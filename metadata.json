@@ -1,0 +1,8 @@
+{
+  "name": " Diocres Hardware\u0026Retail Solutions -PC",
+  "description": "Offline-first Windows desktop point of sale, inventory tracking, seller management, expenses, purchases, and reporting system.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

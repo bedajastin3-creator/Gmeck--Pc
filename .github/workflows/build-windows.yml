@@ -1,0 +1,43 @@
+
+
+name: Build Windows App
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install npm dependencies
+        run: npm install --include=optional
+
+      - name: Build Vite application
+        run: npm run build
+
+      - name: Package Windows Electron Application (.exe installer)
+        run: npm run dist:win
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload Windows Installer Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: BusinessManagement-Windows
+          path: |
+            release/*.exe
+          if-no-files-found: error
+          retention-days: 30

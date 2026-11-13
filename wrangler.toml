@@ -1,0 +1,16 @@
+# wrangler.toml
+name = "diocles-app"
+compatibility_date = "2024-01-01"
+pages_build_output_dir = "dist"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "diocles"
+database_id = "1e992313-1127-4a74-90ce-adede68831e2"
+
+[[r2_buckets]]
+binding = "MEDIA_BUCKET"
+bucket_name = "diocles"
+
+[vars]
+AUTH_SECRET = "diocres-hardware-retail-solutions-2026"
