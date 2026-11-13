@@ -705,7 +705,7 @@ async function updateSettings(db: any, settings: any) {
       low_stock_threshold_default = ?, updated_at = ?
     WHERE id = 'global'
   `).bind(
-    settings.businessName || 'Gmeck Company Limited',
+    settings.businessName || 'Diocres Hardware&Retail Solutions',
     settings.tagline || null, settings.address || null, settings.phone || null,
     settings.email || null, settings.currencySymbol || 'TSh',
     settings.currencyCode || 'TZS', settings.taxRatePercent || 0,
