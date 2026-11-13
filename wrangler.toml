@@ -3,3 +3,14 @@ name = "gmeck-app"
 compatibility_date = "2024-01-01"
 pages_build_output_dir = "dist"
 
+[[d1_databases]]
+binding = "DB"
+database_name = "kariakoo"
+database_id = "c4cb013f-f031-495a-aed8-e871ec30442c"
+
+[[r2_buckets]]
+binding = "MEDIA_BUCKET"
+bucket_name = "kariakoo"
+
+[vars]
+AUTH_SECRET = "gmeck-electronics-solutions-2026"
