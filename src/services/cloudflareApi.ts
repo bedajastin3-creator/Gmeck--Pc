@@ -25,7 +25,7 @@ export class CloudflareApi {
   }
 
   static getR2BaseUrl(): string {
-    return 'https://m.diocres.jobsreport.online';
+    return 'https://m.gmeck.sonkosound.store';
   }
 
   static setToken(token: string): void {
@@ -438,7 +438,7 @@ export class CloudflareApi {
     
     // Ensure URL uses custom R2 domain
     if (result.url && !result.url.includes('m.diocres.jobsreport.online')) {
-      result.url = `https://m.diocres.jobsreport.online/${result.key}`;
+      result.url = `https://m.gmeck.sonkosound.store/${result.key}`;
     }
     
     return result;
@@ -480,7 +480,7 @@ export class CloudflareApi {
 
   // Get R2 file URL (using custom domain)
   static getFileUrl(key: string): string {
-    return `https://m.diocres.jobsreport.online/${key}`;
+    return `https://m.gmeck.sonkosound.store/${key}`;
   }
 
   // Delete R2 file
