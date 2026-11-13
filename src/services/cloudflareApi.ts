@@ -1,18 +1,10 @@
-// src/services/cloudflareApi.ts (DISCONNECTED MODE - EXTERNAL CALLS DISABLED)
+// src/services/cloudflareApi.ts (COMPLETE VERSION WITH R2 CUSTOM DOMAIN)
 export interface CloudflareConfig {
   baseUrl: string;
   deviceId: string;
 }
 
 export class CloudflareApi {
-  /**
-   * DISCONNECTED_MODE:
-   * When true, all external requests to Cloudflare D1, Workers, and R2 are disabled.
-   * The app operates purely in local/static mode in Google AI Studio.
-   * To reconnect later, toggle this flag to false.
-   */
-  public static readonly DISCONNECTED_MODE = true;
-
   private static config: CloudflareConfig = {
     baseUrl: 'https://gmeck.sonkosound.store',
     deviceId: '',
@@ -33,7 +25,7 @@ export class CloudflareApi {
   }
 
   static getR2BaseUrl(): string {
-    return 'https://m.gmeck.sonkosound.store';
+    return 'https://m.diocres.jobsreport.online';
   }
 
   static setToken(token: string): void {
@@ -64,7 +56,6 @@ export class CloudflareApi {
   }
 
   private static isOnline(): boolean {
-    if (this.DISCONNECTED_MODE) return false;
     return typeof navigator !== 'undefined' && navigator.onLine;
   }
 
@@ -76,10 +67,6 @@ export class CloudflareApi {
     endpoint: string,
     options: RequestInit = {}
   ): Promise<T> {
-    if (this.DISCONNECTED_MODE) {
-      throw new Error(`DISCONNECTED: External backend requests are disabled (tried to call ${endpoint})`);
-    }
-
     if (!this.isOnline()) {
       throw new Error('OFFLINE: Cannot reach cloud endpoint');
     }
@@ -109,7 +96,6 @@ export class CloudflareApi {
   // ==========================================
   
   static async checkConnection(): Promise<boolean> {
-    if (this.DISCONNECTED_MODE) return false;
     if (!this.isOnline()) return false;
     try {
       await this.request('/health');
@@ -418,38 +404,13 @@ export class CloudflareApi {
   // R2 FILE OPERATIONS
   // ==========================================
   
-  // Upload product or seller image to R2 (or local DataURL when in disconnected mode)
+  // Upload product or seller image to R2
   static async uploadImage(
     file: File | Blob,
     type: 'product' | 'seller',
     entityId: string,
     imageOrder: number = 0
   ): Promise<{ success: boolean; key: string; url: string; size: number }> {
-    if (this.DISCONNECTED_MODE) {
-      // In disconnected mode, convert file/blob to local DataURL for pure offline persistence
-      return new Promise((resolve) => {
-        const reader = new FileReader();
-        reader.onload = (e) => {
-          const dataUrl = (e.target?.result as string) || '';
-          resolve({
-            success: true,
-            key: `local_${type}_${entityId}_${imageOrder}`,
-            url: dataUrl,
-            size: file.size,
-          });
-        };
-        reader.onerror = () => {
-          resolve({
-            success: true,
-            key: `local_${type}_${entityId}`,
-            url: '',
-            size: file.size,
-          });
-        };
-        reader.readAsDataURL(file);
-      });
-    }
-
     if (!this.isOnline()) {
       throw new Error('OFFLINE: Cannot upload file');
     }
@@ -476,8 +437,8 @@ export class CloudflareApi {
     const result = await response.json();
     
     // Ensure URL uses custom R2 domain
-    if (result.url && !result.url.includes('m.gmeck.sonkosound.store')) {
-      result.url = `https://m.gmeck.sonkosound.store/${result.key}`;
+    if (result.url && !result.url.includes('m.diocres.jobsreport.online')) {
+      result.url = `https://m.diocres.jobsreport.online/${result.key}`;
     }
     
     return result;
@@ -494,14 +455,6 @@ export class CloudflareApi {
 
   // Upload backup to R2
   static async uploadBackup(backupFile: Blob): Promise<{ success: boolean; key: string; size: number }> {
-    if (this.DISCONNECTED_MODE) {
-      return {
-        success: true,
-        key: `local_backup_${Date.now()}`,
-        size: backupFile.size,
-      };
-    }
-
     if (!this.isOnline()) {
       throw new Error('OFFLINE: Cannot upload backup');
     }
@@ -527,20 +480,17 @@ export class CloudflareApi {
 
   // Get R2 file URL (using custom domain)
   static getFileUrl(key: string): string {
-    if (this.DISCONNECTED_MODE) return key;
-    return `https://m.gmeck.sonkosound.store/${key}`;
+    return `https://m.diocres.jobsreport.online/${key}`;
   }
 
   // Delete R2 file
   static async deleteFile(key: string): Promise<{ success: boolean }> {
-    if (this.DISCONNECTED_MODE) return { success: true };
     return this.request(`/r2/files/${key}`, { method: 'DELETE' });
   }
 
   // List backups
   static async listBackups(): Promise<any[]> {
-    if (this.DISCONNECTED_MODE) return [];
-    const result: any = await this.request('/r2/backups');
-    return result?.backups || [];
+    const result = await this.request('/r2/backups');
+    return result.backups || [];
   }
 }
