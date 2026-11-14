@@ -90,7 +90,8 @@ ${shopLabel ? `Shop: ${shopLabel}` : ''}`;
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({
-      model: 'llama-3.3-70b-versatile',
+      // ✅ FIXED: Replaced retired llama-3.3-70b with openai/gpt-oss-120b
+      model: 'openai/gpt-oss-120b',
       temperature: 0.1,
       response_format: { type: 'json_object' },
       messages: [
@@ -181,8 +182,6 @@ export const onRequestPost: PagesFunction<Env> = async ({ request, env }) => {
     }
 
     // 2. Content-Type guard — MUST run before request.formData()
-    //    Without this, a bare POST throws "Parsing a Body as FormData
-    //    requires a Content-Type header" and becomes a 500.
     const contentType = request.headers.get('Content-Type') ?? '';
     if (!contentType.includes('multipart/form-data')) {
       return json(
