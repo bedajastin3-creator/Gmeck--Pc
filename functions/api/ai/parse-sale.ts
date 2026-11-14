@@ -76,7 +76,8 @@ Rules:
   Return "" only when no quantity or measurement is mentioned at all.
   Never invent a quantity.
 - priceText: return the raw phrase. Do NOT compute the number.
-  Examples: "laki nne na hamsini", "450,000", "elfu tatu".
+  Examples: "laki nne na hamsini", "450,000", "elfu tatu", "15k".
+  IMPORTANT: If the seller mentions a price anywhere in the sentence, you MUST extract it into priceText.
 - attributes: only what the seller actually said. Keys are freeform.
   Examples: {"ram":"8GB"}, {"size":"XL"}, {"color":"red"}, {"weight":"2kg"}.
 - Never add a payment method or "sold" status.
@@ -90,7 +91,6 @@ ${shopLabel ? `Shop: ${shopLabel}` : ''}`;
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({
-      // ✅ FIXED: Replaced retired llama-3.3-70b with openai/gpt-oss-120b
       model: 'openai/gpt-oss-120b',
       temperature: 0.1,
       response_format: { type: 'json_object' },
@@ -147,11 +147,6 @@ async function matchProduct(
 }
 
 // ── 4. Quantity resolution helper ──────────────────────────────
-/**
- * Given a spoken quantity phrase + the matched product's unit,
- * return a decimal quantity. Falls back to recovering from the
- * transcript only when the phrase is empty AND the unit is measured.
- */
 function resolveQuantity(
   quantityText: string | undefined,
   productUnit: string | null | undefined,
@@ -181,13 +176,10 @@ export const onRequestPost: PagesFunction<Env> = async ({ request, env }) => {
       return json({ error: 'Unauthorized' }, 401);
     }
 
-    // 2. Content-Type guard — MUST run before request.formData()
+    // 2. Content-Type guard
     const contentType = request.headers.get('Content-Type') ?? '';
     if (!contentType.includes('multipart/form-data')) {
-      return json(
-        { error: 'Expected multipart/form-data with "audio" field' },
-        400
-      );
+      return json({ error: 'Expected multipart/form-data with "audio" field' }, 400);
     }
 
     // 3. Parse form safely
@@ -205,8 +197,6 @@ export const onRequestPost: PagesFunction<Env> = async ({ request, env }) => {
     }
 
     const requestedShopId = (form.get('shopId') as string | null) || null;
-
-    // TODO: verify the caller's assignedShopIds from the users table.
     const shopIds: string[] = requestedShopId ? [requestedShopId] : [];
 
     // 5. Transcribe
@@ -233,13 +223,35 @@ export const onRequestPost: PagesFunction<Env> = async ({ request, env }) => {
         const productUnit: string | null = row?.unit ?? null;
 
         const qty = resolveQuantity(it.quantityText, productUnit, transcript);
-        const price = parseSwahiliPrice(it.priceText ?? '');
+        
+        // ── PRICE RESOLUTION & FALLBACKS ──
+        let price = parseSwahiliPrice(it.priceText ?? '');
+
+        // Fallback 1: Check attributes (in case LLM put it there)
+        if (!price && it.attributes) {
+          const attrPrice = it.attributes.price || it.attributes.bei || it.attributes.amount;
+          if (attrPrice) price = parseSwahiliPrice(String(attrPrice));
+        }
+
+        // Fallback 2: Scan transcript for numbers (handles "F15", "15000", etc.)
+        if (!price) {
+          const numbersInTranscript = transcript.match(/\d{3,}/g);
+          if (numbersInTranscript && numbersInTranscript.length > 0) {
+            price = Math.max(...numbersInTranscript.map(n => parseInt(n, 10)));
+          }
+        }
 
         const stock = Number(row?.current_stock ?? 0);
         const inStock = !!row && stock >= qty;
 
+        // ── WARNINGS (moved AFTER fallbacks) ──
         if (!row) warnings.push(`Product not found: "${it.productName}"`);
-        if (!price) warnings.push(`No price detected for "${it.productName}"`);
+        
+        // Only warn if we STILL couldn't find a price after all fallbacks
+        if (!price) {
+          warnings.push(`No price detected for "${it.productName}"`);
+        }
+
         if (row && stock < qty) {
           warnings.push(
             `Only ${stock}${productUnit ? ' ' + productUnit : ''} in stock for "${row.name}" (asked ${qty})`
