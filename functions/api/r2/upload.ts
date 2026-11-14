@@ -35,7 +35,7 @@ export async function onRequestPost(context: any) {
     });
 
     // Use custom R2 domain
-    const fullUrl = `https://m.gmeck.sonkosound.store//${key}`;
+    const fullUrl = `https://m.gmeck.sonkosound.store/${key}`;
 
     // Update database for seller avatars
     if (type === 'seller') {
