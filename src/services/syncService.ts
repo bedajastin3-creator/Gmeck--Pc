@@ -218,10 +218,12 @@ export class SyncService {
 
         let parsedPermissions: any = {};
         try {
-          if (cloudUser.permissions) {
-            parsedPermissions = typeof cloudUser.permissions === 'string'
-              ? JSON.parse(cloudUser.permissions)
-              : cloudUser.permissions;
+          let rawPerms = cloudUser.permissions;
+          while (typeof rawPerms === 'string' && rawPerms.trim()) {
+            rawPerms = JSON.parse(rawPerms);
+          }
+          if (rawPerms && typeof rawPerms === 'object' && !Array.isArray(rawPerms)) {
+            parsedPermissions = rawPerms;
           }
         } catch (e) {
           console.warn('Failed to parse permissions for user:', cloudUser.id, e);
@@ -230,29 +232,32 @@ export class SyncService {
 
         let parsedShopIds: string[] = [];
         try {
-          if (cloudUser.assigned_shop_ids) {
-            parsedShopIds = typeof cloudUser.assigned_shop_ids === 'string'
-              ? JSON.parse(cloudUser.assigned_shop_ids)
-              : cloudUser.assigned_shop_ids;
+          let rawShops = cloudUser.assigned_shop_ids ?? cloudUser.assignedShopIds;
+          while (typeof rawShops === 'string' && rawShops.trim()) {
+            rawShops = JSON.parse(rawShops);
+          }
+          if (Array.isArray(rawShops)) {
+            parsedShopIds = rawShops;
           }
         } catch (e) {
           console.warn('Failed to parse assigned_shop_ids for user:', cloudUser.id, e);
           parsedShopIds = [];
         }
 
+        const existingUser = index !== -1 ? mergedUsers[index] : undefined;
         const userData = {
           id: cloudUser.id,
           username: cloudUser.username,
           name: cloudUser.name,
           role: cloudUser.role,
-          passwordHash: cloudUser.password_hash,
+          passwordHash: cloudUser.password_hash || existingUser?.passwordHash || '',
           color: cloudUser.color,
           status: cloudUser.status,
           assignedShopIds: parsedShopIds,
           avatarUrl: cloudUser.avatar_url || cloudUser.avatarUrl || null,
           permissions: parsedPermissions,
-          createdAt: cloudUser.created_at,
-          updatedAt: cloudUser.updated_at,
+          createdAt: cloudUser.created_at || existingUser?.createdAt || new Date().toISOString(),
+          updatedAt: cloudUser.updated_at || existingUser?.updatedAt || new Date().toISOString(),
         };
 
         if (index === -1) {

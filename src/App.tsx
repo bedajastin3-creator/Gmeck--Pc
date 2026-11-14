@@ -56,6 +56,9 @@ const MainLayout: React.FC = () => {
         case 'new_sale':
           return <NewSalePOS />;
         case 'products':
+          if (permissions.canEditProducts || permissions.canDeleteProducts) {
+            return <AdminProducts />;
+          }
           return <SellerProducts />;
         case 'purchases':
           // Sellers can always view/record purchases

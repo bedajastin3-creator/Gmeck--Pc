@@ -53,8 +53,14 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   
   const isSyncingRef = useRef<boolean>(false);
   const isPushingRef = useRef<boolean>(false);
-  const lastPullTimeRef = useRef<number>(Date.now());
-  const PULL_INTERVAL = 900000; // 15 minutes between pulls (D1 cost optimization)
+  const lastPullTimeRef = useRef<number>(0);
+  const currentUserRef = useRef<User | null>(currentUser);
+  const PULL_INTERVAL = 900000; // 15 minutes between background pulls (D1 cost optimization)
+  const FOCUS_PULL_COOLDOWN = 30000; // 30 seconds cooldown on window focus
+
+  useEffect(() => {
+    currentUserRef.current = currentUser;
+  }, [currentUser]);
 
   const setSelectedShopId = (shopId: string) => {
     setSelectedShopIdState(shopId);
@@ -188,16 +194,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
   };
 
-  // 1. FORCE FULL PULL ON FIRST LOAD (for incognito/new devices)
+  // 1. FORCE PULL ON APP STARTUP (ensures desktop app receives latest permissions/data from web)
   useEffect(() => {
-    const hasSynced = localStorage.getItem('omnibiz_has_synced');
-    
-    if (!hasSynced) {
-      console.log('[FirstLoad] No previous sync - pulling all data from D1...');
-      pullCloudData(true);
-    } else {
-      console.log('[FirstLoad] Has synced before - loading from local storage');
-    }
+    console.log('[Startup] Pulling latest data and user permissions from cloud...');
+    pullCloudData(true);
   }, []);
 
   // 2. Listen to LocalDB changes and push immediately
@@ -207,8 +207,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       setDbState({ ...state });
       setSyncStatus(SyncService.getSyncStatus());
 
-      if (currentUser) {
-        const freshUser = state.users.find(u => u.id === currentUser.id);
+      const activeUser = currentUserRef.current;
+      if (activeUser) {
+        const freshUser = state.users.find(u => u.id === activeUser.id);
         if (freshUser) {
           if (freshUser.status !== 'ACTIVE') {
             AuthService.logout();
@@ -220,8 +221,18 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
               description: 'Your seller account has been deactivated by an Administrator.',
             }]);
           } else {
-            setCurrentUser(freshUser);
-            AuthService.setActiveUser(freshUser);
+            const changed =
+              freshUser.updatedAt !== activeUser.updatedAt ||
+              freshUser.name !== activeUser.name ||
+              freshUser.color !== activeUser.color ||
+              freshUser.avatarUrl !== activeUser.avatarUrl ||
+              JSON.stringify(freshUser.permissions || {}) !== JSON.stringify(activeUser.permissions || {}) ||
+              JSON.stringify(freshUser.assignedShopIds || []) !== JSON.stringify(activeUser.assignedShopIds || []);
+
+            if (changed) {
+              setCurrentUser(freshUser);
+              AuthService.setActiveUser(freshUser);
+            }
           }
         }
       }
@@ -234,20 +245,32 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     });
 
     return () => unsubscribe();
-  }, [currentUser]);
+  }, []);
 
-  // 3. Pull cloud data every 15 minutes
+  // 3. Pull cloud data on login, periodically, and when app regains focus
   useEffect(() => {
-    // Pull on login (if user logs in)
-    if (currentUser) {
-      pullCloudData(false);
+    if (currentUser?.id) {
+      pullCloudData(true);
     }
-    
-    // Pull every 15 minutes
+
     const interval = setInterval(() => pullCloudData(false), PULL_INTERVAL);
-    
-    return () => clearInterval(interval);
-  }, [currentUser]);
+
+    const handleFocusPull = () => {
+      if (document.visibilityState === 'hidden') return;
+      if (Date.now() - lastPullTimeRef.current >= FOCUS_PULL_COOLDOWN) {
+        pullCloudData(true);
+      }
+    };
+
+    window.addEventListener('focus', handleFocusPull);
+    document.addEventListener('visibilitychange', handleFocusPull);
+
+    return () => {
+      clearInterval(interval);
+      window.removeEventListener('focus', handleFocusPull);
+      document.removeEventListener('visibilitychange', handleFocusPull);
+    };
+  }, [currentUser?.id]);
 
   // 4. Push on reconnect
   useEffect(() => {
@@ -270,7 +293,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       window.removeEventListener('online', handleOnline);
       window.removeEventListener('offline', handleOffline);
     };
-  }, [currentUser]);
+  }, []);
 
   // Ensure seller has a valid shop selected
   useEffect(() => {
@@ -323,11 +346,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       description: `Logged in as ${freshUser.role}`,
     });
     
-    // Push any pending items and pull latest data after login
+    // Push any pending items and force-pull latest data/permissions after login
     setTimeout(() => {
       pushPendingItems();
-      pullCloudData(false);
-    }, 1000);
+      pullCloudData(true);
+    }, 300);
   };
 
   const logout = () => {

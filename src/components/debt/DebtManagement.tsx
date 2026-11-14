@@ -419,7 +419,7 @@ export const DebtManagement: React.FC = () => {
         ? 0
         : Math.max(0, debt.amount - paidAmount);
     const paymentsCount = debt.payments?.length || (paidAmount > 0 ? 1 : 0);
-    const isAdmin = currentUser?.role === 'ADMIN';
+    const isAdmin = currentUser?.role === 'ADMIN' || !!currentUser?.permissions?.canManageDebts;
 
     return (
       <tr

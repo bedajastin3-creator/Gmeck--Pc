@@ -115,14 +115,14 @@ export class CloudflareApi {
     token?: string;
     error?: string;
   }> {
-    return this.request('/auth/login', {
+    return this.request('/login', {
       method: 'POST',
       body: JSON.stringify({ username, password }),
     });
   }
 
   static async logout(userId: string): Promise<{ success: boolean }> {
-    return this.request('/auth/logout', {
+    return this.request('/logout', {
       method: 'POST',
       body: JSON.stringify({ userId }),
     });

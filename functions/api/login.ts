@@ -33,6 +33,28 @@ export async function onRequestPost(context: any) {
       });
     }
 
+    let parsedShopIds: string[] = [];
+    try {
+      parsedShopIds = typeof user.assigned_shop_ids === 'string'
+        ? JSON.parse(user.assigned_shop_ids || '[]')
+        : (user.assigned_shop_ids || []);
+    } catch {
+      parsedShopIds = [];
+    }
+
+    let parsedPermissions: Record<string, any> = {};
+    try {
+      let rawPerms = user.permissions;
+      while (typeof rawPerms === 'string' && rawPerms.trim()) {
+        rawPerms = JSON.parse(rawPerms);
+      }
+      if (rawPerms && typeof rawPerms === 'object' && !Array.isArray(rawPerms)) {
+        parsedPermissions = rawPerms;
+      }
+    } catch {
+      parsedPermissions = {};
+    }
+
     return new Response(JSON.stringify({
       success: true,
       user: {
@@ -42,7 +64,11 @@ export async function onRequestPost(context: any) {
         role: user.role,
         color: user.color,
         status: user.status,
-        assignedShopIds: JSON.parse(user.assigned_shop_ids || '[]'),
+        assignedShopIds: parsedShopIds,
+        avatarUrl: user.avatar_url || null,
+        permissions: parsedPermissions,
+        created_at: user.created_at,
+        updated_at: user.updated_at,
       },
       token: `token_${user.id}_${Date.now()}`,
     }), {

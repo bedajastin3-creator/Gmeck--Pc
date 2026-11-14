@@ -120,7 +120,7 @@ export const Sidebar: React.FC = () => {
       id="app-sidebar-nav"
       className="w-64 bg-slate-900 text-slate-300 border-r border-slate-800 flex flex-col justify-between shrink-0 select-none"
     >
-      <div className="py-3">
+      <div className="py-3 flex-1 overflow-y-auto">
         {/* Navigation Category Label */}
         <div className="px-4 pb-2 text-[11px] font-semibold uppercase tracking-wider text-slate-400 flex items-center justify-between">
           <span>{isSeller ? 'Seller Terminal' : 'Admin Control Panel'}</span>

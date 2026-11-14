@@ -14,10 +14,14 @@ export class AuthService {
   private static parsePermissions(permissions: any): SellerPermissions {
     if (!permissions) return {};
     try {
-      if (typeof permissions === 'string') {
-        return JSON.parse(permissions);
+      let current = permissions;
+      while (typeof current === 'string' && current.trim()) {
+        current = JSON.parse(current);
       }
-      return permissions;
+      if (current && typeof current === 'object' && !Array.isArray(current)) {
+        return current as SellerPermissions;
+      }
+      return {};
     } catch (e) {
       console.warn('Failed to parse permissions:', e);
       return {};
@@ -149,6 +153,25 @@ export class AuthService {
       .then(result => {
         if (result.success && result.token) {
           CloudflareApi.setToken(result.token);
+          if (result.user) {
+            const latestUsers = db.getUsers();
+            const idx = latestUsers.findIndex(u => u.id === user.id);
+            if (idx !== -1) {
+              const cloudPerms = AuthService.parsePermissions(result.user.permissions);
+              const cloudShops = Array.isArray(result.user.assignedShopIds)
+                ? result.user.assignedShopIds
+                : latestUsers[idx].assignedShopIds;
+              latestUsers[idx] = {
+                ...latestUsers[idx],
+                permissions: result.user.permissions !== undefined ? cloudPerms : latestUsers[idx].permissions,
+                assignedShopIds: cloudShops,
+                avatarUrl: result.user.avatarUrl ?? latestUsers[idx].avatarUrl,
+                color: result.user.color ?? latestUsers[idx].color,
+                status: result.user.status ?? latestUsers[idx].status,
+              };
+              db.saveUsers(latestUsers);
+            }
+          }
           console.log('Cloud token stored for future sync');
         }
       })
