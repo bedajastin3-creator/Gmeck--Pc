@@ -133,7 +133,7 @@ async function matchProduct(
   if (!row) {
     const tokens = needle.toLowerCase().split(/\s+/).filter(Boolean);
     if (tokens.length) {
-      const clauses = tokens.map(() => 'LOWER(name) LIKE ?').join(' AND ');
+      const clauses = tokens.map(() => `LOWER(name) LIKE ?`).join(' AND ');
       row = await env.DB.prepare(
         `SELECT id, name, selling_price, current_stock, category_id, shop_id, unit
            FROM products
@@ -158,47 +158,63 @@ function resolveQuantity(
 ): number {
   const raw = (quantityText ?? '').trim();
 
-  // Normal path — parser handles fractions, decimals, and noun-class
-  // prefixes ("vitano", "mita moja na nusu") deterministically.
   if (raw) {
     const parsed = parseQuantity(raw, 1);
     if (parsed !== 1 || /moja|1\b/.test(raw)) return parsed;
-    // If parseQuantity returned the fallback 1 but the phrase is not
-    // actually "1", keep trying other recovery paths below.
   }
 
-  // Measured goods: if the LLM forgot quantityText, try to recover
-  // from the raw transcript (e.g. "mita moja na nusu" → 1.5).
   if (isDecimalUnit(productUnit ?? '')) {
     const recovered = parseSpokenQuantity(transcript);
     if (recovered !== null) return recovered;
   }
 
-  // Default: 1 (pieces)
   return 1;
 }
 
 // ── 5. Main handler ────────────────────────────────────────────
 export const onRequestPost: PagesFunction<Env> = async ({ request, env }) => {
   try {
+    // 1. Auth
     const auth = request.headers.get('Authorization') ?? '';
-    if (!auth.startsWith('Bearer ')) return json({ error: 'Unauthorized' }, 401);
+    if (!auth.startsWith('Bearer ')) {
+      return json({ error: 'Unauthorized' }, 401);
+    }
 
-    const form = await request.formData();
+    // 2. Content-Type guard — MUST run before request.formData()
+    //    Without this, a bare POST throws "Parsing a Body as FormData
+    //    requires a Content-Type header" and becomes a 500.
+    const contentType = request.headers.get('Content-Type') ?? '';
+    if (!contentType.includes('multipart/form-data')) {
+      return json(
+        { error: 'Expected multipart/form-data with "audio" field' },
+        400
+      );
+    }
+
+    // 3. Parse form safely
+    let form: FormData;
+    try {
+      form = await request.formData();
+    } catch {
+      return json({ error: 'Malformed form data' }, 400);
+    }
+
+    // 4. Validate audio
     const audio = form.get('audio');
     if (!(audio instanceof File) || audio.size === 0) {
       return json({ error: 'Missing audio' }, 400);
     }
+
     const requestedShopId = (form.get('shopId') as string | null) || null;
 
     // TODO: verify the caller's assignedShopIds from the users table.
     const shopIds: string[] = requestedShopId ? [requestedShopId] : [];
 
-    // 1. Transcribe
+    // 5. Transcribe
     const transcript = await transcribe(env, audio);
     if (!transcript) return json({ error: 'Empty transcript' }, 422);
 
-    // 2. Extract
+    // 6. Extract
     let shopLabel: string | null = null;
     if (requestedShopId) {
       const s: any = await env.DB.prepare(
@@ -208,7 +224,7 @@ export const onRequestPost: PagesFunction<Env> = async ({ request, env }) => {
     }
     const parsed = await extract(env, transcript, shopLabel);
 
-    // 3. Resolve each item deterministically
+    // 7. Resolve each item deterministically
     const warnings: string[] = [];
     const rawItems: any[] = Array.isArray(parsed.items) ? parsed.items : [];
 
@@ -217,11 +233,9 @@ export const onRequestPost: PagesFunction<Env> = async ({ request, env }) => {
         const row = await matchProduct(env, it.productName ?? '', shopIds);
         const productUnit: string | null = row?.unit ?? null;
 
-        // Fraction-aware quantity, with measured-unit recovery
         const qty = resolveQuantity(it.quantityText, productUnit, transcript);
         const price = parseSwahiliPrice(it.priceText ?? '');
 
-        // Stock checks use decimal-aware comparison
         const stock = Number(row?.current_stock ?? 0);
         const inStock = !!row && stock >= qty;
 
@@ -232,9 +246,6 @@ export const onRequestPost: PagesFunction<Env> = async ({ request, env }) => {
             `Only ${stock}${productUnit ? ' ' + productUnit : ''} in stock for "${row.name}" (asked ${qty})`
           );
         }
-        // Sanity: measured units usually get fractional quantities; warn
-        // if the model returned a whole number for a measured product AND
-        // the transcript contains a fraction word — helps catch mistakes.
         if (
           row &&
           isDecimalUnit(productUnit ?? '') &&
@@ -249,8 +260,8 @@ export const onRequestPost: PagesFunction<Env> = async ({ request, env }) => {
         return {
           productId: row?.id ?? null,
           productName: row?.name ?? it.productName ?? null,
-          quantity: qty,                       // decimal preserved
-          unit: productUnit,                   // passed to UI
+          quantity: qty,
+          unit: productUnit,
           unitPrice: price ?? row?.selling_price ?? null,
           inStock,
           stockQty: stock,
