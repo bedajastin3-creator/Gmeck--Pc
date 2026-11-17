@@ -177,6 +177,9 @@ async function processOperation(db: any, op: any) {
     case 'UPDATE_STORE':
       await upsertStore(db, payload);
       break;
+    case 'DELETE_STORE':
+      await deleteStore(db, payload);
+      break;
     case 'TRANSFER_STORE_TO_SHOP':
       await transferStoreToShop(db, payload);
       break;
@@ -276,6 +279,17 @@ async function deleteDebt(db: any, payload: any) {
     .bind(payload.id)
     .run();
   await db.prepare('DELETE FROM debts WHERE id = ?').bind(payload.id).run();
+}
+
+async function deleteStore(db: any, payload: any) {
+  if (!payload?.id) {
+    throw new Error('deleteStore: missing store id');
+  }
+  await db
+    .prepare('UPDATE inventory_movements SET store_id = NULL WHERE store_id = ?')
+    .bind(payload.id)
+    .run();
+  await db.prepare('DELETE FROM stores WHERE id = ?').bind(payload.id).run();
 }
 
 // ──────────────────────────────────────────────────────────
