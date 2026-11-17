@@ -11,6 +11,7 @@ import {
   AuditLog,
   SyncQueueItem,
   Shop,
+  Store,
   ImportHistoryItem,
   DebtRecord,
   AppNotification,
@@ -36,6 +37,7 @@ const DB_PREFIX = 'omnibiz_pos_db_v3_';
 
 export interface DatabaseState {
   shops: Shop[];
+  stores: Store[];
   users: User[];
   categories: Category[];
   products: Product[];
@@ -99,15 +101,59 @@ class LocalDatabase {
   }
 
   private saveTable<T>(tableName: string, data: T): void {
+    const key = this.getKey(tableName);
+    const json = JSON.stringify(data);
     try {
-      localStorage.setItem(this.getKey(tableName), JSON.stringify(data));
+      localStorage.setItem(key, json);
     } catch (e) {
-      console.error(`[LocalDB] Failed writing table ${tableName}`, e);
+      // Handle QuotaExceededError cleanly by evicting expendable caches first
+      try {
+        localStorage.removeItem(LocalDatabase.PRE_MIGRATION_KEY);
+        // Prune already-SYNCED items from sync_queue to free space
+        if (tableName !== 'sync_queue' && this.memoryCache?.syncQueue) {
+          const prunedQueue = this.memoryCache.syncQueue.filter(
+            q => q.status === 'PENDING' || q.status === 'FAILED'
+          );
+          if (prunedQueue.length !== this.memoryCache.syncQueue.length) {
+            this.memoryCache.syncQueue = prunedQueue;
+            try {
+              localStorage.setItem(this.getKey('sync_queue'), JSON.stringify(prunedQueue));
+            } catch {
+              // ignore secondary error
+            }
+          }
+        }
+        localStorage.setItem(key, json);
+      } catch (retryErr) {
+        // Fallback for non-critical tables so core data (e.g. products) never crashes
+        if (tableName === 'movements' && Array.isArray(data) && data.length > 500) {
+          try {
+            localStorage.setItem(key, JSON.stringify(data.slice(0, 500)));
+            return;
+          } catch {
+            // ignore
+          }
+        }
+        if (tableName === 'sync_queue' && Array.isArray(data)) {
+          try {
+            const pendingOnly = (data as unknown as SyncQueueItem[]).filter(
+              q => q.status === 'PENDING' || q.status === 'FAILED'
+            );
+            localStorage.setItem(key, JSON.stringify(pendingOnly.slice(0, 500)));
+            return;
+          } catch {
+            // Keep full queue in memoryCache even if localStorage is full
+            return;
+          }
+        }
+        console.error(`[LocalDB] Failed writing table ${tableName}`, retryErr || e);
+      }
     }
   }
 
   public init(): DatabaseState {
     let shops = this.loadTable<Shop[]>('shops', INITIAL_SHOPS);
+    const stores = this.loadTable<Store[]>('stores', []);
     let users = this.loadTable<User[]>('users', INITIAL_USERS);
     let categories = this.loadTable<Category[]>('categories', INITIAL_CATEGORIES);
     let products = this.loadTable<Product[]>('products', INITIAL_PRODUCTS);
@@ -134,7 +180,7 @@ class LocalDatabase {
       let mod = false;
       const copy = { ...u };
       if (copy.role === 'ADMIN') {
-        if (copy.username.toLowerCase() === 'admin') {
+        if ((copy.username || '').toLowerCase() === 'admin') {
           copy.username = 'Admin';
           copy.passwordHash = copy.passwordHash || DEFAULT_ADMIN_HASH;
           mod = true;
@@ -152,11 +198,11 @@ class LocalDatabase {
 
     // Ensure business branding is correct and currency is TSh
     let settingsModified = false;
-    if (settings.businessName === 'Gmeck Company Limited' || !settings.businessName) {
+    if (settings.businessName === 'Electronics & Retail Solutions' || !settings.businessName) {
       settings = {
         ...settings,
-        businessName:'Gmeck Company Limited',
-        tagline: 'Quality Electronicd Tools & Retail Solutions',
+        businessName: 'Gmeck Company Limited',
+        tagline: 'Electronics Tools & Retail Solutions',
         receiptHeaderNote: 'Thank you for shopping with Diocres Hardware&Retail Solutions!',
       };
       settingsModified = true;
@@ -180,6 +226,7 @@ class LocalDatabase {
 
     this.memoryCache = {
       shops: shops || [],
+      stores: stores || [],
       users: users || [],
       categories: categories || [],
       products: products || [],
@@ -232,6 +279,18 @@ class LocalDatabase {
     if (!this.memoryCache) this.init();
     this.memoryCache!.shops = shops;
     this.saveTable('shops', shops);
+    this.notify();
+  }
+
+  // --- Stores (Warehouses) ---
+  public getStores(): Store[] {
+    return this.getState().stores || [];
+  }
+
+  public saveStores(stores: Store[]): void {
+    if (!this.memoryCache) this.init();
+    this.memoryCache!.stores = stores;
+    this.saveTable('stores', stores);
     this.notify();
   }
 
@@ -377,6 +436,26 @@ class LocalDatabase {
     this.notify();
   }
 
+  public enqueueSyncBatch(items: SyncQueueItem[]): void {
+    if (!items || items.length === 0) return;
+    if (!this.memoryCache) this.init();
+    const existing = this.memoryCache!.syncQueue || [];
+    // Keep all PENDING / FAILED items plus at most the 50 most recent SYNCED items to prevent quota bloat
+    let syncedKept = 0;
+    const compactExisting = existing.filter(q => {
+      if (q.status === 'PENDING' || q.status === 'FAILED') return true;
+      if (syncedKept < 50) {
+        syncedKept++;
+        return true;
+      }
+      return false;
+    });
+    const updated = [...items, ...compactExisting];
+    this.memoryCache!.syncQueue = updated;
+    this.saveTable('sync_queue', updated);
+    this.notify();
+  }
+
   public saveSyncQueue(queue: SyncQueueItem[]): void {
     if (!this.memoryCache) this.init();
     this.memoryCache!.syncQueue = queue;
@@ -407,7 +486,7 @@ class LocalDatabase {
   public updateSaleEditRequest(requestId: string, patch: Partial<SaleEditRequest>): void {
     if (!this.memoryCache) this.init();
     const current = this.memoryCache!.saleEditRequests || [];
-    const updated = current.map(r => 
+    const updated = current.map(r =>
       r.id === requestId ? { ...r, ...patch } : r
     );
     this.memoryCache!.saleEditRequests = updated;
@@ -438,7 +517,9 @@ class LocalDatabase {
   public updateDebt(debtId: string, patch: Partial<DebtRecord>): void {
     if (!this.memoryCache) this.init();
     const current = this.memoryCache!.debts || [];
-    const updated = current.map(d => (d.id === debtId ? { ...d, ...patch, updatedAt: new Date().toISOString() } : d));
+    const updated = current.map(d =>
+      d.id === debtId ? { ...d, ...patch, updatedAt: new Date().toISOString() } : d
+    );
     this.memoryCache!.debts = updated;
     this.saveTable('debts', updated);
     this.notify();
@@ -469,9 +550,10 @@ class LocalDatabase {
     if (!this.memoryCache) this.init();
     const current = this.memoryCache!.notifications || [];
     const isDup = current.some(
-      n => n.type === notification.type &&
-           n.message === notification.message &&
-           n.relatedEntityId === notification.relatedEntityId
+      n =>
+        n.type === notification.type &&
+        n.message === notification.message &&
+        n.relatedEntityId === notification.relatedEntityId
     );
     if (!isDup) {
       const updated = [notification, ...current].slice(0, 300);
@@ -519,7 +601,7 @@ class LocalDatabase {
     const payload = {
       version: '2.0.0',
       exportedAt: new Date().toISOString(),
-      generator: 'Diocres Windows Desktop Business System',
+      generator: 'Diocres Android Mobile Business System',
       data,
     };
     return JSON.stringify(payload, null, 2);
@@ -537,6 +619,7 @@ class LocalDatabase {
       }
 
       this.saveTable('shops', d.shops || INITIAL_SHOPS);
+      this.saveTable('stores', d.stores || []);
       this.saveTable('users', d.users);
       this.saveTable('categories', d.categories || INITIAL_CATEGORIES);
       this.saveTable('products', d.products);
@@ -554,18 +637,134 @@ class LocalDatabase {
 
       this.init();
       this.notify();
-      return { success: true, message: `Successfully restored backup from ${parsed.exportedAt || 'archive'}` };
+      return {
+        success: true,
+        message: `Successfully restored backup from ${parsed.exportedAt || 'archive'}`,
+      };
     } catch (e: any) {
-      return { success: false, message: `Failed to restore database: ${e.message || 'JSON parse error'}` };
+      return {
+        success: false,
+        message: `Failed to restore database: ${e.message || 'JSON parse error'}`,
+      };
+    }
+  }
+
+  private static readonly PRE_MIGRATION_KEY = 'omnibiz_pre_migration_snapshot_v1';
+
+  public savePreMigrationSnapshot(label: string = 'Pre-Import Backup'): boolean {
+    try {
+      const state = this.getState();
+      // Skip oversized snapshots so localStorage quota remains available for imported products
+      if ((state.products?.length || 0) > 1500) {
+        localStorage.removeItem(LocalDatabase.PRE_MIGRATION_KEY);
+        return false;
+      }
+      // Clear previous snapshot first to avoid holding two copies during setItem
+      localStorage.removeItem(LocalDatabase.PRE_MIGRATION_KEY);
+      const snapshot = {
+        savedAt: new Date().toISOString(),
+        label,
+        shops: state.shops || [],
+        stores: state.stores || [],
+        categories: state.categories || [],
+        products: state.products || [],
+        sales: state.sales || [],
+        importHistory: state.importHistory || [],
+      };
+      const serialized = JSON.stringify(snapshot);
+      if (serialized.length > 1_500_000) {
+        return false;
+      }
+      localStorage.setItem(LocalDatabase.PRE_MIGRATION_KEY, serialized);
+      return true;
+    } catch (e) {
+      console.warn('[LocalDB] Failed to save pre-migration snapshot (storage quota?):', e);
+      return false;
+    }
+  }
+
+  public hasPreMigrationSnapshot(): {
+    exists: boolean;
+    savedAt?: string;
+    label?: string;
+    productCount?: number;
+    storeCount?: number;
+  } {
+    try {
+      const raw = localStorage.getItem(LocalDatabase.PRE_MIGRATION_KEY);
+      if (!raw) return { exists: false };
+      const parsed = JSON.parse(raw);
+      if (!parsed || !Array.isArray(parsed.products)) return { exists: false };
+      return {
+        exists: true,
+        savedAt: parsed.savedAt,
+        label: parsed.label,
+        productCount: parsed.products.length,
+        storeCount: Array.isArray(parsed.stores) ? parsed.stores.length : 0,
+      };
+    } catch {
+      return { exists: false };
+    }
+  }
+
+  public restorePreMigrationSnapshot(): { success: boolean; message: string } {
+    try {
+      const raw = localStorage.getItem(LocalDatabase.PRE_MIGRATION_KEY);
+      if (!raw) {
+        return { success: false, message: 'No pre-import snapshot is available to restore.' };
+      }
+      const parsed = JSON.parse(raw);
+      if (!parsed || !Array.isArray(parsed.products)) {
+        return { success: false, message: 'Pre-import snapshot is invalid or incomplete.' };
+      }
+
+      if (Array.isArray(parsed.shops)) this.saveTable('shops', parsed.shops);
+      if (Array.isArray(parsed.stores)) this.saveTable('stores', parsed.stores);
+      if (Array.isArray(parsed.categories)) this.saveTable('categories', parsed.categories);
+      this.saveTable('products', parsed.products);
+      if (Array.isArray(parsed.sales)) this.saveTable('sales', parsed.sales);
+      if (Array.isArray(parsed.movements)) this.saveTable('movements', parsed.movements);
+      if (Array.isArray(parsed.importHistory)) this.saveTable('import_history', parsed.importHistory);
+      if (Array.isArray(parsed.syncQueue)) this.saveTable('sync_queue', parsed.syncQueue);
+
+      localStorage.removeItem(LocalDatabase.PRE_MIGRATION_KEY);
+      this.init();
+      this.notify();
+      return {
+        success: true,
+        message: `Rolled back to state before "${parsed.label || 'import'}" (${parsed.products.length} products restored).`,
+      };
+    } catch (e: any) {
+      return {
+        success: false,
+        message: `Rollback failed: ${e.message || 'Unknown error'}`,
+      };
+    }
+  }
+
+  public clearPreMigrationSnapshot(): void {
+    try {
+      localStorage.removeItem(LocalDatabase.PRE_MIGRATION_KEY);
+    } catch {
+      // ignore
     }
   }
 
   public wipeAllData(keepShopsAndAdmin: boolean = true): void {
-    const shops = keepShopsAndAdmin ? (this.memoryCache?.shops?.length ? this.memoryCache.shops : INITIAL_SHOPS) : INITIAL_SHOPS;
-    const users = keepShopsAndAdmin ? (this.memoryCache?.users?.length ? this.memoryCache.users : INITIAL_USERS) : INITIAL_USERS;
+    const shops = keepShopsAndAdmin
+      ? this.memoryCache?.shops?.length
+        ? this.memoryCache.shops
+        : INITIAL_SHOPS
+      : INITIAL_SHOPS;
+    const users = keepShopsAndAdmin
+      ? this.memoryCache?.users?.length
+        ? this.memoryCache.users
+        : INITIAL_USERS
+      : INITIAL_USERS;
     const settings = this.memoryCache?.settings || INITIAL_SETTINGS;
 
     this.saveTable('shops', shops);
+    this.saveTable('stores', []);
     this.saveTable('users', users);
     this.saveTable('categories', []);
     this.saveTable('products', []);
@@ -580,7 +779,8 @@ class LocalDatabase {
         userId: users[0]?.id || 'user-admin-01',
         userName: users[0]?.name || 'Administrator',
         action: 'SYSTEM_INITIALIZATION',
-        details: 'Wiped all demo and transactional data in preparation for live Cloudflare deployment',
+        details:
+          'Wiped all demo and transactional data in preparation for live Cloudflare deployment',
         entityType: 'SETTINGS',
         timestamp: new Date().toISOString(),
         createdAt: new Date().toISOString(),
