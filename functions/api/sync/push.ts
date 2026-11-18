@@ -107,7 +107,7 @@ async function processOperation(db: any, op: any) {
     case 'CREATE_PRODUCT':
     case 'UPDATE_PRODUCT':
     case 'TOGGLE_PRODUCT_STATUS':
-      await upsertProduct(db, payload);
+      await upsertProduct(db, payload, operation);
       break;
     case 'DELETE_PRODUCT':
       await deleteProduct(db, payload);
@@ -395,11 +395,55 @@ async function upsertStore(db: any, store: any) {
     .run();
 }
 
-async function upsertProduct(db: any, product: any) {
-  const currentStock = product.storeId ? 0 : product.currentStock || 0;
-  const storeStock = product.storeId
-    ? product.storeStock ?? product.currentStock ?? 0
-    : product.storeStock ?? 0;
+let productColumnsChecked = false;
+let hasProductStoreColumns = false;
+
+async function ensureProductStoreColumns(db: any): Promise<boolean> {
+  if (productColumnsChecked) return hasProductStoreColumns;
+  productColumnsChecked = true;
+  try {
+    const info = await db.prepare('PRAGMA table_info(products)').all();
+    const existingCols = new Set(
+      (info?.results || []).map((c: any) => String(c.name || '').toLowerCase())
+    );
+    const needed = [
+      { name: 'store_id', type: 'TEXT' },
+      { name: 'store_stocks', type: 'TEXT' },
+      { name: 'store_details', type: 'TEXT' },
+      { name: 'variation', type: 'TEXT' },
+      { name: 'custom_fields', type: 'TEXT' },
+    ];
+    for (const col of needed) {
+      if (!existingCols.has(col.name)) {
+        try {
+          await db
+            .prepare(`ALTER TABLE products ADD COLUMN ${col.name} ${col.type}`)
+            .run();
+          existingCols.add(col.name);
+        } catch {
+          // Ignore if ALTER TABLE is restricted or concurrent
+        }
+      }
+    }
+    hasProductStoreColumns =
+      existingCols.has('store_stocks') && existingCols.has('store_id');
+  } catch {
+    hasProductStoreColumns = false;
+  }
+  return hasProductStoreColumns;
+}
+
+async function upsertProduct(db: any, product: any, operation?: string) {
+  const hasExplicitStoreStock =
+    product.storeStock !== undefined && product.storeStock !== null;
+  const currentStock =
+    product.storeId && !hasExplicitStoreStock
+      ? 0
+      : Number(product.currentStock || 0);
+  const storeStock =
+    product.storeId && !hasExplicitStoreStock
+      ? Number(product.currentStock ?? 0)
+      : Number(product.storeStock ?? 0);
 
   await db
     .prepare(
@@ -449,7 +493,60 @@ async function upsertProduct(db: any, product: any) {
     )
     .run();
 
-  if (product.storeId && currentStock === 0 && storeStock > 0) {
+  // Safely persist per-store stock breakdown & metadata when columns exist / can be added
+  try {
+    const canPersistStoreCols = await ensureProductStoreColumns(db);
+    if (canPersistStoreCols) {
+      const storeIdVal = product.storeId || product.store_id || null;
+      const storeStocksJson = product.storeStocks
+        ? JSON.stringify(product.storeStocks)
+        : product.store_stocks
+          ? typeof product.store_stocks === 'string'
+            ? product.store_stocks
+            : JSON.stringify(product.store_stocks)
+          : null;
+      const storeDetailsJson = product.storeDetails
+        ? JSON.stringify(product.storeDetails)
+        : product.store_details
+          ? typeof product.store_details === 'string'
+            ? product.store_details
+            : JSON.stringify(product.store_details)
+          : null;
+      const variationVal = product.variation || null;
+      const customFieldsJson = product.customFields
+        ? JSON.stringify(product.customFields)
+        : product.custom_fields
+          ? typeof product.custom_fields === 'string'
+            ? product.custom_fields
+            : JSON.stringify(product.custom_fields)
+          : null;
+
+      await db
+        .prepare(
+          `UPDATE products
+           SET store_id = ?, store_stocks = ?, store_details = ?, variation = ?, custom_fields = ?
+           WHERE id = ?`
+        )
+        .bind(
+          storeIdVal,
+          storeStocksJson,
+          storeDetailsJson,
+          variationVal,
+          customFieldsJson,
+          product.id
+        )
+        .run();
+    }
+  } catch (metaErr: any) {
+    console.warn('[Push] Optional store metadata update skipped:', metaErr?.message || metaErr);
+  }
+
+  if (
+    operation === 'CREATE_PRODUCT' &&
+    product.storeId &&
+    currentStock === 0 &&
+    storeStock > 0
+  ) {
     await db
       .prepare(
         `
