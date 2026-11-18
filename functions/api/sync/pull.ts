@@ -13,7 +13,9 @@ export async function onRequestOptions() {
 export async function onRequestGet(context: any) {
   const { request, env } = context;
   const url = new URL(request.url);
-  const since = url.searchParams.get('since') || new Date(0).toISOString();
+  const rawSince = url.searchParams.get('since');
+  const hasSince = Boolean(rawSince && rawSince.trim() !== '');
+  const since = hasSince ? rawSince! : new Date(0).toISOString();
 
   try {
     const state: any = {};
@@ -21,10 +23,37 @@ export async function onRequestGet(context: any) {
     // ═══════════════════════════════════════════════════════
     // SHOPS
     // ═══════════════════════════════════════════════════════
-    const shopsResult = await env.DB.prepare(
-      'SELECT * FROM shops WHERE updated_at > ?'
-    ).bind(since).all();
-    state.shops = shopsResult.results;
+    const shopsResult = hasSince
+      ? await env.DB.prepare(
+          "SELECT * FROM shops WHERE updated_at > ? OR created_at > ? OR updated_at IS NULL OR updated_at = ''"
+        )
+          .bind(since, since)
+          .all()
+      : await env.DB.prepare('SELECT * FROM shops ORDER BY created_at DESC').all();
+    state.shops = shopsResult.results || [];
+
+    // ═══════════════════════════════════════════════════════
+    // STORES (WAREHOUSES) — always include full/null-safe list
+    // ═══════════════════════════════════════════════════════
+    try {
+      const storesResult = hasSince
+        ? await env.DB.prepare(
+            "SELECT * FROM stores WHERE updated_at > ? OR created_at > ? OR updated_at IS NULL OR updated_at = ''"
+          )
+            .bind(since, since)
+            .all()
+        : await env.DB.prepare('SELECT * FROM stores ORDER BY created_at DESC').all();
+      state.stores = storesResult.results || [];
+    } catch (storesErr: any) {
+      console.error('[pull] Primary stores query failed, falling back to SELECT * FROM stores:', storesErr?.message || storesErr);
+      try {
+        const fallbackStores = await env.DB.prepare('SELECT * FROM stores').all();
+        state.stores = fallbackStores.results || [];
+      } catch (fallbackErr: any) {
+        console.error('[pull] Fallback stores query failed:', fallbackErr?.message || fallbackErr);
+        state.stores = [];
+      }
+    }
 
     // ═══════════════════════════════════════════════════════
     // USERS (always ALL — permissions may change)
