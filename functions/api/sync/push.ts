@@ -217,6 +217,16 @@ async function deleteShop(db: any, payload: any) {
     .prepare('DELETE FROM purchases WHERE shop_id = ?')
     .bind(payload.id)
     .run();
+  try {
+    await db
+      .prepare(
+        'DELETE FROM sale_edit_requests WHERE sale_id IN (SELECT id FROM sales WHERE shop_id = ?)'
+      )
+      .bind(payload.id)
+      .run();
+  } catch {
+    // Ignore if sale_edit_requests table is absent
+  }
   await db
     .prepare(
       'DELETE FROM sale_items WHERE sale_id IN (SELECT id FROM sales WHERE shop_id = ?)'
@@ -236,6 +246,16 @@ async function deleteShop(db: any, payload: any) {
     .prepare('DELETE FROM expenses WHERE shop_id = ?')
     .bind(payload.id)
     .run();
+  try {
+    await db
+      .prepare(
+        'DELETE FROM debt_payments WHERE debt_id IN (SELECT id FROM debts WHERE shop_id = ?)'
+      )
+      .bind(payload.id)
+      .run();
+  } catch {
+    // Ignore if debt_payments table is absent
+  }
   await db
     .prepare('DELETE FROM debts WHERE shop_id = ?')
     .bind(payload.id)
@@ -329,25 +349,27 @@ async function upsertShop(db: any, shop: any) {
 }
 
 async function upsertStore(db: any, store: any) {
+  const shopId = store?.shopId || store?.shop_id;
   if (!store?.id) {
     throw new Error('upsertStore: missing store.id');
   }
-  if (!store?.shopId) {
+  if (!shopId) {
     throw new Error('upsertStore: missing store.shopId');
   }
 
   // Explicit FK pre-check so errors surface with a clear message
   const shop = await db
     .prepare('SELECT id FROM shops WHERE id = ?')
-    .bind(store.shopId)
+    .bind(shopId)
     .first();
 
   if (!shop) {
     throw new Error(
-      `Cannot upsert store "${store.name}" (id=${store.id}): shop_id "${store.shopId}" does not exist in DB. Push the shop before the store.`
+      `Cannot upsert store "${store.name}" (id=${store.id}): shop_id "${shopId}" does not exist in DB. Push the shop before the store.`
     );
   }
 
+  const now = new Date().toISOString();
   await db
     .prepare(
       `
@@ -363,12 +385,12 @@ async function upsertStore(db: any, store: any) {
     )
     .bind(
       store.id,
-      store.shopId,
+      shopId,
       store.name,
       store.location || null,
       store.status || 'ACTIVE',
-      store.createdAt || new Date().toISOString(),
-      store.updatedAt || new Date().toISOString()
+      store.createdAt || store.created_at || now,
+      store.updatedAt || store.updated_at || now
     )
     .run();
 }
