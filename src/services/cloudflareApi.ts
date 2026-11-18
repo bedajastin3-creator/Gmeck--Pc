@@ -198,6 +198,58 @@ export class CloudflareApi {
     return this.request(`/shops/${id}`);
   }
 
+  public static async deleteShop(id: string): Promise<any> {
+    return this.request(`/shops/${id}`, {
+      method: 'DELETE',
+    });
+  }
+
+  // ==========================================
+  // STORES (WAREHOUSES) ENDPOINTS
+  // ==========================================
+  public static async getStores(filters?: {
+    shopId?: string;
+    status?: string;
+  }): Promise<any[]> {
+    const params = new URLSearchParams();
+    if (filters?.shopId && filters.shopId !== 'ALL') {
+      params.append('shopId', filters.shopId);
+    }
+    if (filters?.status && filters.status !== 'ALL') {
+      params.append('status', filters.status);
+    }
+    const qs = params.toString();
+    const res = await this.request<any>(qs ? `/stores?${qs}` : '/stores');
+    if (Array.isArray(res)) return res;
+    if (res && Array.isArray(res.stores)) return res.stores;
+    if (res && Array.isArray(res.data)) return res.data;
+    return [];
+  }
+
+  public static async getStore(id: string): Promise<any> {
+    return this.request(`/stores/${id}`);
+  }
+
+  public static async createStore(store: any): Promise<any> {
+    return this.request('/stores', {
+      method: 'POST',
+      body: JSON.stringify(store),
+    });
+  }
+
+  public static async updateStore(id: string, store: any): Promise<any> {
+    return this.request(`/stores/${id}`, {
+      method: 'PUT',
+      body: JSON.stringify(store),
+    });
+  }
+
+  public static async deleteStore(id: string): Promise<any> {
+    return this.request(`/stores/${id}`, {
+      method: 'DELETE',
+    });
+  }
+
   // ==========================================
   // PRODUCTS ENDPOINTS
   // ==========================================
