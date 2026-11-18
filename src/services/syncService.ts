@@ -403,6 +403,142 @@ export class SyncService {
     db.saveSyncQueue(queue);
   }
 
+  public static applyCloudShops(
+    cloudShops: any[],
+    options?: { reconcileDeleted?: boolean }
+  ): void {
+    if (!Array.isArray(cloudShops)) return;
+
+    const queue = db.getSyncQueue();
+    const pendingDeleteShopIds = new Set(
+      queue
+        .filter(q => q.status === 'PENDING' && (q.operation || q.action) === 'DELETE_SHOP')
+        .map(q => q.entityId)
+    );
+    const pendingMutateShopIds = new Set(
+      queue
+        .filter(
+          q =>
+            q.status === 'PENDING' &&
+            ['CREATE_SHOP', 'UPDATE_SHOP', 'TOGGLE_SHOP_STATUS'].includes(
+              String(q.operation || q.action)
+            )
+        )
+        .map(q => q.entityId)
+    );
+
+    const localShops = db.getShops();
+    const merged: any[] = options?.reconcileDeleted
+      ? localShops.filter(s => pendingMutateShopIds.has(s.id) && !pendingDeleteShopIds.has(s.id))
+      : localShops.filter(s => !pendingDeleteShopIds.has(s.id));
+
+    cloudShops.forEach((cloudShop: any) => {
+      if (!cloudShop?.id || pendingDeleteShopIds.has(cloudShop.id)) return;
+      const index = merged.findIndex(s => s.id === cloudShop.id);
+      if (index !== -1 && pendingMutateShopIds.has(cloudShop.id)) {
+        return;
+      }
+      const existing = index !== -1 ? merged[index] : undefined;
+      const rawStatus = String(cloudShop.status || existing?.status || 'ACTIVE').toUpperCase();
+      const shopData = {
+        id: cloudShop.id,
+        name: cloudShop.name ?? existing?.name ?? '',
+        code: cloudShop.code ?? existing?.code,
+        description: cloudShop.description ?? existing?.description,
+        address: cloudShop.address ?? existing?.address,
+        phone: cloudShop.phone ?? existing?.phone,
+        status: (rawStatus === 'INACTIVE' ? 'INACTIVE' : 'ACTIVE') as 'ACTIVE' | 'INACTIVE',
+        color: cloudShop.color ?? existing?.color,
+        createdAt: cloudShop.created_at || cloudShop.createdAt || existing?.createdAt || new Date().toISOString(),
+        updatedAt: cloudShop.updated_at || cloudShop.updatedAt || existing?.updatedAt || new Date().toISOString(),
+      };
+
+      if (index === -1) {
+        merged.push(shopData);
+      } else {
+        merged[index] = { ...existing, ...shopData };
+      }
+    });
+
+    db.saveShops(merged);
+  }
+
+  public static applyCloudStores(
+    cloudStores: any[],
+    options?: { reconcileDeleted?: boolean }
+  ) {
+    if (!Array.isArray(cloudStores)) return db.getStores();
+
+    const queue = db.getSyncQueue();
+    const pendingDeleteStoreIds = new Set(
+      queue
+        .filter(q => q.status === 'PENDING' && (q.operation || q.action) === 'DELETE_STORE')
+        .map(q => q.entityId)
+    );
+    const pendingMutateStoreIds = new Set(
+      queue
+        .filter(
+          q =>
+            q.status === 'PENDING' &&
+            ['CREATE_STORE', 'UPDATE_STORE'].includes(String(q.operation || q.action))
+        )
+        .map(q => q.entityId)
+    );
+
+    const localStores = db.getStores();
+    const mergedStores = options?.reconcileDeleted
+      ? localStores.filter(s => pendingMutateStoreIds.has(s.id) && !pendingDeleteStoreIds.has(s.id))
+      : localStores.filter(s => !pendingDeleteStoreIds.has(s.id));
+
+    cloudStores.forEach((cloudStore: any) => {
+      if (!cloudStore?.id || pendingDeleteStoreIds.has(cloudStore.id)) return;
+      const index = mergedStores.findIndex(s => s.id === cloudStore.id);
+      if (index !== -1 && pendingMutateStoreIds.has(cloudStore.id)) {
+        return;
+      }
+
+      const existingStore = index !== -1 ? mergedStores[index] : undefined;
+      const rawStatus = String(
+        cloudStore.status || existingStore?.status || 'ACTIVE'
+      ).toUpperCase();
+      const resolvedShopId = cloudStore.shop_id || cloudStore.shopId || existingStore?.shopId || '';
+      if (!resolvedShopId) return;
+
+      const storeData = {
+        id: cloudStore.id,
+        shopId: resolvedShopId,
+        name: cloudStore.name ?? existingStore?.name ?? 'Unnamed Store',
+        location: cloudStore.location || existingStore?.location || undefined,
+        status: (rawStatus === 'INACTIVE' ? 'INACTIVE' : 'ACTIVE') as 'ACTIVE' | 'INACTIVE',
+        isShopFloor:
+          cloudStore.is_shop_floor !== undefined
+            ? Boolean(cloudStore.is_shop_floor)
+            : cloudStore.isShopFloor !== undefined
+              ? Boolean(cloudStore.isShopFloor)
+              : existingStore?.isShopFloor,
+        createdAt:
+          cloudStore.created_at ||
+          cloudStore.createdAt ||
+          existingStore?.createdAt ||
+          new Date().toISOString(),
+        updatedAt:
+          cloudStore.updated_at ||
+          cloudStore.updatedAt ||
+          existingStore?.updatedAt ||
+          new Date().toISOString(),
+      };
+
+      if (index === -1) {
+        mergedStores.push(storeData);
+      } else {
+        mergedStores[index] = { ...existingStore, ...storeData };
+      }
+    });
+
+    db.saveStores(mergedStores);
+    return mergedStores;
+  }
+
   // ==========================================
   // APPLY CLOUD DATA TO LOCAL DATABASE
   // ==========================================
@@ -410,65 +546,13 @@ export class SyncService {
     if (!cloudData) return;
 
     // Apply shops
-    if (cloudData.shops && cloudData.shops.length > 0) {
-      const localShops = db.getShops();
-      const merged = [...localShops];
-
-      cloudData.shops.forEach((cloudShop: any) => {
-        const index = merged.findIndex(s => s.id === cloudShop.id);
-        const shopData = {
-          id: cloudShop.id,
-          name: cloudShop.name,
-          code: cloudShop.code,
-          description: cloudShop.description,
-          address: cloudShop.address,
-          phone: cloudShop.phone,
-          status: cloudShop.status,
-          color: cloudShop.color,
-          createdAt: cloudShop.created_at,
-          updatedAt: cloudShop.updated_at,
-        };
-
-        if (index === -1) {
-          merged.push(shopData);
-        } else {
-          merged[index] = { ...merged[index], ...shopData };
-        }
-      });
-
-      db.saveShops(merged);
+    if (Array.isArray(cloudData.shops) && cloudData.shops.length > 0) {
+      this.applyCloudShops(cloudData.shops);
     }
 
     // Apply stores (warehouses)
-    if (cloudData.stores && cloudData.stores.length > 0) {
-      const localStores = db.getStores();
-      const mergedStores = [...localStores];
-
-      cloudData.stores.forEach((cloudStore: any) => {
-        const index = mergedStores.findIndex(s => s.id === cloudStore.id);
-        const existingStore = index !== -1 ? mergedStores[index] : undefined;
-        const storeData = {
-          id: cloudStore.id,
-          shopId: cloudStore.shop_id || cloudStore.shopId,
-          name: cloudStore.name,
-          location: cloudStore.location || undefined,
-          status: cloudStore.status || 'ACTIVE',
-          isShopFloor:
-            cloudStore.is_shop_floor !== undefined
-              ? Boolean(cloudStore.is_shop_floor)
-              : existingStore?.isShopFloor,
-          createdAt: cloudStore.created_at || cloudStore.createdAt,
-          updatedAt: cloudStore.updated_at || cloudStore.updatedAt,
-        };
-
-        if (index === -1) {
-          mergedStores.push(storeData);
-        } else {
-          mergedStores[index] = { ...mergedStores[index], ...storeData };
-        }
-      });
-
-      db.saveStores(mergedStores);
+    if (Array.isArray(cloudData.stores) && cloudData.stores.length > 0) {
+      this.applyCloudStores(cloudData.stores);
     }
 
     // Apply users
@@ -587,11 +671,38 @@ export class SyncService {
             updatedAt: img.updated_at,
           }));
 
+        const parseMaybeJson = <T,>(raw: any, fallback?: T): T | undefined => {
+          if (raw === undefined || raw === null || raw === '') return fallback;
+          if (typeof raw === 'string') {
+            try {
+              return JSON.parse(raw) as T;
+            } catch {
+              return fallback;
+            }
+          }
+          return raw as T;
+        };
+
         const existingProd = index !== -1 ? mergedProducts[index] : undefined;
+        const parsedStoreStocks = parseMaybeJson<Record<string, number>>(
+          cloudProduct.store_stocks ?? cloudProduct.storeStocks,
+          existingProd?.storeStocks
+        );
+        const parsedStoreDetails = parseMaybeJson<Record<string, any>>(
+          cloudProduct.store_details ?? cloudProduct.storeDetails,
+          existingProd?.storeDetails
+        );
+        const parsedCustomFields = parseMaybeJson<any>(
+          cloudProduct.custom_fields ?? cloudProduct.customFields,
+          existingProd?.customFields
+        );
+
         const productData = {
           id: cloudProduct.id,
           shopId: cloudProduct.shop_id,
+          storeId: cloudProduct.store_id || cloudProduct.storeId || existingProd?.storeId,
           name: cloudProduct.name,
+          variation: cloudProduct.variation ?? existingProd?.variation,
           sku: cloudProduct.sku,
           barcode: cloudProduct.barcode || existingProd?.barcode || '',
           categoryId: cloudProduct.category_id,
@@ -600,6 +711,9 @@ export class SyncService {
           purchasePrice: cloudProduct.purchase_price,
           currentStock: cloudProduct.current_stock ?? existingProd?.currentStock ?? 0,
           storeStock: cloudProduct.store_stock ?? existingProd?.storeStock ?? 0,
+          ...(parsedStoreStocks ? { storeStocks: parsedStoreStocks } : {}),
+          ...(parsedStoreDetails ? { storeDetails: parsedStoreDetails } : {}),
+          ...(parsedCustomFields ? { customFields: parsedCustomFields } : {}),
           minStock: cloudProduct.min_stock,
           unit: cloudProduct.unit,
           status: cloudProduct.status,
@@ -922,6 +1036,117 @@ export class SyncService {
           cloudData.settings.receipt_footer_note;
 
       db.saveSettings(mergedSettings);
+    }
+
+    // Reconstruct per-store stock breakdown from movements/purchases when missing after cloud pull
+    this.reconcileStoreStocksFromMovements();
+  }
+
+  public static reconcileStoreStocksFromMovements(): void {
+    const stores = db.getStores();
+    const products = db.getProducts();
+    if (stores.length === 0 || products.length === 0) return;
+
+    const validStoreIdSet = new Set(stores.map(s => s.id));
+    const warehouseStoresByShop = new Map<string, any[]>();
+    for (const st of stores) {
+      if (!st.isShopFloor) {
+        const list = warehouseStoresByShop.get(st.shopId) || [];
+        list.push(st);
+        warehouseStoresByShop.set(st.shopId, list);
+      }
+    }
+
+    const movements = db.getMovements();
+    const purchases = db.getPurchases();
+    const mvByProduct = new Map<string, Map<string, number>>();
+    for (const m of movements) {
+      if (!m.storeId || !validStoreIdSet.has(m.storeId)) continue;
+      let storeMap = mvByProduct.get(m.productId);
+      if (!storeMap) {
+        storeMap = new Map<string, number>();
+        mvByProduct.set(m.productId, storeMap);
+      }
+      storeMap.set(m.storeId, (storeMap.get(m.storeId) || 0) + Number(m.changeQty || 0));
+    }
+    for (const pur of purchases) {
+      if (!pur.storeId || !validStoreIdSet.has(pur.storeId)) continue;
+      for (const item of pur.items || []) {
+        let storeMap = mvByProduct.get(item.productId);
+        if (!storeMap) {
+          storeMap = new Map<string, number>();
+          mvByProduct.set(item.productId, storeMap);
+        }
+        if (!storeMap.has(pur.storeId)) {
+          storeMap.set(pur.storeId, Number(item.quantity || 0));
+        }
+      }
+    }
+
+    let changed = false;
+    const updatedProducts = products.map(p => {
+      const storeStockTotal = Number(p.storeStock || 0);
+      const validExistingEntries = p.storeStocks
+        ? Object.entries(p.storeStocks).filter(([sid]) => validStoreIdSet.has(sid))
+        : [];
+      const mappedWarehouseSum = validExistingEntries.reduce((sum, [sid, q]) => {
+        const st = stores.find(s => s.id === sid);
+        return st?.isShopFloor ? sum : sum + Math.max(0, Number(q || 0));
+      }, 0);
+
+      if (validExistingEntries.length > 0 && (storeStockTotal === 0 || mappedWarehouseSum > 0)) {
+        return p;
+      }
+      if (storeStockTotal <= 0) return p;
+
+      const shopWarehouses = (warehouseStoresByShop.get(p.shopId) || []).filter(
+        s => s.status === 'ACTIVE'
+      );
+      const fallbackWarehouses =
+        shopWarehouses.length > 0 ? shopWarehouses : warehouseStoresByShop.get(p.shopId) || [];
+      if (fallbackWarehouses.length === 0) return p;
+
+      const nextStoreStocks: Record<string, number> = { ...(p.storeStocks || {}) };
+
+      if (p.storeId && fallbackWarehouses.some(w => w.id === p.storeId)) {
+        nextStoreStocks[p.storeId] = storeStockTotal;
+        changed = true;
+        return { ...p, storeStocks: nextStoreStocks };
+      }
+
+      const prodMv = mvByProduct.get(p.id);
+      if (prodMv && prodMv.size > 0) {
+        const positiveEntries = Array.from(prodMv.entries()).filter(
+          ([sid, qty]) =>
+            qty > 0 && fallbackWarehouses.some(w => w.id === sid)
+        );
+        if (positiveEntries.length > 0) {
+          const mvSum = positiveEntries.reduce((s, [, q]) => s + q, 0);
+          let assigned = 0;
+          positiveEntries.forEach(([sid, q], idx) => {
+            const share =
+              idx === positiveEntries.length - 1
+                ? Math.max(0, storeStockTotal - assigned)
+                : Math.round((q / mvSum) * storeStockTotal);
+            nextStoreStocks[sid] = share;
+            assigned += share;
+          });
+          changed = true;
+          return { ...p, storeStocks: nextStoreStocks };
+        }
+      }
+
+      if (fallbackWarehouses.length === 1) {
+        nextStoreStocks[fallbackWarehouses[0].id] = storeStockTotal;
+        changed = true;
+        return { ...p, storeStocks: nextStoreStocks };
+      }
+
+      return p;
+    });
+
+    if (changed) {
+      db.saveProducts(updatedProducts);
     }
   }
 }
