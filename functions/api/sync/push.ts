@@ -134,6 +134,9 @@ async function processOperation(db: any, op: any) {
     case 'UPDATE_PURCHASE':
       await updatePurchase(db, payload);
       break;
+    case 'DELETE_PURCHASE':
+      await deletePurchase(db, payload);
+      break;
 
     case 'CREATE_EXPENSE':
       await createExpense(db, payload);
@@ -1159,6 +1162,150 @@ async function updatePurchase(db: any, purchase: any) {
       }
     }
   }
+}
+
+async function deletePurchase(db: any, payload: any) {
+  const purchaseId = payload?.id || payload?.purchaseId;
+  if (!purchaseId) return;
+
+  const existingPurchase = await db
+    .prepare(
+      'SELECT id, shop_id, shop_name, supplier_name, purchase_number FROM purchases WHERE id = ?'
+    )
+    .bind(purchaseId)
+    .first();
+
+  // Only revert stock if the purchase still exists in D1 (idempotent on retry)
+  if (existingPurchase) {
+    const existingItemsRes = await db
+      .prepare(
+        'SELECT product_id, product_name, quantity, unit_cost, total FROM purchase_items WHERE purchase_id = ?'
+      )
+      .bind(purchaseId)
+      .all();
+
+    const itemsToRevert =
+      existingItemsRes?.results && existingItemsRes.results.length > 0
+        ? existingItemsRes.results.map((row: any) => ({
+            productId: row.product_id,
+            productName: row.product_name,
+            quantity: Number(row.quantity) || 0,
+            unitCost: Number(row.unit_cost) || 0,
+            total: Number(row.total) || 0,
+          }))
+        : (payload.items || []).map((item: any) => ({
+            productId: item.productId,
+            productName: item.productName,
+            quantity: Number(item.quantity) || 0,
+            unitCost: Number(item.unitCost) || 0,
+            total: Number(item.total) || 0,
+          }));
+
+    const nowIso = payload.voidedAt || new Date().toISOString();
+    const isStorePurchase = Boolean(payload.storeId);
+
+    for (const item of itemsToRevert) {
+      if (!item.productId || item.quantity <= 0) continue;
+
+      const product = await db
+        .prepare('SELECT current_stock, store_stock FROM products WHERE id = ?')
+        .bind(item.productId)
+        .first();
+
+      if (product) {
+        const prevFloor = Number(product.current_stock) || 0;
+        const prevStore = Number(product.store_stock) || 0;
+
+        if (isStorePurchase) {
+          const nextStore = Math.max(0, prevStore - item.quantity);
+          await db
+            .prepare('UPDATE products SET store_stock = ?, updated_at = ? WHERE id = ?')
+            .bind(nextStore, nowIso, item.productId)
+            .run();
+
+          await db
+            .prepare(
+              `
+            INSERT INTO inventory_movements (
+              id, shop_id, shop_name, store_id, product_id, product_name,
+              previous_qty, change_qty, new_qty, type, reason, cost_value,
+              reference_id, user_id, user_name, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO NOTHING
+          `
+            )
+            .bind(
+              crypto.randomUUID(),
+              payload.shopId || existingPurchase.shop_id,
+              payload.shopName || existingPurchase.shop_name || null,
+              payload.storeId || null,
+              item.productId,
+              item.productName,
+              prevStore,
+              -item.quantity,
+              nextStore,
+              'VOID_RETURN',
+              `Voided & deleted PO ${payload.purchaseNumber || existingPurchase.purchase_number || purchaseId}: ${payload.reason || 'Purchase voided'}`,
+              item.total || item.unitCost * item.quantity,
+              purchaseId,
+              payload.voidedByUserId || 'system',
+              payload.voidedByName || 'Admin',
+              nowIso
+            )
+            .run();
+        } else {
+          const nextFloor = Math.max(0, prevFloor - item.quantity);
+          await db
+            .prepare('UPDATE products SET current_stock = ?, updated_at = ? WHERE id = ?')
+            .bind(nextFloor, nowIso, item.productId)
+            .run();
+
+          await db
+            .prepare(
+              `
+            INSERT INTO inventory_movements (
+              id, shop_id, shop_name, store_id, product_id, product_name,
+              previous_qty, change_qty, new_qty, type, reason, cost_value,
+              reference_id, user_id, user_name, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO NOTHING
+          `
+            )
+            .bind(
+              crypto.randomUUID(),
+              payload.shopId || existingPurchase.shop_id,
+              payload.shopName || existingPurchase.shop_name || null,
+              null,
+              item.productId,
+              item.productName,
+              prevFloor,
+              -item.quantity,
+              nextFloor,
+              'VOID_RETURN',
+              `Voided & deleted PO ${payload.purchaseNumber || existingPurchase.purchase_number || purchaseId}: ${payload.reason || 'Purchase voided'}`,
+              item.total || item.unitCost * item.quantity,
+              purchaseId,
+              payload.voidedByUserId || 'system',
+              payload.voidedByName || 'Admin',
+              nowIso
+            )
+            .run();
+        }
+      }
+    }
+  }
+
+  await db
+    .prepare('DELETE FROM purchase_items WHERE purchase_id = ?')
+    .bind(purchaseId)
+    .run();
+
+  await db
+    .prepare('DELETE FROM purchases WHERE id = ?')
+    .bind(purchaseId)
+    .run();
 }
 
 // ──────────────────────────────────────────────────────────
