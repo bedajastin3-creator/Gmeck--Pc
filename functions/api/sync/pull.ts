@@ -176,19 +176,30 @@ export async function onRequestGet(context: any) {
     state.movements = movementsResult.results;
 
     // ═══════════════════════════════════════════════════════
-    // STOCK TRANSFERS (safe fallback if table not yet created)
+    // STOCK TRANSFERS (safe fallback if table not yet migrated)
     // ═══════════════════════════════════════════════════════
     try {
       const transfersResult = hasSince
         ? await env.DB.prepare(
-            'SELECT * FROM stock_transfers WHERE updated_at > ? OR created_at > ?'
+            "SELECT * FROM stock_transfers WHERE updated_at > ? OR created_at > ? OR updated_at IS NULL OR updated_at = ''"
           )
             .bind(since, since)
             .all()
         : await env.DB.prepare('SELECT * FROM stock_transfers ORDER BY created_at DESC').all();
       state.stockTransfers = transfersResult.results || [];
     } catch {
-      state.stockTransfers = [];
+      try {
+        const fallbackTransfers = hasSince
+          ? await env.DB.prepare(
+              'SELECT * FROM stock_transfers WHERE created_at > ? ORDER BY created_at DESC'
+            )
+              .bind(since)
+              .all()
+          : await env.DB.prepare('SELECT * FROM stock_transfers ORDER BY created_at DESC').all();
+        state.stockTransfers = fallbackTransfers.results || [];
+      } catch {
+        state.stockTransfers = [];
+      }
     }
 
     // ═══════════════════════════════════════════════════════
