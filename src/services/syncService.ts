@@ -31,6 +31,7 @@ const OP_ORDER: Record<string, number> = {
   CREATE_PURCHASE: 4,
   UPDATE_PURCHASE: 4,
   TRANSFER_STORE_TO_SHOP: 4,
+  UPSERT_STOCK_TRANSFER: 4,
 
   // Tier 5 — sales & downstream
   CREATE_SALE: 5,
@@ -46,6 +47,7 @@ const OP_ORDER: Record<string, number> = {
   // Cleanup
   DELETE_SHOP: 90,
   DELETE_STORE: 90,
+  DELETE_STOCK_TRANSFER: 90,
   DELETE_PRODUCT_DEEP: 90,
 };
 
@@ -1036,6 +1038,80 @@ export class SyncService {
           cloudData.settings.receipt_footer_note;
 
       db.saveSettings(mergedSettings);
+    }
+
+    // Apply stock transfers
+    if (Array.isArray(cloudData.stockTransfers) && cloudData.stockTransfers.length > 0) {
+      const queue = db.getSyncQueue();
+      const pendingDeleteIds = new Set(
+        queue
+          .filter(q => q.status === 'PENDING' && (q.operation || q.action) === 'DELETE_STOCK_TRANSFER')
+          .map(q => q.entityId)
+      );
+      const pendingUpsertIds = new Set(
+        queue
+          .filter(q => q.status === 'PENDING' && (q.operation || q.action) === 'UPSERT_STOCK_TRANSFER')
+          .map(q => q.entityId)
+      );
+
+      const localTransfers = db.getStockTransfers().filter(t => !pendingDeleteIds.has(t.id));
+      const mergedTransfers = [...localTransfers];
+
+      cloudData.stockTransfers.forEach((ct: any) => {
+        if (!ct?.id || pendingDeleteIds.has(ct.id)) return;
+        const idx = mergedTransfers.findIndex(t => t.id === ct.id);
+        if (idx !== -1 && pendingUpsertIds.has(ct.id)) return;
+
+        let parsedItems: any[] = [];
+        try {
+          parsedItems =
+            typeof ct.items_json === 'string'
+              ? JSON.parse(ct.items_json)
+              : Array.isArray(ct.items)
+                ? ct.items
+                : [];
+        } catch {
+          parsedItems = [];
+        }
+
+        const record = {
+          id: ct.id,
+          transferNumber: ct.transfer_number || ct.transferNumber || `TRF-${String(ct.id).slice(0, 6).toUpperCase()}`,
+          transferDate: ct.transfer_date || ct.transferDate || (ct.created_at || ct.createdAt || new Date().toISOString()).slice(0, 10),
+          sourceType: (ct.source_type || ct.sourceType || 'STORE') as 'STORE' | 'SHOP',
+          sourceId: ct.source_id || ct.sourceId || '',
+          sourceName: ct.source_name || ct.sourceName || 'Source',
+          sourceLocation: ct.source_location || ct.sourceLocation || undefined,
+          sourceShopId: ct.source_shop_id || ct.sourceShopId || '',
+          sourceShopName: ct.source_shop_name || ct.sourceShopName || undefined,
+          destType: (ct.dest_type || ct.destType || 'SHOP') as 'STORE' | 'SHOP',
+          destId: ct.dest_id || ct.destId || '',
+          destName: ct.dest_name || ct.destName || 'Destination',
+          destLocation: ct.dest_location || ct.destLocation || undefined,
+          destShopId: ct.dest_shop_id || ct.destShopId || '',
+          destShopName: ct.dest_shop_name || ct.destShopName || undefined,
+          status: (ct.status === 'NOT_COMPLETED' ? 'NOT_COMPLETED' : 'COMPLETED') as 'COMPLETED' | 'NOT_COMPLETED',
+          shippingCharges: Number(ct.shipping_charges ?? ct.shippingCharges ?? 0),
+          notice: ct.notice || undefined,
+          items: parsedItems,
+          totalUnits: Number(ct.total_units ?? ct.totalUnits ?? 0),
+          totalAmount: Number(ct.total_amount ?? ct.totalAmount ?? 0),
+          createdByUserId: ct.created_by_user_id || ct.createdByUserId || '',
+          createdByName: ct.created_by_name || ct.createdByName || 'System',
+          createdAt: ct.created_at || ct.createdAt || new Date().toISOString(),
+          updatedAt: ct.updated_at || ct.updatedAt || new Date().toISOString(),
+        };
+
+        if (idx === -1) {
+          mergedTransfers.push(record);
+        } else {
+          mergedTransfers[idx] = { ...mergedTransfers[idx], ...record };
+        }
+      });
+
+      db.saveStockTransfers(
+        mergedTransfers.sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''))
+      );
     }
 
     // Reconstruct per-store stock breakdown from movements/purchases when missing after cloud pull
