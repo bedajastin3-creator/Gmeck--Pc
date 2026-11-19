@@ -663,42 +663,102 @@ async function upsertCategory(db: any, category: any) {
 // SALES
 // ──────────────────────────────────────────────────────────
 
+let salesAssistantColChecked = false;
+let hasSalesAssistantCol = false;
+
+async function ensureSalesAssistantColumn(db: any): Promise<boolean> {
+  if (salesAssistantColChecked) return hasSalesAssistantCol;
+  salesAssistantColChecked = true;
+  try {
+    const info = await db.prepare('PRAGMA table_info(sales)').all();
+    const cols = new Set(
+      (info?.results || []).map((c: any) => String(c.name || '').toLowerCase())
+    );
+    if (!cols.has('assistant_name')) {
+      await db.prepare('ALTER TABLE sales ADD COLUMN assistant_name TEXT').run();
+    }
+    hasSalesAssistantCol = true;
+  } catch {
+    hasSalesAssistantCol = false;
+  }
+  return hasSalesAssistantCol;
+}
+
 async function createSale(db: any, sale: any) {
   const now = new Date().toISOString();
-  await db
-    .prepare(
-      `
-    INSERT INTO sales (
-      id, receipt_number, shop_id, shop_name, seller_id, seller_name,
-      subtotal, discount, tax, total, cost_of_goods, gross_profit,
-      payment_method, amount_received, change, status, notes, created_at, updated_at
-    )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(id) DO NOTHING
-  `
-    )
-    .bind(
-      sale.id,
-      sale.receiptNumber,
-      sale.shopId,
-      sale.shopName || null,
-      sale.sellerId,
-      sale.sellerName,
-      sale.subtotal || 0,
-      sale.discount || 0,
-      sale.tax || 0,
-      sale.total || 0,
-      sale.costOfGoods || 0,
-      sale.grossProfit || 0,
-      sale.paymentMethod,
-      sale.amountReceived || 0,
-      sale.change || 0,
-      sale.status || 'COMPLETED',
-      sale.notes || null,
-      sale.createdAt || now,
-      now
-    )
-    .run();
+  const assistantColOk = await ensureSalesAssistantColumn(db);
+  if (assistantColOk) {
+    await db
+      .prepare(
+        `
+      INSERT INTO sales (
+        id, receipt_number, shop_id, shop_name, seller_id, seller_name, assistant_name,
+        subtotal, discount, tax, total, cost_of_goods, gross_profit,
+        payment_method, amount_received, change, status, notes, created_at, updated_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO NOTHING
+    `
+      )
+      .bind(
+        sale.id,
+        sale.receiptNumber,
+        sale.shopId,
+        sale.shopName || null,
+        sale.sellerId,
+        sale.sellerName,
+        sale.assistantName || null,
+        sale.subtotal || 0,
+        sale.discount || 0,
+        sale.tax || 0,
+        sale.total || 0,
+        sale.costOfGoods || 0,
+        sale.grossProfit || 0,
+        sale.paymentMethod,
+        sale.amountReceived || 0,
+        sale.change || 0,
+        sale.status || 'COMPLETED',
+        sale.notes || null,
+        sale.createdAt || now,
+        now
+      )
+      .run();
+  } else {
+    await db
+      .prepare(
+        `
+      INSERT INTO sales (
+        id, receipt_number, shop_id, shop_name, seller_id, seller_name,
+        subtotal, discount, tax, total, cost_of_goods, gross_profit,
+        payment_method, amount_received, change, status, notes, created_at, updated_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO NOTHING
+    `
+      )
+      .bind(
+        sale.id,
+        sale.receiptNumber,
+        sale.shopId,
+        sale.shopName || null,
+        sale.sellerId,
+        sale.sellerName,
+        sale.subtotal || 0,
+        sale.discount || 0,
+        sale.tax || 0,
+        sale.total || 0,
+        sale.costOfGoods || 0,
+        sale.grossProfit || 0,
+        sale.paymentMethod,
+        sale.amountReceived || 0,
+        sale.change || 0,
+        sale.status || 'COMPLETED',
+        sale.notes || null,
+        sale.createdAt || now,
+        now
+      )
+      .run();
+  }
 
   for (const item of sale.items || []) {
     await db
@@ -1389,35 +1449,92 @@ async function recordStockAdjustment(db: any, movement: any) {
   }
 }
 
+let settingsAssistantColChecked = false;
+let hasSettingsAssistantCol = false;
+
+async function ensureSettingsAssistantColumn(db: any): Promise<boolean> {
+  if (settingsAssistantColChecked) return hasSettingsAssistantCol;
+  settingsAssistantColChecked = true;
+  try {
+    const info = await db.prepare('PRAGMA table_info(settings)').all();
+    const cols = new Set(
+      (info?.results || []).map((c: any) => String(c.name || '').toLowerCase())
+    );
+    if (!cols.has('enable_sales_assistant')) {
+      await db
+        .prepare('ALTER TABLE settings ADD COLUMN enable_sales_assistant INTEGER DEFAULT 0')
+        .run();
+    }
+    hasSettingsAssistantCol = true;
+  } catch {
+    hasSettingsAssistantCol = false;
+  }
+  return hasSettingsAssistantCol;
+}
+
 async function updateSettings(db: any, settings: any) {
-  await db
-    .prepare(
-      `
-    UPDATE settings SET
-      business_name = ?, tagline = ?, address = ?, phone = ?, email = ?,
-      currency_symbol = ?, currency_code = ?, tax_rate_percent = ?, enable_tax = ?,
-      receipt_header_note = ?, receipt_footer_note = ?, receipt_paper_width = ?,
-      low_stock_threshold_default = ?, updated_at = ?
-    WHERE id = 'global'
-  `
-    )
-    .bind(
-      settings.businessName || 'Diocres Hardware&Retail Solutions',
-      settings.tagline || null,
-      settings.address || null,
-      settings.phone || null,
-      settings.email || null,
-      settings.currencySymbol || 'TSh',
-      settings.currencyCode || 'TZS',
-      settings.taxRatePercent || 0,
-      settings.enableTax ? 1 : 0,
-      settings.receiptHeaderNote || null,
-      settings.receiptFooterNote || null,
-      settings.receiptPaperWidth || '80mm',
-      settings.lowStockThresholdDefault || 5,
-      new Date().toISOString()
-    )
-    .run();
+  const assistantColOk = await ensureSettingsAssistantColumn(db);
+  if (assistantColOk) {
+    await db
+      .prepare(
+        `
+      UPDATE settings SET
+        business_name = ?, tagline = ?, address = ?, phone = ?, email = ?,
+        currency_symbol = ?, currency_code = ?, tax_rate_percent = ?, enable_tax = ?,
+        enable_sales_assistant = ?,
+        receipt_header_note = ?, receipt_footer_note = ?, receipt_paper_width = ?,
+        low_stock_threshold_default = ?, updated_at = ?
+      WHERE id = 'global'
+    `
+      )
+      .bind(
+        settings.businessName || 'Diocres Hardware&Retail Solutions',
+        settings.tagline || null,
+        settings.address || null,
+        settings.phone || null,
+        settings.email || null,
+        settings.currencySymbol || 'TSh',
+        settings.currencyCode || 'TZS',
+        settings.taxRatePercent || 0,
+        settings.enableTax ? 1 : 0,
+        settings.enableSalesAssistant ? 1 : 0,
+        settings.receiptHeaderNote || null,
+        settings.receiptFooterNote || null,
+        settings.receiptPaperWidth || '80mm',
+        settings.lowStockThresholdDefault || 5,
+        new Date().toISOString()
+      )
+      .run();
+  } else {
+    await db
+      .prepare(
+        `
+      UPDATE settings SET
+        business_name = ?, tagline = ?, address = ?, phone = ?, email = ?,
+        currency_symbol = ?, currency_code = ?, tax_rate_percent = ?, enable_tax = ?,
+        receipt_header_note = ?, receipt_footer_note = ?, receipt_paper_width = ?,
+        low_stock_threshold_default = ?, updated_at = ?
+      WHERE id = 'global'
+    `
+      )
+      .bind(
+        settings.businessName || 'Diocres Hardware&Retail Solutions',
+        settings.tagline || null,
+        settings.address || null,
+        settings.phone || null,
+        settings.email || null,
+        settings.currencySymbol || 'TSh',
+        settings.currencyCode || 'TZS',
+        settings.taxRatePercent || 0,
+        settings.enableTax ? 1 : 0,
+        settings.receiptHeaderNote || null,
+        settings.receiptFooterNote || null,
+        settings.receiptPaperWidth || '80mm',
+        settings.lowStockThresholdDefault || 5,
+        new Date().toISOString()
+      )
+      .run();
+  }
 }
 
 async function createDebt(db: any, debt: any) {
