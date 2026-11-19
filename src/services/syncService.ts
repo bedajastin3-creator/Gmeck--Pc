@@ -768,6 +768,7 @@ export class SyncService {
           shopName: cloudSale.shop_name,
           sellerId: cloudSale.seller_id,
           sellerName: cloudSale.seller_name,
+          assistantName: cloudSale.assistant_name || undefined,
           subtotal: cloudSale.subtotal,
           discount: cloudSale.discount,
           tax: cloudSale.tax,
@@ -1030,6 +1031,8 @@ export class SyncService {
         mergedSettings.taxRatePercent = cloudData.settings.tax_rate_percent;
       if (cloudData.settings.enable_tax !== undefined)
         mergedSettings.enableTax = !!cloudData.settings.enable_tax;
+      if (cloudData.settings.enable_sales_assistant !== undefined)
+        mergedSettings.enableSalesAssistant = !!cloudData.settings.enable_sales_assistant;
       if (cloudData.settings.receipt_header_note)
         mergedSettings.receiptHeaderNote =
           cloudData.settings.receipt_header_note;
