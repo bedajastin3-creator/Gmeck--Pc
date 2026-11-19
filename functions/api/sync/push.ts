@@ -183,6 +183,12 @@ async function processOperation(db: any, op: any) {
     case 'TRANSFER_STORE_TO_SHOP':
       await transferStoreToShop(db, payload);
       break;
+    case 'UPSERT_STOCK_TRANSFER':
+      await upsertStockTransfer(db, payload);
+      break;
+    case 'DELETE_STOCK_TRANSFER':
+      await deleteStockTransfer(db, payload);
+      break;
 
     default:
       throw new Error(`Unknown operation: ${operation}`);
@@ -1502,6 +1508,8 @@ async function transferStoreToShop(db: any, transfer: any) {
     }
   }
 
+  await ensureProductStoreColumns(db);
+
   const product = await db
     .prepare(
       'SELECT current_stock, store_stock, name FROM products WHERE id = ?'
@@ -1529,6 +1537,33 @@ async function transferStoreToShop(db: any, transfer: any) {
     )
     .bind(newShopStock, newStoreStock, now, transfer.productId)
     .run();
+
+  if (transfer.nextStoreStocks || transfer.nextStoreDetails) {
+    try {
+      const storeColsOk = await ensureProductStoreColumns(db);
+      if (storeColsOk) {
+        if (transfer.nextStoreStocks && transfer.nextStoreDetails) {
+          await db
+            .prepare(
+              'UPDATE products SET store_stocks = ?, store_details = ? WHERE id = ?'
+            )
+            .bind(
+              JSON.stringify(transfer.nextStoreStocks),
+              JSON.stringify(transfer.nextStoreDetails),
+              transfer.productId
+            )
+            .run();
+        } else if (transfer.nextStoreStocks) {
+          await db
+            .prepare('UPDATE products SET store_stocks = ? WHERE id = ?')
+            .bind(JSON.stringify(transfer.nextStoreStocks), transfer.productId)
+            .run();
+        }
+      }
+    } catch {
+      // Ignore if optional store columns are unavailable
+    }
+  }
 
   await db
     .prepare(
@@ -1587,4 +1622,129 @@ async function transferStoreToShop(db: any, transfer: any) {
       now
     )
     .run();
+}
+
+async function ensureStockTransfersTable(db: any) {
+  await db
+    .prepare(
+      `
+      CREATE TABLE IF NOT EXISTS stock_transfers (
+        id TEXT PRIMARY KEY,
+        transfer_number TEXT,
+        transfer_date TEXT NOT NULL,
+        source_type TEXT NOT NULL,
+        source_id TEXT NOT NULL,
+        source_name TEXT NOT NULL,
+        source_location TEXT,
+        source_shop_id TEXT NOT NULL,
+        source_shop_name TEXT,
+        dest_type TEXT NOT NULL,
+        dest_id TEXT NOT NULL,
+        dest_name TEXT NOT NULL,
+        dest_location TEXT,
+        dest_shop_id TEXT NOT NULL,
+        dest_shop_name TEXT,
+        status TEXT NOT NULL,
+        shipping_charges REAL DEFAULT 0,
+        notice TEXT,
+        items_json TEXT NOT NULL,
+        total_units INTEGER DEFAULT 0,
+        total_amount REAL DEFAULT 0,
+        created_by_user_id TEXT,
+        created_by_name TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      )
+    `
+    )
+    .run();
+}
+
+async function upsertStockTransfer(db: any, t: any) {
+  await ensureStockTransfersTable(db);
+  const now = new Date().toISOString();
+  await db
+    .prepare(
+      `
+      INSERT INTO stock_transfers (
+        id, transfer_number, transfer_date,
+        source_type, source_id, source_name, source_location, source_shop_id, source_shop_name,
+        dest_type, dest_id, dest_name, dest_location, dest_shop_id, dest_shop_name,
+        status, shipping_charges, notice, items_json,
+        total_units, total_amount, created_by_user_id, created_by_name,
+        created_at, updated_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        transfer_number = excluded.transfer_number,
+        transfer_date = excluded.transfer_date,
+        source_type = excluded.source_type,
+        source_id = excluded.source_id,
+        source_name = excluded.source_name,
+        source_location = excluded.source_location,
+        source_shop_id = excluded.source_shop_id,
+        source_shop_name = excluded.source_shop_name,
+        dest_type = excluded.dest_type,
+        dest_id = excluded.dest_id,
+        dest_name = excluded.dest_name,
+        dest_location = excluded.dest_location,
+        dest_shop_id = excluded.dest_shop_id,
+        dest_shop_name = excluded.dest_shop_name,
+        status = excluded.status,
+        shipping_charges = excluded.shipping_charges,
+        notice = excluded.notice,
+        items_json = excluded.items_json,
+        total_units = excluded.total_units,
+        total_amount = excluded.total_amount,
+        updated_at = excluded.updated_at
+    `
+    )
+    .bind(
+      t.id,
+      t.transferNumber || null,
+      t.transferDate || now.slice(0, 10),
+      t.sourceType || 'STORE',
+      t.sourceId || '',
+      t.sourceName || 'Source',
+      t.sourceLocation || null,
+      t.sourceShopId || '',
+      t.sourceShopName || null,
+      t.destType || 'SHOP',
+      t.destId || '',
+      t.destName || 'Destination',
+      t.destLocation || null,
+      t.destShopId || '',
+      t.destShopName || null,
+      t.status || 'COMPLETED',
+      Number(t.shippingCharges || 0),
+      t.notice || null,
+      JSON.stringify(t.items || []),
+      Number(t.totalUnits || 0),
+      Number(t.totalAmount || 0),
+      t.createdByUserId || null,
+      t.createdByName || null,
+      t.createdAt || now,
+      t.updatedAt || now
+    )
+    .run();
+}
+
+async function deleteStockTransfer(db: any, payload: any) {
+  try {
+    await ensureStockTransfersTable(db);
+    await db
+      .prepare('DELETE FROM stock_transfers WHERE id = ?')
+      .bind(payload.id)
+      .run();
+  } catch {
+    // Ignore if table doesn't exist
+  }
+  try {
+    await db
+      .prepare("DELETE FROM inventory_movements WHERE reference_id = ? AND type = 'STORE_TRANSFER'")
+      .bind(payload.id)
+      .run();
+  } catch {
+    // Ignore optional movement cleanup failure
+  }
 }
