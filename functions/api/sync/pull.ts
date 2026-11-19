@@ -176,6 +176,22 @@ export async function onRequestGet(context: any) {
     state.movements = movementsResult.results;
 
     // ═══════════════════════════════════════════════════════
+    // STOCK TRANSFERS (safe fallback if table not yet created)
+    // ═══════════════════════════════════════════════════════
+    try {
+      const transfersResult = hasSince
+        ? await env.DB.prepare(
+            'SELECT * FROM stock_transfers WHERE updated_at > ? OR created_at > ?'
+          )
+            .bind(since, since)
+            .all()
+        : await env.DB.prepare('SELECT * FROM stock_transfers ORDER BY created_at DESC').all();
+      state.stockTransfers = transfersResult.results || [];
+    } catch {
+      state.stockTransfers = [];
+    }
+
+    // ═══════════════════════════════════════════════════════
     // DEBTS
     // ═══════════════════════════════════════════════════════
     const debtsResult = await env.DB.prepare(
