@@ -1624,40 +1624,177 @@ async function transferStoreToShop(db: any, transfer: any) {
     .run();
 }
 
+const STOCK_TRANSFERS_CREATE_SQL = (tableName: string) => `
+  CREATE TABLE IF NOT EXISTS ${tableName} (
+    id TEXT PRIMARY KEY,
+    transfer_number TEXT,
+    transfer_date TEXT NOT NULL,
+    source_type TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    source_name TEXT NOT NULL,
+    source_location TEXT,
+    source_shop_id TEXT NOT NULL,
+    source_shop_name TEXT,
+    dest_type TEXT NOT NULL,
+    dest_id TEXT NOT NULL,
+    dest_name TEXT NOT NULL,
+    dest_location TEXT,
+    dest_shop_id TEXT NOT NULL,
+    dest_shop_name TEXT,
+    status TEXT NOT NULL DEFAULT 'COMPLETED',
+    shipping_charges REAL DEFAULT 0,
+    notice TEXT,
+    items_json TEXT NOT NULL,
+    total_units INTEGER DEFAULT 0,
+    total_amount REAL DEFAULT 0,
+    created_by_user_id TEXT,
+    created_by_name TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  )
+`;
+
+let stockTransfersSchemaReady = false;
+
 async function ensureStockTransfersTable(db: any) {
-  await db
-    .prepare(
-      `
-      CREATE TABLE IF NOT EXISTS stock_transfers (
-        id TEXT PRIMARY KEY,
-        transfer_number TEXT,
-        transfer_date TEXT NOT NULL,
-        source_type TEXT NOT NULL,
-        source_id TEXT NOT NULL,
-        source_name TEXT NOT NULL,
-        source_location TEXT,
-        source_shop_id TEXT NOT NULL,
-        source_shop_name TEXT,
-        dest_type TEXT NOT NULL,
-        dest_id TEXT NOT NULL,
-        dest_name TEXT NOT NULL,
-        dest_location TEXT,
-        dest_shop_id TEXT NOT NULL,
-        dest_shop_name TEXT,
-        status TEXT NOT NULL,
-        shipping_charges REAL DEFAULT 0,
-        notice TEXT,
-        items_json TEXT NOT NULL,
-        total_units INTEGER DEFAULT 0,
-        total_amount REAL DEFAULT 0,
-        created_by_user_id TEXT,
-        created_by_name TEXT,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-      )
-    `
-    )
-    .run();
+  if (stockTransfersSchemaReady) return;
+
+  await db.prepare(STOCK_TRANSFERS_CREATE_SQL('stock_transfers')).run();
+
+  const info = await db.prepare('PRAGMA table_info(stock_transfers)').all();
+  const columns = (info?.results || []) as Array<{ name: string; notnull?: number }>;
+  const colNames = new Set(columns.map(c => String(c.name || '').toLowerCase()));
+
+  const isLegacySchema =
+    !colNames.has('items_json') ||
+    !colNames.has('source_id') ||
+    !colNames.has('dest_id') ||
+    columns.some(
+      c =>
+        ['store_id', 'shop_id', 'product_id', 'quantity', 'transferred_by_id', 'transferred_by_name'].includes(
+          String(c.name || '').toLowerCase()
+        ) && Number(c.notnull || 0) === 1
+    );
+
+  if (isLegacySchema) {
+    // Migrate legacy single-product stock_transfers table to the multi-product schema
+    await db.prepare('DROP TABLE IF EXISTS stock_transfers_v2').run();
+    await db.prepare(STOCK_TRANSFERS_CREATE_SQL('stock_transfers_v2')).run();
+
+    try {
+      const legacyRows = await db.prepare('SELECT * FROM stock_transfers').all();
+      for (const row of legacyRows?.results || []) {
+        const createdAt = row.created_at || new Date().toISOString();
+        const qty = Number(row.quantity || 0);
+        const itemsJson = row.items_json
+          ? String(row.items_json)
+          : JSON.stringify(
+              row.product_id
+                ? [
+                    {
+                      productId: String(row.product_id),
+                      productName: String(row.product_id),
+                      quantity: qty,
+                      unitPrice: 0,
+                      subtotal: 0,
+                    },
+                  ]
+                : []
+            );
+
+        await db
+          .prepare(
+            `
+            INSERT OR REPLACE INTO stock_transfers_v2 (
+              id, transfer_number, transfer_date,
+              source_type, source_id, source_name, source_location, source_shop_id, source_shop_name,
+              dest_type, dest_id, dest_name, dest_location, dest_shop_id, dest_shop_name,
+              status, shipping_charges, notice, items_json,
+              total_units, total_amount, created_by_user_id, created_by_name,
+              created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `
+          )
+          .bind(
+            row.id,
+            row.transfer_number || `TRF-${String(row.id || '').slice(0, 6).toUpperCase()}`,
+            row.transfer_date || String(createdAt).slice(0, 10),
+            row.source_type || 'STORE',
+            row.source_id || row.store_id || '',
+            row.source_name || 'Store',
+            row.source_location || null,
+            row.source_shop_id || row.shop_id || '',
+            row.source_shop_name || null,
+            row.dest_type || 'SHOP',
+            row.dest_id || row.shop_id || '',
+            row.dest_name || 'Shop',
+            row.dest_location || null,
+            row.dest_shop_id || row.shop_id || '',
+            row.dest_shop_name || null,
+            row.status || 'COMPLETED',
+            Number(row.shipping_charges || 0),
+            row.notice || row.notes || null,
+            itemsJson,
+            Number(row.total_units ?? qty),
+            Number(row.total_amount || 0),
+            row.created_by_user_id || row.transferred_by_id || null,
+            row.created_by_name || row.transferred_by_name || null,
+            createdAt,
+            row.updated_at || createdAt
+          )
+          .run();
+      }
+    } catch (migrateErr: any) {
+      console.error('[push] Legacy stock_transfers row copy warning:', migrateErr?.message || migrateErr);
+    }
+
+    await db.prepare('DROP TABLE stock_transfers').run();
+    await db.prepare('ALTER TABLE stock_transfers_v2 RENAME TO stock_transfers').run();
+    stockTransfersSchemaReady = true;
+    return;
+  }
+
+  // Ensure any newer optional columns exist on an already-migrated table
+  const requiredColumns: Array<{ name: string; sqlType: string }> = [
+    { name: 'transfer_number', sqlType: 'TEXT' },
+    { name: 'transfer_date', sqlType: "TEXT DEFAULT ''" },
+    { name: 'source_type', sqlType: "TEXT DEFAULT 'STORE'" },
+    { name: 'source_id', sqlType: "TEXT DEFAULT ''" },
+    { name: 'source_name', sqlType: "TEXT DEFAULT 'Source'" },
+    { name: 'source_location', sqlType: 'TEXT' },
+    { name: 'source_shop_id', sqlType: "TEXT DEFAULT ''" },
+    { name: 'source_shop_name', sqlType: 'TEXT' },
+    { name: 'dest_type', sqlType: "TEXT DEFAULT 'SHOP'" },
+    { name: 'dest_id', sqlType: "TEXT DEFAULT ''" },
+    { name: 'dest_name', sqlType: "TEXT DEFAULT 'Destination'" },
+    { name: 'dest_location', sqlType: 'TEXT' },
+    { name: 'dest_shop_id', sqlType: "TEXT DEFAULT ''" },
+    { name: 'dest_shop_name', sqlType: 'TEXT' },
+    { name: 'status', sqlType: "TEXT DEFAULT 'COMPLETED'" },
+    { name: 'shipping_charges', sqlType: 'REAL DEFAULT 0' },
+    { name: 'notice', sqlType: 'TEXT' },
+    { name: 'items_json', sqlType: "TEXT DEFAULT '[]'" },
+    { name: 'total_units', sqlType: 'INTEGER DEFAULT 0' },
+    { name: 'total_amount', sqlType: 'REAL DEFAULT 0' },
+    { name: 'created_by_user_id', sqlType: 'TEXT' },
+    { name: 'created_by_name', sqlType: 'TEXT' },
+    { name: 'updated_at', sqlType: "TEXT DEFAULT ''" },
+  ];
+
+  for (const col of requiredColumns) {
+    if (!colNames.has(col.name)) {
+      try {
+        await db
+          .prepare(`ALTER TABLE stock_transfers ADD COLUMN ${col.name} ${col.sqlType}`)
+          .run();
+      } catch {
+        // Ignore if concurrently added
+      }
+    }
+  }
+
+  stockTransfersSchemaReady = true;
 }
 
 async function upsertStockTransfer(db: any, t: any) {
