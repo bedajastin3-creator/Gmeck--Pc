@@ -45,6 +45,7 @@ const OP_ORDER: Record<string, number> = {
   DELETE_DEBT: 5,
 
   // Cleanup
+  DELETE_PURCHASE: 90,
   DELETE_SHOP: 90,
   DELETE_STORE: 90,
   DELETE_STOCK_TRANSFER: 90,
@@ -796,10 +797,20 @@ export class SyncService {
 
     // Apply purchases
     if (cloudData.purchases && cloudData.purchases.length > 0) {
-      const localPurchases = db.getPurchases();
+      const queue = db.getSyncQueue();
+      const pendingDeletePurchaseIds = new Set(
+        queue
+          .filter(q => q.status === 'PENDING' && (q.operation || q.action) === 'DELETE_PURCHASE')
+          .map(q => q.entityId)
+      );
+
+      const localPurchases = db
+        .getPurchases()
+        .filter(p => !pendingDeletePurchaseIds.has(p.id));
       const mergedPurchases = [...localPurchases];
 
       cloudData.purchases.forEach((cloudPurchase: any) => {
+        if (!cloudPurchase?.id || pendingDeletePurchaseIds.has(cloudPurchase.id)) return;
         const index = mergedPurchases.findIndex(p => p.id === cloudPurchase.id);
 
         const purchaseItems = (cloudData.purchaseItems || [])
