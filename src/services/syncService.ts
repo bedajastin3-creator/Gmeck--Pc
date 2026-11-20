@@ -34,6 +34,7 @@ const OP_ORDER: Record<string, number> = {
   UPSERT_STOCK_TRANSFER: 4,
 
   // Tier 5 — sales & downstream
+  CREATE_PURCHASE_RETURN: 5,
   CREATE_SALE: 5,
   UPDATE_SALE: 5,
   VOID_SALE: 5,
@@ -830,6 +831,7 @@ export class SyncService {
           shopId: cloudPurchase.shop_id,
           shopName: cloudPurchase.shop_name,
           storeId: cloudPurchase.store_id || undefined,
+          storeName: cloudPurchase.store_name || undefined,
           supplierName: cloudPurchase.supplier_name,
           date: cloudPurchase.date,
           totalAmount: cloudPurchase.total_amount,
@@ -839,6 +841,7 @@ export class SyncService {
           createdByUserId: cloudPurchase.created_by_user_id,
           createdByName: cloudPurchase.created_by_name,
           createdAt: cloudPurchase.created_at,
+          updatedAt: cloudPurchase.updated_at || undefined,
           items: purchaseItems,
         };
 
@@ -850,6 +853,61 @@ export class SyncService {
       });
 
       db.savePurchases(mergedPurchases);
+    }
+
+    // Apply purchase returns
+    if (cloudData.purchaseReturns && cloudData.purchaseReturns.length > 0) {
+      const localReturns = db.getPurchaseReturns();
+      const mergedReturns = [...localReturns];
+
+      cloudData.purchaseReturns.forEach((cloudRet: any) => {
+        if (!cloudRet?.id) return;
+        const index = mergedReturns.findIndex(r => r.id === cloudRet.id);
+
+        const returnItems = (cloudData.purchaseReturnItems || [])
+          .filter((item: any) => item.return_id === cloudRet.id)
+          .map((item: any) => ({
+            id: item.id,
+            productId: item.product_id,
+            productName: item.product_name,
+            originalQty: Number(item.original_qty) || 0,
+            returnQty: Number(item.return_qty) || 0,
+            remainingQty: Number(item.remaining_qty) || 0,
+            unitCost: Number(item.unit_cost) || 0,
+            returnTotal: Number(item.return_total) || 0,
+          }));
+
+        const returnData = {
+          id: cloudRet.id,
+          returnNumber: cloudRet.return_number,
+          purchaseId: cloudRet.purchase_id,
+          purchaseNumber: cloudRet.purchase_number,
+          shopId: cloudRet.shop_id,
+          shopName: cloudRet.shop_name || undefined,
+          storeId: cloudRet.store_id || undefined,
+          storeName: cloudRet.store_name || undefined,
+          supplierName: cloudRet.supplier_name,
+          invoiceNumber: cloudRet.invoice_number || undefined,
+          items: returnItems,
+          totalReturnQty: Number(cloudRet.total_return_qty) || 0,
+          totalReturnAmount: Number(cloudRet.total_return_amount) || 0,
+          reason: cloudRet.reason || '',
+          returnedByUserId: cloudRet.returned_by_user_id,
+          returnedByName: cloudRet.returned_by_name,
+          createdAt: cloudRet.created_at,
+        };
+
+        if (index === -1) {
+          mergedReturns.push(returnData);
+        } else {
+          mergedReturns[index] = { ...mergedReturns[index], ...returnData };
+        }
+      });
+
+      mergedReturns.sort(
+        (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+      );
+      db.savePurchaseReturns(mergedReturns);
     }
 
     // Apply expenses
