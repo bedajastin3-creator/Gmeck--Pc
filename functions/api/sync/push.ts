@@ -1065,16 +1065,29 @@ async function updatePurchase(db: any, purchase: any) {
 
   if (oldPurchase.results) {
     for (const oldItem of oldPurchase.results) {
-      await db
-        .prepare(
-          `UPDATE products SET current_stock = current_stock - ?, updated_at = ? WHERE id = ?`
-        )
-        .bind(
-          oldItem.quantity || 0,
-          new Date().toISOString(),
-          oldItem.product_id
-        )
-        .run();
+      if (purchase.storeId) {
+        await db
+          .prepare(
+            `UPDATE products SET store_stock = MAX(0, COALESCE(store_stock, 0) - ?), updated_at = ? WHERE id = ?`
+          )
+          .bind(
+            oldItem.quantity || 0,
+            new Date().toISOString(),
+            oldItem.product_id
+          )
+          .run();
+      } else {
+        await db
+          .prepare(
+            `UPDATE products SET current_stock = MAX(0, COALESCE(current_stock, 0) - ?), updated_at = ? WHERE id = ?`
+          )
+          .bind(
+            oldItem.quantity || 0,
+            new Date().toISOString(),
+            oldItem.product_id
+          )
+          .run();
+      }
     }
   }
 
