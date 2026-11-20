@@ -137,6 +137,9 @@ async function processOperation(db: any, op: any) {
     case 'DELETE_PURCHASE':
       await deletePurchase(db, payload);
       break;
+    case 'CREATE_PURCHASE_RETURN':
+      await createPurchaseReturn(db, payload);
+      break;
 
     case 'CREATE_EXPENSE':
       await createExpense(db, payload);
@@ -216,6 +219,20 @@ async function deleteShop(db: any, payload: any) {
     .prepare('DELETE FROM inventory_movements WHERE shop_id = ?')
     .bind(payload.id)
     .run();
+  try {
+    await db
+      .prepare(
+        'DELETE FROM purchase_return_items WHERE return_id IN (SELECT id FROM purchase_returns WHERE shop_id = ?)'
+      )
+      .bind(payload.id)
+      .run();
+    await db
+      .prepare('DELETE FROM purchase_returns WHERE shop_id = ?')
+      .bind(payload.id)
+      .run();
+  } catch {
+    // Ignore if purchase_returns tables are absent
+  }
   await db
     .prepare(
       'DELETE FROM purchase_items WHERE purchase_id IN (SELECT id FROM purchases WHERE shop_id = ?)'
@@ -931,34 +948,75 @@ async function voidSale(db: any, payload: any) {
 // ──────────────────────────────────────────────────────────
 
 async function createPurchase(db: any, purchase: any) {
-  await db
-    .prepare(
-      `
-    INSERT INTO purchases (
-      id, purchase_number, shop_id, shop_name, supplier_name, date,
-      total_amount, payment_status, notes, invoice_number,
-      created_by_user_id, created_by_name, created_at
-    )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(id) DO NOTHING
-  `
-    )
-    .bind(
-      purchase.id,
-      purchase.purchaseNumber,
-      purchase.shopId,
-      purchase.shopName || null,
-      purchase.supplierName,
-      purchase.date || new Date().toISOString().slice(0, 10),
-      purchase.totalAmount || 0,
-      purchase.paymentStatus || 'PAID',
-      purchase.notes || null,
-      purchase.invoiceNumber || null,
-      purchase.createdByUserId,
-      purchase.createdByName,
-      purchase.createdAt || new Date().toISOString()
-    )
-    .run();
+  const nowIso = new Date().toISOString();
+  const createdAt = purchase.createdAt || nowIso;
+  const updatedAt = purchase.updatedAt || createdAt;
+
+  try {
+    await db
+      .prepare(
+        `
+      INSERT INTO purchases (
+        id, purchase_number, shop_id, shop_name, store_id, store_name, supplier_name, date,
+        total_amount, payment_status, notes, invoice_number,
+        created_by_user_id, created_by_name, created_at, updated_at, last_synced_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO NOTHING
+    `
+      )
+      .bind(
+        purchase.id,
+        purchase.purchaseNumber,
+        purchase.shopId,
+        purchase.shopName || null,
+        purchase.storeId || null,
+        purchase.storeName || null,
+        purchase.supplierName,
+        purchase.date || nowIso.slice(0, 10),
+        purchase.totalAmount || 0,
+        purchase.paymentStatus || 'PAID',
+        purchase.notes || null,
+        purchase.invoiceNumber || null,
+        purchase.createdByUserId,
+        purchase.createdByName,
+        createdAt,
+        updatedAt,
+        nowIso
+      )
+      .run();
+  } catch {
+    // Fallback if optional store_id/store_name/updated_at columns are not present
+    await db
+      .prepare(
+        `
+      INSERT INTO purchases (
+        id, purchase_number, shop_id, shop_name, supplier_name, date,
+        total_amount, payment_status, notes, invoice_number,
+        created_by_user_id, created_by_name, created_at, last_synced_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO NOTHING
+    `
+      )
+      .bind(
+        purchase.id,
+        purchase.purchaseNumber,
+        purchase.shopId,
+        purchase.shopName || null,
+        purchase.supplierName,
+        purchase.date || nowIso.slice(0, 10),
+        purchase.totalAmount || 0,
+        purchase.paymentStatus || 'PAID',
+        purchase.notes || null,
+        purchase.invoiceNumber || null,
+        purchase.createdByUserId,
+        purchase.createdByName,
+        createdAt,
+        nowIso
+      )
+      .run();
+  }
 
   for (const item of purchase.items || []) {
     await db
@@ -1058,6 +1116,21 @@ async function createPurchase(db: any, purchase: any) {
 }
 
 async function updatePurchase(db: any, purchase: any) {
+  const nowIso = new Date().toISOString();
+  const updatedAt = purchase.updatedAt || nowIso;
+
+  let existingStoreId: string | null = null;
+  try {
+    const existingRow = await db
+      .prepare('SELECT store_id FROM purchases WHERE id = ?')
+      .bind(purchase.id)
+      .first();
+    existingStoreId = existingRow?.store_id || null;
+  } catch {
+    existingStoreId = null;
+  }
+  const effectiveStoreId = purchase.storeId || existingStoreId;
+
   const oldPurchase = await db
     .prepare('SELECT * FROM purchase_items WHERE purchase_id = ?')
     .bind(purchase.id)
@@ -1065,14 +1138,14 @@ async function updatePurchase(db: any, purchase: any) {
 
   if (oldPurchase.results) {
     for (const oldItem of oldPurchase.results) {
-      if (purchase.storeId) {
+      if (effectiveStoreId) {
         await db
           .prepare(
             `UPDATE products SET store_stock = MAX(0, COALESCE(store_stock, 0) - ?), updated_at = ? WHERE id = ?`
           )
           .bind(
             oldItem.quantity || 0,
-            new Date().toISOString(),
+            nowIso,
             oldItem.product_id
           )
           .run();
@@ -1083,7 +1156,7 @@ async function updatePurchase(db: any, purchase: any) {
           )
           .bind(
             oldItem.quantity || 0,
-            new Date().toISOString(),
+            nowIso,
             oldItem.product_id
           )
           .run();
@@ -1096,21 +1169,48 @@ async function updatePurchase(db: any, purchase: any) {
     .bind(purchase.id)
     .run();
 
-  await db
-    .prepare(
-      `
-    UPDATE purchases SET supplier_name = ?, invoice_number = ?, payment_status = ?, notes = ?, total_amount = ? WHERE id = ?
-  `
-    )
-    .bind(
-      purchase.supplierName,
-      purchase.invoiceNumber || null,
-      purchase.paymentStatus || 'PAID',
-      purchase.notes || null,
-      purchase.totalAmount || 0,
-      purchase.id
-    )
-    .run();
+  try {
+    await db
+      .prepare(
+        `
+      UPDATE purchases
+      SET supplier_name = ?, invoice_number = ?, payment_status = ?, notes = ?, total_amount = ?,
+          store_id = COALESCE(?, store_id), store_name = COALESCE(?, store_name),
+          updated_at = ?, last_synced_at = ?
+      WHERE id = ?
+    `
+      )
+      .bind(
+        purchase.supplierName,
+        purchase.invoiceNumber || null,
+        purchase.paymentStatus || 'PAID',
+        purchase.notes || null,
+        purchase.totalAmount || 0,
+        purchase.storeId || null,
+        purchase.storeName || null,
+        updatedAt,
+        nowIso,
+        purchase.id
+      )
+      .run();
+  } catch {
+    await db
+      .prepare(
+        `
+      UPDATE purchases SET supplier_name = ?, invoice_number = ?, payment_status = ?, notes = ?, total_amount = ?, last_synced_at = ? WHERE id = ?
+    `
+      )
+      .bind(
+        purchase.supplierName,
+        purchase.invoiceNumber || null,
+        purchase.paymentStatus || 'PAID',
+        purchase.notes || null,
+        purchase.totalAmount || 0,
+        nowIso,
+        purchase.id
+      )
+      .run();
+  }
 
   for (const item of purchase.items || []) {
     await db
@@ -1146,7 +1246,7 @@ async function updatePurchase(db: any, purchase: any) {
       let newStock = currentStock;
       let newStoreStock = currentStoreStock;
 
-      if (purchase.storeId) {
+      if (effectiveStoreId) {
         newStoreStock += newPurchaseQty;
         await db
           .prepare(
@@ -1155,7 +1255,7 @@ async function updatePurchase(db: any, purchase: any) {
           .bind(
             newStoreStock,
             Number(newUnitCost.toFixed(2)),
-            new Date().toISOString(),
+            nowIso,
             item.productId
           )
           .run();
@@ -1168,10 +1268,132 @@ async function updatePurchase(db: any, purchase: any) {
           .bind(
             newStock,
             Number(newUnitCost.toFixed(2)),
-            new Date().toISOString(),
+            nowIso,
             item.productId
           )
           .run();
+      }
+    }
+  }
+}
+
+async function createPurchaseReturn(db: any, ret: any) {
+  if (!ret?.id) return;
+
+  const nowIso = new Date().toISOString();
+
+  // Check if already synced (idempotent on retry so audit movements are not duplicated)
+  const existing = await db
+    .prepare('SELECT id FROM purchase_returns WHERE id = ?')
+    .bind(ret.id)
+    .first();
+
+  await db
+    .prepare(
+      `
+    INSERT INTO purchase_returns (
+      id, return_number, purchase_id, purchase_number, shop_id, shop_name,
+      store_id, store_name, supplier_name, invoice_number,
+      total_return_qty, total_return_amount, reason,
+      returned_by_user_id, returned_by_name, created_at, last_synced_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(id) DO NOTHING
+  `
+    )
+    .bind(
+      ret.id,
+      ret.returnNumber,
+      ret.purchaseId,
+      ret.purchaseNumber || '',
+      ret.shopId,
+      ret.shopName || null,
+      ret.storeId || null,
+      ret.storeName || null,
+      ret.supplierName || '',
+      ret.invoiceNumber || null,
+      Number(ret.totalReturnQty) || 0,
+      Number(ret.totalReturnAmount) || 0,
+      ret.reason || '',
+      ret.returnedByUserId || 'system',
+      ret.returnedByName || 'Admin',
+      ret.createdAt || nowIso,
+      nowIso
+    )
+    .run();
+
+  for (const item of ret.items || []) {
+    await db
+      .prepare(
+        `
+      INSERT INTO purchase_return_items (
+        id, return_id, product_id, product_name,
+        original_qty, return_qty, remaining_qty, unit_cost, return_total
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO NOTHING
+    `
+      )
+      .bind(
+        item.id || crypto.randomUUID(),
+        ret.id,
+        item.productId,
+        item.productName || '',
+        Number(item.originalQty) || 0,
+        Number(item.returnQty) || 0,
+        Number(item.remainingQty) || 0,
+        Number(item.unitCost) || 0,
+        Number(item.returnTotal) || 0
+      )
+      .run();
+
+    // Record a RETURN audit movement once per synced purchase return
+    // (Note: stock deduction itself is applied deterministically by UPDATE_PURCHASE)
+    if (!existing && item.productId && Number(item.returnQty) > 0) {
+      try {
+        const product = await db
+          .prepare('SELECT current_stock, store_stock FROM products WHERE id = ?')
+          .bind(item.productId)
+          .first();
+
+        const postQty = ret.storeId
+          ? Number(product?.store_stock) || 0
+          : Number(product?.current_stock) || 0;
+        const returnQty = Number(item.returnQty) || 0;
+
+        await db
+          .prepare(
+            `
+          INSERT INTO inventory_movements (
+            id, shop_id, shop_name, store_id, product_id, product_name,
+            previous_qty, change_qty, new_qty, type, reason, cost_value,
+            reference_id, user_id, user_name, created_at
+          )
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(id) DO NOTHING
+        `
+          )
+          .bind(
+            `pr-mov-${ret.id}-${item.id || item.productId}`,
+            ret.shopId,
+            ret.shopName || null,
+            ret.storeId || null,
+            item.productId,
+            item.productName || '',
+            postQty + returnQty,
+            -returnQty,
+            postQty,
+            'RETURN',
+            `Purchase Return ${ret.returnNumber} (PO ${ret.purchaseNumber || ret.purchaseId}): ${ret.reason || 'Supplier return'}`,
+            Number(item.returnTotal) || 0,
+            ret.purchaseId,
+            ret.returnedByUserId || 'system',
+            ret.returnedByName || 'Admin',
+            ret.createdAt || nowIso
+          )
+          .run();
+      } catch {
+        // Non-blocking audit movement log
       }
     }
   }
@@ -1181,12 +1403,22 @@ async function deletePurchase(db: any, payload: any) {
   const purchaseId = payload?.id || payload?.purchaseId;
   if (!purchaseId) return;
 
-  const existingPurchase = await db
-    .prepare(
-      'SELECT id, shop_id, shop_name, supplier_name, purchase_number FROM purchases WHERE id = ?'
-    )
-    .bind(purchaseId)
-    .first();
+  let existingPurchase: any = null;
+  try {
+    existingPurchase = await db
+      .prepare(
+        'SELECT id, shop_id, shop_name, store_id, supplier_name, purchase_number FROM purchases WHERE id = ?'
+      )
+      .bind(purchaseId)
+      .first();
+  } catch {
+    existingPurchase = await db
+      .prepare(
+        'SELECT id, shop_id, shop_name, supplier_name, purchase_number FROM purchases WHERE id = ?'
+      )
+      .bind(purchaseId)
+      .first();
+  }
 
   // Only revert stock if the purchase still exists in D1 (idempotent on retry)
   if (existingPurchase) {
@@ -1215,7 +1447,7 @@ async function deletePurchase(db: any, payload: any) {
           }));
 
     const nowIso = payload.voidedAt || new Date().toISOString();
-    const isStorePurchase = Boolean(payload.storeId);
+    const isStorePurchase = Boolean(payload.storeId || existingPurchase.store_id);
 
     for (const item of itemsToRevert) {
       if (!item.productId || item.quantity <= 0) continue;
