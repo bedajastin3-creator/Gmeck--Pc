@@ -145,19 +145,69 @@ export async function onRequestGet(context: any) {
     }
 
     // ═══════════════════════════════════════════════════════
-    // PURCHASES
+    // PURCHASES (includes updated_at so edits & returns re-sync)
     // ═══════════════════════════════════════════════════════
-    const purchasesResult = await env.DB.prepare(
-      'SELECT * FROM purchases WHERE created_at > ?'
-    ).bind(since).all();
-    state.purchases = purchasesResult.results;
+    try {
+      const purchasesResult = hasSince
+        ? await env.DB.prepare(
+            "SELECT * FROM purchases WHERE updated_at > ? OR created_at > ? OR updated_at IS NULL OR updated_at = '' ORDER BY created_at DESC"
+          )
+            .bind(since, since)
+            .all()
+        : await env.DB.prepare('SELECT * FROM purchases ORDER BY created_at DESC').all();
+      state.purchases = purchasesResult.results || [];
 
-    const purchaseItemsResult = await env.DB.prepare(`
-      SELECT pi.* FROM purchase_items pi
-      JOIN purchases p ON pi.purchase_id = p.id
-      WHERE p.created_at > ?
-    `).bind(since).all();
-    state.purchaseItems = purchaseItemsResult.results;
+      const purchaseItemsResult = hasSince
+        ? await env.DB.prepare(`
+            SELECT pi.* FROM purchase_items pi
+            JOIN purchases p ON pi.purchase_id = p.id
+            WHERE p.updated_at > ? OR p.created_at > ? OR p.updated_at IS NULL OR p.updated_at = ''
+          `)
+            .bind(since, since)
+            .all()
+        : await env.DB.prepare('SELECT * FROM purchase_items').all();
+      state.purchaseItems = purchaseItemsResult.results || [];
+    } catch {
+      const purchasesResult = await env.DB.prepare(
+        'SELECT * FROM purchases WHERE created_at > ?'
+      ).bind(since).all();
+      state.purchases = purchasesResult.results || [];
+
+      const purchaseItemsResult = await env.DB.prepare(`
+        SELECT pi.* FROM purchase_items pi
+        JOIN purchases p ON pi.purchase_id = p.id
+        WHERE p.created_at > ?
+      `).bind(since).all();
+      state.purchaseItems = purchaseItemsResult.results || [];
+    }
+
+    // ═══════════════════════════════════════════════════════
+    // PURCHASE RETURNS (safe fallback if tables not migrated)
+    // ═══════════════════════════════════════════════════════
+    try {
+      const returnsResult = hasSince
+        ? await env.DB.prepare(
+            'SELECT * FROM purchase_returns WHERE created_at > ? ORDER BY created_at DESC'
+          )
+            .bind(since)
+            .all()
+        : await env.DB.prepare('SELECT * FROM purchase_returns ORDER BY created_at DESC').all();
+      state.purchaseReturns = returnsResult.results || [];
+
+      const returnItemsResult = hasSince
+        ? await env.DB.prepare(`
+            SELECT pri.* FROM purchase_return_items pri
+            JOIN purchase_returns pr ON pri.return_id = pr.id
+            WHERE pr.created_at > ?
+          `)
+            .bind(since)
+            .all()
+        : await env.DB.prepare('SELECT * FROM purchase_return_items').all();
+      state.purchaseReturnItems = returnItemsResult.results || [];
+    } catch {
+      state.purchaseReturns = [];
+      state.purchaseReturnItems = [];
+    }
 
     // ═══════════════════════════════════════════════════════
     // EXPENSES
