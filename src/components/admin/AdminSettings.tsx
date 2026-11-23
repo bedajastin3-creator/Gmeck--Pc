@@ -13,6 +13,7 @@ import {
   Camera,
   Upload,
   X,
+  UserCheck,
 } from 'lucide-react';
 import { useApp } from '../../context/AppContext';
 import { AuthService } from '../../services/authService';
@@ -35,6 +36,7 @@ export const AdminSettings: React.FC = () => {
   const [taxRatePercent, setTaxRatePercent] = useState(dbState.settings.taxRatePercent.toString());
   const [receiptHeaderNote, setReceiptHeaderNote] = useState(dbState.settings.receiptHeaderNote);
   const [receiptFooterNote, setReceiptFooterNote] = useState(dbState.settings.receiptFooterNote);
+  const enableSalesAssistant = Boolean(dbState.settings.enableSalesAssistant);
 
   // Admin username state
   const [adminUsername, setAdminUsername] = useState(currentUser?.username || 'Admin');
@@ -65,7 +67,7 @@ export const AdminSettings: React.FC = () => {
           const canvas = document.createElement('canvas');
           let width = img.width;
           let height = img.height;
-          
+
           if (width > maxWidth) {
             height = (maxWidth / width) * height;
             width = maxWidth;
@@ -74,12 +76,12 @@ export const AdminSettings: React.FC = () => {
             width = (maxHeight / height) * width;
             height = maxHeight;
           }
-          
+
           canvas.width = width;
           canvas.height = height;
           const ctx = canvas.getContext('2d');
           ctx?.drawImage(img, 0, 0, width, height);
-          
+
           canvas.toBlob((blob) => {
             if (blob) resolve(blob);
             else reject(new Error('Failed to compress image'));
@@ -98,14 +100,14 @@ export const AdminSettings: React.FC = () => {
     if (!file || !currentUser) return;
 
     setIsUploading(true);
-    
+
     try {
       const compressed = await compressImage(file, 200, 200);
       const result = await CloudflareApi.uploadImage(compressed, 'seller', currentUser.id);
-      
+
       if (result.success) {
         setAvatarUrl(result.url);
-        
+
         const users = StorageService.getUsers();
         const userIndex = users.findIndex(u => u.id === currentUser.id);
         if (userIndex !== -1) {
@@ -113,7 +115,7 @@ export const AdminSettings: React.FC = () => {
           StorageService.saveUsers(users);
           if (refreshUser) refreshUser();
         }
-        
+
         addToast({
           type: 'success',
           title: 'Profile Picture Updated',
@@ -136,9 +138,9 @@ export const AdminSettings: React.FC = () => {
 
   const handleRemoveAvatar = () => {
     if (!currentUser) return;
-    
+
     setAvatarUrl(undefined);
-    
+
     const users = StorageService.getUsers();
     const userIndex = users.findIndex(u => u.id === currentUser.id);
     if (userIndex !== -1) {
@@ -146,7 +148,7 @@ export const AdminSettings: React.FC = () => {
       StorageService.saveUsers(users);
       if (refreshUser) refreshUser();
     }
-    
+
     addToast({
       type: 'info',
       title: 'Profile Picture Removed',
@@ -168,12 +170,25 @@ export const AdminSettings: React.FC = () => {
       taxRatePercent: parseFloat(taxRatePercent) || 0,
       receiptHeaderNote,
       receiptFooterNote,
+      enableSalesAssistant,
     });
 
     addToast({
       type: 'success',
       title: 'Settings Saved',
       description: 'Business configurations and receipt policies updated.',
+    });
+  };
+
+  const handleToggleSalesAssistant = () => {
+    const nextValue = !enableSalesAssistant;
+    updateSettings({ enableSalesAssistant: nextValue });
+    addToast({
+      type: nextValue ? 'success' : 'info',
+      title: nextValue ? 'Sales Assistant Enabled' : 'Sales Assistant Disabled',
+      description: nextValue
+        ? 'Sellers can now enter Jina la Muuzaji at checkout, and Assistant Performance is active in Reports.'
+        : 'Sales Assistant feature is turned off across POS and Reports.',
     });
   };
 
@@ -251,24 +266,24 @@ export const AdminSettings: React.FC = () => {
   const auditLogs = StorageService.getAuditLogs();
 
   return (
-    <div id="admin-settings-view" className="flex-1 p-6 bg-slate-950 text-slate-100 overflow-y-auto">
+    <div id="admin-settings-view" className="flex-1 p-3.5 sm:p-6 bg-slate-950 text-slate-100 overflow-y-auto space-y-4 sm:space-y-6">
       {/* Header */}
-      <div className="mb-6 pb-4 border-b border-slate-800">
-        <h2 className="text-xl font-bold text-white tracking-tight">System Configuration & Audit</h2>
+      <div className="pb-3.5 sm:pb-4 border-b border-slate-800">
+        <h2 className="text-lg sm:text-xl font-bold text-white tracking-tight">System Configuration & Audit</h2>
         <p className="text-xs text-slate-400 mt-0.5">
           Configure business details, admin credentials, tax rates, and view audit trail
         </p>
       </div>
 
-      <div className="max-w-4xl space-y-6">
+      <div className="max-w-4xl space-y-4 sm:space-y-6">
         {/* Admin Profile Card */}
-        <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-xl">
-          <div className="flex items-center gap-2 mb-4 pb-3 border-b border-slate-800">
+        <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 sm:p-6 shadow-xl">
+          <div className="flex items-center gap-2 mb-3.5 pb-3 border-b border-slate-800">
             <ShieldCheck className="w-5 h-5 text-emerald-400" />
-            <h3 className="text-sm font-bold text-white uppercase tracking-wider">Admin Profile</h3>
+            <h3 className="text-xs sm:text-sm font-bold text-white uppercase tracking-wider">Admin Profile</h3>
           </div>
 
-          <div className="flex items-center gap-6">
+          <div className="flex flex-col sm:flex-row items-center gap-4 sm:gap-6">
             <div className="relative">
               {avatarUrl ? (
                 <img src={avatarUrl} alt={currentUser.name} className="w-20 h-20 rounded-full object-cover border-2 border-emerald-500 shadow-lg" />
@@ -288,7 +303,7 @@ export const AdminSettings: React.FC = () => {
               <input ref={fileInputRef} type="file" accept="image/*" onChange={handleAvatarUpload} className="hidden" />
             </div>
 
-            <div>
+            <div className="text-center sm:text-left">
               <div className="text-lg font-bold text-white">{currentUser.name}</div>
               <div className="text-sm text-slate-400">@{currentUser.username}</div>
               <div className="text-xs text-slate-500 mt-1">System Administrator</div>
@@ -297,17 +312,17 @@ export const AdminSettings: React.FC = () => {
         </div>
 
         {/* Change Admin Username */}
-        <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-xl">
+        <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 sm:p-6 shadow-xl">
           <div className="flex items-center gap-2 mb-3 pb-3 border-b border-slate-800">
             <UserIcon className="w-5 h-5 text-blue-400" />
-            <h3 className="text-sm font-bold text-white uppercase tracking-wider">Change Admin Username</h3>
+            <h3 className="text-xs sm:text-sm font-bold text-white uppercase tracking-wider">Change Admin Username</h3>
           </div>
 
           {usernameError && (
             <div className="mb-4 p-3 rounded-lg bg-rose-500/15 border border-rose-500/30 text-rose-300 text-xs">{usernameError}</div>
           )}
 
-          <form onSubmit={handleChangeUsername} className="space-y-4 max-w-md text-xs">
+          <form onSubmit={handleChangeUsername} className="space-y-3.5 max-w-md text-xs">
             <div>
               <label className="block text-slate-300 font-medium mb-1">Current Username</label>
               <input
@@ -333,23 +348,73 @@ export const AdminSettings: React.FC = () => {
             <button
               type="submit"
               disabled={isChangingUsername}
-              className="px-5 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-500 text-white font-semibold shadow transition disabled:opacity-50"
+              className="w-full sm:w-auto px-4 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-500 text-white font-semibold shadow transition disabled:opacity-50"
             >
               {isChangingUsername ? 'Updating...' : 'Change Username'}
             </button>
           </form>
         </div>
 
+        {/* Sales Assistant Feature Toggle (Admin & Shop Admin) */}
+        <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 sm:p-6 shadow-xl">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+            <div className="flex items-start gap-3">
+              <div className={`w-10 h-10 rounded-xl flex items-center justify-center shrink-0 border ${
+                enableSalesAssistant
+                  ? 'bg-emerald-500/15 border-emerald-500/30 text-emerald-400'
+                  : 'bg-slate-800 border-slate-700 text-slate-400'
+              }`}>
+                <UserCheck className="w-5 h-5" />
+              </div>
+              <div>
+                <div className="flex items-center gap-2 flex-wrap">
+                  <h3 className="text-xs sm:text-sm font-bold text-white uppercase tracking-wider">
+                    Sales Assistant (Jina la Muuzaji)
+                  </h3>
+                  <span className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider border ${
+                    enableSalesAssistant
+                      ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
+                      : 'bg-slate-800 text-slate-400 border-slate-700'
+                  }`}>
+                    {enableSalesAssistant ? 'ON' : 'OFF'}
+                  </span>
+                </div>
+                <p className="text-xs text-slate-400 mt-1 leading-relaxed">
+                  When enabled, sellers see a <span className="text-slate-200 font-medium">Jina la Muuzaji</span> field above payment methods in New Sale. Assistant names appear in Reports under Price Deviation (<span className="font-mono text-slate-300">Seller/Assistant</span>) and the Assistant Performance card.
+                </p>
+              </div>
+            </div>
+
+            <button
+              id="toggle-sales-assistant-btn"
+              type="button"
+              role="switch"
+              aria-checked={enableSalesAssistant}
+              onClick={handleToggleSalesAssistant}
+              className={`relative inline-flex h-8 w-14 shrink-0 items-center rounded-full border transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500/50 self-end sm:self-center ${
+                enableSalesAssistant
+                  ? 'bg-emerald-600 border-emerald-500'
+                  : 'bg-slate-800 border-slate-700'
+              }`}
+            >
+              <span
+                className={`inline-block h-6 w-6 transform rounded-full bg-white shadow-md transition-transform ${
+                  enableSalesAssistant ? 'translate-x-7' : 'translate-x-1'
+                }`}
+              />
+            </button>
+          </div>
+        </div>
+
         {/* Business & POS Configuration */}
-        <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-xl">
-          <div className="flex items-center gap-2 mb-4 pb-3 border-b border-slate-800">
+        <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 sm:p-6 shadow-xl">
+          <div className="flex items-center gap-2 mb-3.5 pb-3 border-b border-slate-800">
             <Store className="w-5 h-5 text-blue-400" />
-            <h3 className="text-sm font-bold text-white uppercase tracking-wider">Store Identity & Contact Details</h3>
+            <h3 className="text-xs sm:text-sm font-bold text-white uppercase tracking-wider">Store Identity & Contact Details</h3>
           </div>
 
-          <form onSubmit={handleSaveSettings} className="space-y-4 text-xs">
-            {/* ... existing settings form ... */}
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <form onSubmit={handleSaveSettings} className="space-y-3.5 sm:space-y-4 text-xs">
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
               <div>
                 <label className="block text-slate-300 font-medium mb-1">Business Store Name</label>
                 <input type="text" required value={businessName} onChange={e => setBusinessName(e.target.value)} className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white focus:outline-none focus:ring-1 focus:ring-blue-500" />
@@ -360,7 +425,7 @@ export const AdminSettings: React.FC = () => {
               </div>
             </div>
 
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3.5">
               <div>
                 <label className="block text-slate-300 font-medium mb-1">Physical Address</label>
                 <input type="text" value={address} onChange={e => setAddress(e.target.value)} className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white focus:outline-none focus:ring-1 focus:ring-blue-500" />
@@ -375,7 +440,7 @@ export const AdminSettings: React.FC = () => {
               </div>
             </div>
 
-            <div className="pt-3 border-t border-slate-800 grid grid-cols-1 sm:grid-cols-3 gap-4">
+            <div className="pt-3 border-t border-slate-800 grid grid-cols-1 sm:grid-cols-3 gap-3.5">
               <div>
                 <label className="block text-slate-300 font-medium mb-1">Currency Symbol</label>
                 <input type="text" value={currencySymbol} onChange={e => setCurrencySymbol(e.target.value)} className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white font-mono focus:outline-none focus:ring-1 focus:ring-blue-500" />
@@ -396,7 +461,7 @@ export const AdminSettings: React.FC = () => {
               </div>
             </div>
 
-            <div className="pt-3 border-t border-slate-800 grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div className="pt-3 border-t border-slate-800 grid grid-cols-1 sm:grid-cols-2 gap-3.5">
               <div>
                 <label className="block text-slate-300 font-medium mb-1">Receipt Header Announcement Note</label>
                 <input type="text" value={receiptHeaderNote} onChange={e => setReceiptHeaderNote(e.target.value)} className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white focus:outline-none focus:ring-1 focus:ring-blue-500" />
@@ -408,23 +473,23 @@ export const AdminSettings: React.FC = () => {
             </div>
 
             <div className="pt-3 border-t border-slate-800 flex justify-end">
-              <button type="submit" className="px-5 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-500 text-white font-semibold shadow transition">Save Store Settings</button>
+              <button type="submit" className="w-full sm:w-auto px-4 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-500 text-white font-semibold shadow transition">Save Store Settings</button>
             </div>
           </form>
         </div>
 
         {/* Change Admin Password */}
-        <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-xl">
+        <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 sm:p-6 shadow-xl">
           <div className="flex items-center gap-2 mb-3 pb-3 border-b border-slate-800">
             <KeyRound className="w-5 h-5 text-amber-400" />
-            <h3 className="text-sm font-bold text-white uppercase tracking-wider">Change Master Admin Password</h3>
+            <h3 className="text-xs sm:text-sm font-bold text-white uppercase tracking-wider">Change Master Admin Password</h3>
           </div>
 
           {passwordError && (
             <div className="mb-4 p-3 rounded-lg bg-rose-500/15 border border-rose-500/30 text-rose-300 text-xs">{passwordError}</div>
           )}
 
-          <form onSubmit={handleAdminPasswordChange} className="space-y-4 max-w-md text-xs">
+          <form onSubmit={handleAdminPasswordChange} className="space-y-3.5 max-w-md text-xs">
             <div>
               <label className="block text-slate-300 font-medium mb-1">Current Admin Password</label>
               <input type="password" required value={currentPassword} onChange={e => setCurrentPassword(e.target.value)} placeholder="Enter current password..." className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-amber-500" />
@@ -437,36 +502,37 @@ export const AdminSettings: React.FC = () => {
               <label className="block text-slate-300 font-medium mb-1">Confirm New Password</label>
               <input type="password" required value={confirmPassword} onChange={e => setConfirmPassword(e.target.value)} placeholder="Re-enter new password..." className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-amber-500" />
             </div>
-            <button type="submit" disabled={isChangingPass} className="px-5 py-2.5 rounded-xl bg-amber-600 hover:bg-amber-500 text-white font-semibold shadow transition disabled:opacity-50">
+            <button type="submit" disabled={isChangingPass} className="w-full sm:w-auto px-4 py-2.5 rounded-xl bg-amber-600 hover:bg-amber-500 text-white font-semibold shadow transition disabled:opacity-50">
               {isChangingPass ? 'Updating...' : 'Update Admin Password'}
             </button>
           </form>
         </div>
 
         {/* Security Audit Trail */}
-        <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-xl">
-          <div className="flex items-center justify-between pb-3 border-b border-slate-800 mb-4">
+        <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 sm:p-6 shadow-xl">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-1 pb-3 border-b border-slate-800 mb-3.5 sm:mb-4">
             <div className="flex items-center gap-2">
               <History className="w-5 h-5 text-purple-400" />
-              <h3 className="text-sm font-bold text-white uppercase tracking-wider">Security & Administrative Audit Logs</h3>
+              <h3 className="text-xs sm:text-sm font-bold text-white uppercase tracking-wider">Security & Audit Logs</h3>
             </div>
-            <span className="text-xs text-slate-400">{auditLogs.length} events logged</span>
+            <span className="text-[11px] sm:text-xs text-slate-400">{auditLogs.length} events logged</span>
           </div>
+
           <div className="max-h-72 overflow-y-auto space-y-2 text-xs pr-1">
             {auditLogs.length === 0 ? (
               <div className="text-center py-6 text-slate-500">No audit events recorded yet.</div>
             ) : (
               auditLogs.slice(0, 30).map(log => (
-                <div key={log.id} className="p-2.5 rounded-lg bg-slate-950 border border-slate-800 flex items-start justify-between gap-3 font-mono text-[11px]">
-                  <div>
-                    <div className="font-semibold text-slate-200">
+                <div key={log.id} className="p-2.5 rounded-xl bg-slate-950 border border-slate-800 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-1 sm:gap-3 font-mono text-[11px]">
+                  <div className="min-w-0 flex-1">
+                    <div className="font-semibold text-slate-200 break-words">
                       <span className="text-blue-400">[{log.action}]</span> {log.details}
                     </div>
                     <div className="text-slate-500 text-[10px] mt-0.5">
                       Performed by: <span className="text-slate-300">{log.performedByName}</span>
                     </div>
                   </div>
-                  <span className="text-slate-500 shrink-0">{formatDateTime(log.createdAt)}</span>
+                  <span className="text-slate-500 text-[10px] sm:text-[11px] shrink-0">{formatDateTime(log.createdAt || log.timestamp)}</span>
                 </div>
               ))
             )}

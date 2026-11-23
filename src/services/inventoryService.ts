@@ -1,11 +1,20 @@
 import { db } from '../db/storage';
 import { InventoryMovement, MovementType, User } from '../types';
 import { generateUUID } from '../utils/crypto';
+import { getAdminManagedShops, hasAdminAccess, isPlatformAdmin, isShopAdmin } from '../utils/permissions';
+
+function getAllowedShopIdsForInventory(currentUser?: User): Set<string> | null {
+  if (!currentUser || isPlatformAdmin(currentUser)) return null;
+  if (isShopAdmin(currentUser)) {
+    return new Set(getAdminManagedShops(currentUser, db.getShops()).map(s => s.id));
+  }
+  return new Set(currentUser.assignedShopIds || []);
+}
 
 export class InventoryService {
   /**
    * Adjust stock manually for count correction, damage, loss, or physical inventory.
-   * Admin OR Seller with canManageInventory permission.
+   * Admin, Shop Admin, OR Seller with canManageInventory permission.
    */
   public static adjustStock(
     productId: string,
@@ -14,8 +23,7 @@ export class InventoryService {
     currentUser: User,
     movementType: MovementType = 'ADJUSTMENT'
   ): { success: boolean; error?: string; lossValue?: number } {
-    // FIX: Allow Admin OR Seller with canManageInventory permission
-    if (currentUser.role !== 'ADMIN' && !currentUser.permissions?.canManageInventory) {
+    if (!hasAdminAccess(currentUser) && !currentUser.permissions?.canManageInventory) {
       return { success: false, error: 'Permission Denied: You do not have permission to adjust stock levels.' };
     }
 
@@ -30,6 +38,11 @@ export class InventoryService {
     }
 
     const prod = products[prodIndex];
+    const allowedShopIds = getAllowedShopIdsForInventory(currentUser);
+    if (allowedShopIds && (!prod.shopId || !allowedShopIds.has(prod.shopId))) {
+      return { success: false, error: 'Permission Denied: This product belongs to a shop outside your access scope.' };
+    }
+
     const prevQty = prod.currentStock;
     const diff = newQuantity - prevQty;
 
@@ -92,7 +105,7 @@ export class InventoryService {
 
   /**
    * Receive fast stock-in.
-   * Admin OR Seller with canManageInventory permission.
+   * Admin, Shop Admin, OR Seller with canManageInventory permission.
    */
   public static stockIn(
     productId: string,
@@ -100,8 +113,7 @@ export class InventoryService {
     reason: string,
     currentUser: User
   ): { success: boolean; error?: string } {
-    // FIX: Allow Admin OR Seller with canManageInventory permission
-    if (currentUser.role !== 'ADMIN' && !currentUser.permissions?.canManageInventory) {
+    if (!hasAdminAccess(currentUser) && !currentUser.permissions?.canManageInventory) {
       return { success: false, error: 'Permission Denied: You do not have permission to perform stock-in.' };
     }
 
@@ -129,9 +141,14 @@ export class InventoryService {
 
   public static getMovementHistory(
     filter?: { search?: string; productId?: string; shopId?: string },
-    _currentUser?: User
+    currentUser?: User
   ): InventoryMovement[] {
     let list = db.getMovements();
+
+    const allowedShopIds = getAllowedShopIdsForInventory(currentUser);
+    if (allowedShopIds) {
+      list = list.filter(m => !!m.shopId && allowedShopIds.has(m.shopId));
+    }
 
     if (filter?.shopId && filter.shopId !== 'ALL') {
       list = list.filter(m => m.shopId === filter.shopId);
@@ -148,14 +165,19 @@ export class InventoryService {
           m.productName.toLowerCase().includes(q) ||
           m.reason.toLowerCase().includes(q) ||
           m.userName.toLowerCase().includes(q) ||
+          m.type.toLowerCase().includes(q) ||
           (m.shopName && m.shopName.toLowerCase().includes(q))
       );
     }
     return list;
   }
 
-  public static getInventoryValuation(shopId?: string, _currentUser?: User) {
+  public static getInventoryValuation(shopId?: string, currentUser?: User) {
     let products = db.getProducts().filter(p => p.status === 'ACTIVE');
+    const allowedShopIds = getAllowedShopIdsForInventory(currentUser);
+    if (allowedShopIds) {
+      products = products.filter(p => !!p.shopId && allowedShopIds.has(p.shopId));
+    }
     if (shopId && shopId !== 'ALL') {
       products = products.filter(p => p.shopId === shopId);
     }

@@ -19,6 +19,7 @@ export interface SellerPermissions {
   canManageSellers?: boolean;     // Manage other sellers
   canRecordPurchases?: boolean;   // Record purchases
   canViewPurchases?: boolean;     // View purchases
+  shopAdminShopIds?: string[];    // Shop IDs where this seller is designated Shop Admin
 }
 
 export interface User {
@@ -30,6 +31,7 @@ export interface User {
   color: string; // Hex or theme color key
   status: UserStatus;
   assignedShopIds?: string[]; // Multiple shop IDs assigned to this user
+  shopAdminShopIds?: string[]; // Shop IDs where user is designated Shop Admin
   avatarUrl?: string; // URL to user's avatar image
   permissions?: SellerPermissions; // NEW: Granular permissions for sellers
   createdAt: string;
@@ -47,6 +49,17 @@ export interface Shop {
   phone?: string;
   status: ShopStatus;
   color?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface Store {
+  id: string;
+  shopId: string;
+  name: string;
+  location?: string;
+  status: ShopStatus;
+  isShopFloor?: boolean;
   createdAt: string;
   updatedAt: string;
 }
@@ -82,10 +95,31 @@ export interface ProductImage {
   updatedAt: string;
 }
 
+export interface ProductStoreStockDetail {
+  storeId: string;
+  storeName: string;
+  quantity: number;
+  unitPurchasePrice?: number;
+  unitSellingPrice?: number;
+  importedPurchaseValue?: number;
+  importedSaleValue?: number;
+  importedPotentialProfit?: number;
+}
+
+export interface ProductCustomFields {
+  field1?: string;
+  field2?: string;
+  field3?: string;
+  field4?: string;
+  [key: string]: any;
+}
+
 export interface Product {
   id: string;
   shopId: string; // Stable Shop ID
+  storeId?: string;
   name: string;
+  variation?: string;
   sku: string;
   barcode: string;
   categoryId: string;
@@ -93,11 +127,63 @@ export interface Product {
   proposedSellingPrice?: number; // Proposed price alias
   purchasePrice: number; // Cost of goods
   currentStock: number;
+  storeStock?: number;
+  storeStocks?: Record<string, number>;
+  storeDetails?: Record<string, ProductStoreStockDetail>;
+  customFields?: ProductCustomFields;
+  historicalUnitsSold?: number;
+  historicalUnitsTransferred?: number;
+  historicalUnitsAdjusted?: number;
+  historicalNote?: string;
   minStock: number;
   unit: string; // e.g., 'pcs', 'kg', 'box', 'pack', 'liter'
   status: ProductStatus;
   imageUrl?: string; // Main image URL/dataUrl (for backward compatibility)
   images?: ProductImage[]; // Optional array of up to 3 ProductImages
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type StockTransferLocationType = 'STORE' | 'SHOP';
+
+export type StockTransferStatus = 'COMPLETED' | 'NOT_COMPLETED';
+
+export interface StockTransferItem {
+  id?: string;
+  productId: string;
+  productName: string;
+  variation?: string;
+  sku?: string;
+  unit?: string;
+  quantity: number;
+  unitPrice: number;
+  subtotal: number;
+}
+
+export interface StockTransfer {
+  id: string;
+  transferNumber: string;
+  transferDate: string;
+  sourceType: StockTransferLocationType;
+  sourceId: string;
+  sourceName: string;
+  sourceLocation?: string;
+  sourceShopId: string;
+  sourceShopName?: string;
+  destType: StockTransferLocationType;
+  destId: string;
+  destName: string;
+  destLocation?: string;
+  destShopId: string;
+  destShopName?: string;
+  status: StockTransferStatus;
+  shippingCharges: number;
+  notice?: string;
+  items: StockTransferItem[];
+  totalUnits: number;
+  totalAmount: number;
+  createdByUserId: string;
+  createdByName: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -134,6 +220,7 @@ export interface Sale {
   shopName?: string;
   sellerId: string;
   sellerName: string;
+  assistantName?: string;
   subtotal: number;
   discount: number;
   tax: number;
@@ -189,12 +276,27 @@ export interface SaleEditRequest {
   reviewedAt?: string;
 }
 
-export type MovementType = 'SALE' | 'PURCHASE' | 'PURCHASE_EDIT' | 'ADJUSTMENT' | 'CORRECTION' | 'RETURN' | 'VOID_RETURN' | 'DAMAGED' | 'BROKEN' | 'EXPIRED' | 'LOST';
+export type MovementType =
+  | 'SALE'
+  | 'PURCHASE'
+  | 'PURCHASE_EDIT'
+  | 'ADJUSTMENT'
+  | 'CORRECTION'
+  | 'RESTOCK'
+  | 'RETURN'
+  | 'VOID_RETURN'
+  | 'DAMAGED'
+  | 'BROKEN'
+  | 'EXPIRED'
+  | 'LOST'
+  | 'STORE_TRANSFER'
+  | 'INITIAL_STOCK';
 
 export interface InventoryMovement {
   id: string;
   shopId: string;
   shopName?: string;
+  storeId?: string;
   productId: string;
   productName: string;
   previousQty: number;
@@ -217,6 +319,7 @@ export interface PurchaseItem {
   productName: string;
   quantity: number;
   unitCost: number;
+  sellingPrice?: number;
   total: number;
 }
 
@@ -225,7 +328,10 @@ export interface Purchase {
   purchaseNumber: string;
   shopId: string;
   shopName?: string;
+  storeId?: string;
+  storeName?: string;
   supplierName: string;
+  supplierPhone?: string;
   date: string;
   items: PurchaseItem[];
   totalAmount: number;
@@ -236,6 +342,37 @@ export interface Purchase {
   createdByName: string;
   createdAt: string;
   updatedAt?: string;
+}
+
+export interface PurchaseReturnItem {
+  id: string;
+  productId: string;
+  productName: string;
+  originalQty: number;
+  returnQty: number;
+  remainingQty: number;
+  unitCost: number;
+  returnTotal: number;
+}
+
+export interface PurchaseReturn {
+  id: string;
+  returnNumber: string;
+  purchaseId: string;
+  purchaseNumber: string;
+  shopId: string;
+  shopName?: string;
+  storeId?: string;
+  storeName?: string;
+  supplierName: string;
+  invoiceNumber?: string;
+  items: PurchaseReturnItem[];
+  totalReturnQty: number;
+  totalReturnAmount: number;
+  reason: string;
+  returnedByUserId: string;
+  returnedByName: string;
+  createdAt: string;
 }
 
 export type ExpenseCategory =
@@ -278,6 +415,7 @@ export interface BusinessSettings {
   currencyCode?: string;
   taxRatePercent: number;
   enableTax: boolean;
+  enableSalesAssistant?: boolean;
   receiptHeaderNote: string;
   receiptFooterNote: string;
   receiptPaperWidth: '80mm' | '58mm' | 'A4';
@@ -292,7 +430,22 @@ export interface AuditLog {
   userName: string;
   action: string;
   details: string;
-  entityType: 'PRODUCT' | 'SALE' | 'PURCHASE' | 'EXPENSE' | 'SELLER' | 'INVENTORY' | 'SETTINGS' | 'AUTH' | 'BACKUP' | 'SHOP' | 'IMPORT' | 'SALE_EDIT' | 'DEBT';
+  entityType:
+    | 'PRODUCT'
+    | 'SALE'
+    | 'PURCHASE'
+    | 'EXPENSE'
+    | 'SELLER'
+    | 'INVENTORY'
+    | 'SETTINGS'
+    | 'AUTH'
+    | 'BACKUP'
+    | 'SHOP'
+    | 'STORE'
+    | 'STOCK_TRANSFER'
+    | 'IMPORT'
+    | 'SALE_EDIT'
+    | 'DEBT';
   entityId?: string;
   shopId?: string;
   timestamp: string;
@@ -305,11 +458,15 @@ export type SyncOperation =
   | 'UPDATE_PRODUCT'
   | 'TOGGLE_PRODUCT_STATUS'
   | 'DELETE_PRODUCT'
+  | 'CREATE_CATEGORY'
+  | 'UPDATE_CATEGORY'
   | 'CREATE_SALE'
   | 'UPDATE_SALE'
   | 'VOID_SALE'
   | 'CREATE_PURCHASE'
   | 'UPDATE_PURCHASE'
+  | 'DELETE_PURCHASE'
+  | 'CREATE_PURCHASE_RETURN'
   | 'CREATE_EXPENSE'
   | 'UPDATE_EXPENSE'
   | 'DELETE_EXPENSE'
@@ -322,6 +479,12 @@ export type SyncOperation =
   | 'UPDATE_SHOP'
   | 'TOGGLE_SHOP_STATUS'
   | 'DELETE_SHOP'
+  | 'CREATE_STORE'
+  | 'UPDATE_STORE'
+  | 'DELETE_STORE'
+  | 'TRANSFER_STORE_TO_SHOP'
+  | 'UPSERT_STOCK_TRANSFER'
+  | 'DELETE_STOCK_TRANSFER'
   | 'CREATE_SALE_EDIT_REQUEST'
   | 'REVIEW_SALE_EDIT_REQUEST'
   | 'CREATE_DEBT'
@@ -364,11 +527,13 @@ export interface ImportHistoryItem {
   id: string;
   fileName: string;
   dataType: CsvDataType;
+  format?: string;
   totalRecords: number;
   successCount: number;
   failedCount: number;
   updatedCount?: number;
   createdCount?: number;
+  skippedCount?: number;
   importedByUserId: string;
   importedByName: string;
   createdAt: string;

@@ -5,6 +5,7 @@ import { Sidebar } from './components/common/Sidebar';
 import { ReceiptModal } from './components/common/ReceiptModal';
 import { ToastContainer } from './components/common/ToastContainer';
 import { LoginView } from './components/auth/LoginView';
+import { getShopAdminShopIds, hasAdminAccess, isShopAdmin } from './utils/permissions';
 
 // Common / Shared Independent Modules
 import { DebtManagement } from './components/debt/DebtManagement';
@@ -21,6 +22,7 @@ import { SellerSettings } from './components/seller/SellerSettings';
 // Admin Views
 import { AdminDashboard } from './components/admin/AdminDashboard';
 import { AdminShops } from './components/admin/AdminShops';
+import { AdminStores } from './components/admin/AdminStores';
 import { AdminSales } from './components/admin/AdminSales';
 import { AdminProducts } from './components/admin/AdminProducts';
 import { AdminInventory } from './components/admin/AdminInventory';
@@ -56,7 +58,7 @@ const MainLayout: React.FC = () => {
         case 'new_sale':
           return <NewSalePOS />;
         case 'products':
-          if (permissions.canEditProducts || permissions.canDeleteProducts) {
+          if (hasAdminAccess(currentUser) || permissions.canEditProducts || permissions.canDeleteProducts) {
             return <AdminProducts />;
           }
           return <SellerProducts />;
@@ -64,39 +66,49 @@ const MainLayout: React.FC = () => {
           // Sellers can always view/record purchases
           return <AdminPurchases />;
         case 'sales':
-          // ADDED: Allow seller with canEditSales or canDeleteSales to view sales history
-          if (permissions.canEditSales || permissions.canDeleteSales) {
+          // Allow seller with canEditSales, canDeleteSales, or designated Shop Admin to view sales history
+          if (permissions.canEditSales || permissions.canDeleteSales || getShopAdminShopIds(currentUser).length > 0) {
             return <AdminSales />;
           }
           return <SellerDashboard />;
         case 'inventory':
-          // Only if seller has canManageInventory permission
-          if (permissions.canManageInventory) {
+          // Only if seller has canManageInventory permission or Shop Admin access
+          if (permissions.canManageInventory || hasAdminAccess(currentUser)) {
             return <AdminInventory />;
           }
           return <SellerDashboard />;
         case 'expenses':
-          // Only if seller has canViewExpenses or canRecordExpenses permission
-          if (permissions.canViewExpenses || permissions.canRecordExpenses) {
+          // Only if seller has canViewExpenses or canRecordExpenses permission or Shop Admin access
+          if (hasAdminAccess(currentUser) || permissions.canViewExpenses || permissions.canRecordExpenses) {
             return <AdminExpenses />;
           }
           return <SellerDashboard />;
         case 'reports':
-          // Only if seller has canViewReports permission
-          if (permissions.canViewReports) {
+          // Only if seller has canViewReports permission or Shop Admin access
+          if (hasAdminAccess(currentUser) || permissions.canViewReports) {
             return <AdminReports />;
           }
           return <SellerDashboard />;
         case 'shops':
-          // Only if seller has canManageShops permission
-          if (permissions.canManageShops) {
+          // Only if seller has canManageShops permission or is designated Shop Admin
+          if (permissions.canManageShops || getShopAdminShopIds(currentUser).length > 0) {
             return <AdminShops />;
           }
           return <SellerDashboard />;
+        case 'stores':
+          if (hasAdminAccess(currentUser) || permissions.canManageShops || permissions.canManageInventory) {
+            return <AdminStores />;
+          }
+          return <SellerDashboard />;
         case 'sellers':
-          // Only if seller has canManageSellers permission
-          if (permissions.canManageSellers) {
+          // Only if seller has canManageSellers permission or Shop Admin access
+          if (hasAdminAccess(currentUser) || permissions.canManageSellers) {
             return <AdminSellers />;
+          }
+          return <SellerDashboard />;
+        case 'data_management':
+          if (isShopAdmin(currentUser)) {
+            return <AdminDataManagement />;
           }
           return <SellerDashboard />;
         case 'my_sales':
@@ -118,6 +130,8 @@ const MainLayout: React.FC = () => {
         return <NewSalePOS />;
       case 'shops':
         return <AdminShops />;
+      case 'stores':
+        return <AdminStores />;
       case 'sales':
         return <AdminSales />;
       case 'products':

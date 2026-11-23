@@ -3,6 +3,7 @@ import { Product, ProductImage, ProductStatus, User } from '../types';
 import { generateUUID } from '../utils/crypto';
 import { normalizeProductImages } from '../utils/imageUtils';
 import { CloudflareApi } from './cloudflareApi';
+import { getAdminManagedShops, hasAdminAccess, isPlatformAdmin } from '../utils/permissions';
 
 // Helper to convert base64 to Blob
 function base64ToBlob(dataUrl: string, mimeType: string): Promise<Blob> {
@@ -133,7 +134,14 @@ export class ProductService {
   public static async createProduct(
     data: {
       shopId: string;
+      storeId?: string;
+      secondLocation?: {
+        type: 'SHOP_FLOOR' | 'STORE';
+        shopId: string;
+        storeId?: string;
+      };
       name: string;
+      variation?: string;
       sku?: string;
       barcode?: string;
       categoryId: string;
@@ -148,10 +156,12 @@ export class ProductService {
     },
     currentUser: User
   ): Promise<{ success: boolean; product?: Product; error?: string }> {
-    // Sellers can create products for their assigned shops
-    if (currentUser.role === 'SELLER') {
+    // Sellers can create products for their assigned/managed shops
+    if (!isPlatformAdmin(currentUser)) {
+      const managedIds = getAdminManagedShops(currentUser, db.getShops()).map(s => s.id);
       const assigned = currentUser.assignedShopIds || [];
-      if (assigned.length > 0 && !assigned.includes(data.shopId)) {
+      const allowedIds = Array.from(new Set([...managedIds, ...assigned]));
+      if (allowedIds.length > 0 && !allowedIds.includes(data.shopId)) {
         return { success: false, error: 'Permission Denied: You are not assigned to this shop.' };
       }
     }
@@ -201,17 +211,78 @@ export class ProductService {
       ? (normalizedImages[0].thumbnailUrl || normalizedImages[0].dataUrl)
       : data.imageUrl;
 
+    const allStores = db.getStores();
+    const targetStore = data.storeId
+      ? allStores.find(s => s.id === data.storeId && s.shopId === data.shopId)
+      : undefined;
+    const isWarehouseCreate = Boolean(targetStore && !targetStore.isShopFloor);
+    const initialQty = Math.max(0, Number(data.currentStock || 0));
+    const buyPrice = Number(data.purchasePrice || 0);
+    const sellPrice = Number(data.sellingPrice);
+
+    const storeStocksMap: Record<string, number> = {};
+    const storeDetailsMap: Product['storeDetails'] = {};
+
+    if (isWarehouseCreate && targetStore) {
+      storeStocksMap[targetStore.id] = initialQty;
+      storeDetailsMap[targetStore.id] = {
+        storeId: targetStore.id,
+        storeName: targetStore.name,
+        quantity: initialQty,
+        unitPurchasePrice: buyPrice,
+        unitSellingPrice: sellPrice,
+        importedPurchaseValue: initialQty * buyPrice,
+        importedSaleValue: initialQty * sellPrice,
+        importedPotentialProfit: initialQty * (sellPrice - buyPrice),
+      };
+    }
+
+    if (
+      data.secondLocation &&
+      data.secondLocation.shopId === data.shopId &&
+      data.secondLocation.type === 'STORE' &&
+      data.secondLocation.storeId
+    ) {
+      const secStore = allStores.find(
+        s => s.id === data.secondLocation!.storeId && s.shopId === data.shopId && !s.isShopFloor
+      );
+      if (secStore && !(secStore.id in storeStocksMap)) {
+        storeStocksMap[secStore.id] = 0;
+        storeDetailsMap[secStore.id] = {
+          storeId: secStore.id,
+          storeName: secStore.name,
+          quantity: 0,
+          unitPurchasePrice: buyPrice,
+          unitSellingPrice: sellPrice,
+          importedPurchaseValue: 0,
+          importedSaleValue: 0,
+          importedPotentialProfit: 0,
+        };
+      }
+    }
+
+    const hasStoreEntries = Object.keys(storeStocksMap).length > 0;
+
     const newProduct: Product = {
       id: productId,
       shopId: data.shopId,
+      storeId: isWarehouseCreate && targetStore ? targetStore.id : undefined,
       name: data.name.trim(),
+      variation: data.variation?.trim() || undefined,
       sku: cleanSku,
       barcode: cleanBarcode,
       categoryId: data.categoryId || 'cat-supplies',
-      sellingPrice: Number(data.sellingPrice),
-      purchasePrice: Number(data.purchasePrice || 0),
-      currentStock: Number(data.currentStock || 0),
-      minStock: Number(data.minStock ?? 5),
+      sellingPrice: sellPrice,
+      purchasePrice: buyPrice,
+      currentStock: isWarehouseCreate ? 0 : initialQty,
+      storeStock: isWarehouseCreate ? initialQty : 0,
+      ...(hasStoreEntries
+        ? {
+            storeStocks: storeStocksMap,
+            storeDetails: storeDetailsMap,
+          }
+        : {}),
+      minStock: Number(data.minStock ?? 0),
       unit: data.unit?.trim() || 'pcs',
       status: data.status || 'ACTIVE',
       images: normalizedImages,
@@ -223,20 +294,24 @@ export class ProductService {
     const updated = [newProduct, ...products];
     db.saveProducts(updated);
 
-    // If initial stock is greater than 0, record initial inventory movement with shopId
-    if (newProduct.currentStock > 0) {
+    // If initial stock is greater than 0, record initial inventory movement with shopId (and storeId if warehouse)
+    if (initialQty > 0) {
       db.saveMovements([
         {
           id: generateUUID(),
           shopId: newProduct.shopId,
           shopName: shop.name,
+          storeId: isWarehouseCreate && targetStore ? targetStore.id : undefined,
           productId: newProduct.id,
           productName: newProduct.name,
           previousQty: 0,
-          changeQty: newProduct.currentStock,
-          newQty: newProduct.currentStock,
-          type: 'ADJUSTMENT',
-          reason: `Initial stock opening in ${shop.name} by ${currentUser.name}`,
+          changeQty: initialQty,
+          newQty: initialQty,
+          type: isWarehouseCreate ? 'INITIAL_STOCK' : 'ADJUSTMENT',
+          reason:
+            isWarehouseCreate && targetStore
+              ? `Initial stock opening in store '${targetStore.name}' (${shop.name}) by ${currentUser.name}`
+              : `Initial stock opening in ${shop.name} by ${currentUser.name}`,
           userId: currentUser.id,
           userName: currentUser.name,
           createdAt: new Date().toISOString(),
@@ -279,8 +354,12 @@ export class ProductService {
     updates: Partial<Omit<Product, 'id' | 'createdAt'>>,
     currentUser: User
   ): Promise<{ success: boolean; product?: Product; error?: string }> {
-    // FIX: Allow Admin OR Seller with canEditProducts permission
-    if (currentUser.role !== 'ADMIN' && !currentUser.permissions?.canEditProducts) {
+    if (
+      !hasAdminAccess(currentUser) &&
+      !currentUser.permissions?.canEditProducts &&
+      !currentUser.permissions?.canManageInventory &&
+      !currentUser.permissions?.canManageShops
+    ) {
       return {
         success: false,
         error: 'Permission Denied: You do not have permission to edit products.',
@@ -360,13 +439,13 @@ export class ProductService {
    * Toggle Product Active/Inactive status.
    * Admin or Seller with canEditProducts permission.
    */
-  public static toggleProductStatus(
+  public static async toggleProductStatus(
     id: string,
     newStatus: ProductStatus,
     currentUser: User
-  ): { success: boolean; error?: string } {
-    // FIX: Allow Admin OR Seller with canEditProducts permission
-    if (currentUser.role !== 'ADMIN' && !currentUser.permissions?.canEditProducts) {
+  ): Promise<{ success: boolean; error?: string }> {
+    // Allow Platform Admin, Shop Admin, or Seller with canEditProducts permission
+    if (!hasAdminAccess(currentUser) && !currentUser.permissions?.canEditProducts) {
       return { success: false, error: 'Permission Denied: You do not have permission to change product status.' };
     }
 
@@ -375,14 +454,14 @@ export class ProductService {
 
   /**
    * Delete a product permanently.
-   * Admin or Seller with canDeleteProducts permission.
+   * Admin, Shop Admin, or Seller with canDeleteProducts permission.
    */
   public static deleteProduct(
     productId: string,
     currentUser: User
   ): { success: boolean; error?: string } {
-    // FIX: Allow Admin OR Seller with canDeleteProducts permission
-    if (currentUser.role !== 'ADMIN' && !currentUser.permissions?.canDeleteProducts) {
+    // Allow Platform Admin, Shop Admin, or Seller with canDeleteProducts permission
+    if (!hasAdminAccess(currentUser) && !currentUser.permissions?.canDeleteProducts) {
       return { success: false, error: 'Permission Denied: You do not have permission to delete products.' };
     }
 

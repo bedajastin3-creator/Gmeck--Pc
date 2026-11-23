@@ -16,6 +16,8 @@ import {
   DebtRecord,
   AppNotification,
   SaleEditRequest,
+  StockTransfer,
+  PurchaseReturn,
 } from '../types';
 import {
   INITIAL_USERS,
@@ -52,6 +54,8 @@ export interface DatabaseState {
   debts: DebtRecord[];
   notifications: AppNotification[];
   saleEditRequests: SaleEditRequest[];
+  stockTransfers: StockTransfer[];
+  purchaseReturns: PurchaseReturn[];
 }
 
 type DBListener = () => void;
@@ -166,6 +170,8 @@ class LocalDatabase {
     const syncQueue = this.loadTable<SyncQueueItem[]>('sync_queue', []);
     const importHistory = this.loadTable<ImportHistoryItem[]>('import_history', INITIAL_IMPORT_HISTORY);
     const saleEditRequests = this.loadTable<SaleEditRequest[]>('sale_edit_requests', []);
+    const stockTransfers = this.loadTable<StockTransfer[]>('stock_transfers', []);
+    const purchaseReturns = this.loadTable<PurchaseReturn[]>('purchase_returns', []);
 
     // Ensure users have Admin account
     if (!users || users.length === 0) {
@@ -241,6 +247,8 @@ class LocalDatabase {
       debts: debts || [],
       notifications: notifications || [],
       saleEditRequests: saleEditRequests || [],
+      stockTransfers: stockTransfers || [],
+      purchaseReturns: purchaseReturns || [],
     };
 
     return this.memoryCache;
@@ -291,6 +299,18 @@ class LocalDatabase {
     if (!this.memoryCache) this.init();
     this.memoryCache!.stores = stores;
     this.saveTable('stores', stores);
+    this.notify();
+  }
+
+  // --- Stock Transfers ---
+  public getStockTransfers(): StockTransfer[] {
+    return this.getState().stockTransfers || [];
+  }
+
+  public saveStockTransfers(transfers: StockTransfer[]): void {
+    if (!this.memoryCache) this.init();
+    this.memoryCache!.stockTransfers = transfers;
+    this.saveTable('stock_transfers', transfers);
     this.notify();
   }
 
@@ -351,6 +371,18 @@ class LocalDatabase {
     if (!this.memoryCache) this.init();
     this.memoryCache!.purchases = purchases;
     this.saveTable('purchases', purchases);
+    this.notify();
+  }
+
+  // --- Purchase Returns ---
+  public getPurchaseReturns(): PurchaseReturn[] {
+    return this.getState().purchaseReturns || [];
+  }
+
+  public savePurchaseReturns(returns: PurchaseReturn[]): void {
+    if (!this.memoryCache) this.init();
+    this.memoryCache!.purchaseReturns = returns;
+    this.saveTable('purchase_returns', returns);
     this.notify();
   }
 
@@ -634,6 +666,8 @@ class LocalDatabase {
       this.saveTable('debts', d.debts || INITIAL_DEBTS);
       this.saveTable('notifications', d.notifications || []);
       this.saveTable('sale_edit_requests', d.saleEditRequests || []);
+      this.saveTable('stock_transfers', d.stockTransfers || []);
+      this.saveTable('purchase_returns', d.purchaseReturns || []);
 
       this.init();
       this.notify();
@@ -791,6 +825,8 @@ class LocalDatabase {
     this.saveTable('debts', []);
     this.saveTable('notifications', []);
     this.saveTable('sale_edit_requests', []);
+    this.saveTable('stock_transfers', []);
+    this.saveTable('purchase_returns', []);
 
     this.init();
     this.notify();

@@ -7,11 +7,54 @@ import { User, Sale, ToastMessage, Shop } from '../types';
 import { getColorOption } from '../utils/colors';
 import { generateUUID } from '../utils/crypto';
 
+export type StoresSubTab = 'stores' | 'inventory' | 'transfer' | 'list' | 'transfer_view';
+export type ShopsSubTab = 'list' | 'add';
+export type InventoryFilter = 'ALL' | 'SHOP' | 'STORE';
+export type ProductsSubTab = 'product_list' | 'add_product' | 'category_list' | 'add_category';
+export type PurchasesSubTab = 'list' | 'add' | 'returns';
+export type ExpensesSubTab = 'list' | 'add';
+export type SellersSubTab = 'list' | 'add';
+
 interface AppContextType {
   currentUser: User | null;
   dbState: DatabaseState;
   activeTab: string;
   setActiveTab: (tab: string) => void;
+  storesSubTab: StoresSubTab;
+  setStoresSubTab: (subTab: StoresSubTab) => void;
+  openStoresSubTab: (subTab: StoresSubTab) => void;
+  storesNavTick: number;
+  bumpStoresNavTick: () => void;
+  shopsSubTab: ShopsSubTab;
+  setShopsSubTab: (subTab: ShopsSubTab) => void;
+  openShopsSubTab: (subTab: ShopsSubTab) => void;
+  shopsNavTick: number;
+  bumpShopsNavTick: () => void;
+  inventoryFilter: InventoryFilter;
+  setInventoryFilter: (filter: InventoryFilter) => void;
+  openInventoryFilter: (filter: InventoryFilter) => void;
+  inventoryNavTick: number;
+  bumpInventoryNavTick: () => void;
+  productsSubTab: ProductsSubTab;
+  setProductsSubTab: (subTab: ProductsSubTab) => void;
+  openProductsSubTab: (subTab: ProductsSubTab) => void;
+  productsNavTick: number;
+  bumpProductsNavTick: () => void;
+  purchasesSubTab: PurchasesSubTab;
+  setPurchasesSubTab: (subTab: PurchasesSubTab) => void;
+  openPurchasesSubTab: (subTab: PurchasesSubTab) => void;
+  purchasesNavTick: number;
+  bumpPurchasesNavTick: () => void;
+  expensesSubTab: ExpensesSubTab;
+  setExpensesSubTab: (subTab: ExpensesSubTab) => void;
+  openExpensesSubTab: (subTab: ExpensesSubTab) => void;
+  expensesNavTick: number;
+  bumpExpensesNavTick: () => void;
+  sellersSubTab: SellersSubTab;
+  setSellersSubTab: (subTab: SellersSubTab) => void;
+  openSellersSubTab: (subTab: SellersSubTab) => void;
+  sellersNavTick: number;
+  bumpSellersNavTick: () => void;
   login: (user: User) => void;
   logout: () => void;
   refreshUser: () => void;
@@ -31,6 +74,7 @@ interface AppContextType {
   // Sync status
   syncStatus: { state: SyncState; pendingCount: number };
   triggerSync: () => Promise<void>;
+  refreshStoresFromCloud: (force?: boolean) => Promise<{ success: boolean; error?: string }>;
   // Settings
   updateSettings: (settings: any) => void;
   // Seller color theme
@@ -43,6 +87,20 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const [currentUser, setCurrentUser] = useState<User | null>(() => AuthService.getActiveUser());
   const [dbState, setDbState] = useState<DatabaseState>(() => db.getState());
   const [activeTab, setActiveTab] = useState<string>('dashboard');
+  const [storesSubTab, setStoresSubTab] = useState<StoresSubTab>('stores');
+  const [storesNavTick, setStoresNavTick] = useState<number>(0);
+  const [shopsSubTab, setShopsSubTab] = useState<ShopsSubTab>('list');
+  const [shopsNavTick, setShopsNavTick] = useState<number>(0);
+  const [inventoryFilter, setInventoryFilter] = useState<InventoryFilter>('ALL');
+  const [inventoryNavTick, setInventoryNavTick] = useState<number>(0);
+  const [productsSubTab, setProductsSubTab] = useState<ProductsSubTab>('product_list');
+  const [productsNavTick, setProductsNavTick] = useState<number>(0);
+  const [purchasesSubTab, setPurchasesSubTab] = useState<PurchasesSubTab>('list');
+  const [purchasesNavTick, setPurchasesNavTick] = useState<number>(0);
+  const [expensesSubTab, setExpensesSubTab] = useState<ExpensesSubTab>('list');
+  const [expensesNavTick, setExpensesNavTick] = useState<number>(0);
+  const [sellersSubTab, setSellersSubTab] = useState<SellersSubTab>('list');
+  const [sellersNavTick, setSellersNavTick] = useState<number>(0);
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
   const [activeReceipt, setActiveReceipt] = useState<Sale | null>(null);
   const [syncStatus, setSyncStatus] = useState(SyncService.getSyncStatus());
@@ -388,6 +446,106 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setActiveReceipt(null);
   };
 
+  const bumpStoresNavTick = () => {
+    setStoresNavTick(prev => prev + 1);
+  };
+
+  const openStoresSubTab = (subTab: StoresSubTab) => {
+    setStoresSubTab(subTab);
+    setStoresNavTick(prev => prev + 1);
+    setActiveTab('stores');
+  };
+
+  const bumpShopsNavTick = () => {
+    setShopsNavTick(prev => prev + 1);
+  };
+
+  const openShopsSubTab = (subTab: ShopsSubTab) => {
+    setShopsSubTab(subTab);
+    setShopsNavTick(prev => prev + 1);
+    setActiveTab('shops');
+  };
+
+  const bumpInventoryNavTick = () => {
+    setInventoryNavTick(prev => prev + 1);
+  };
+
+  const openInventoryFilter = (filter: InventoryFilter) => {
+    setInventoryFilter(filter);
+    setInventoryNavTick(prev => prev + 1);
+    setActiveTab('inventory');
+  };
+
+  const bumpProductsNavTick = () => {
+    setProductsNavTick(prev => prev + 1);
+  };
+
+  const openProductsSubTab = (subTab: ProductsSubTab) => {
+    setProductsSubTab(subTab);
+    setProductsNavTick(prev => prev + 1);
+    setActiveTab('products');
+  };
+
+  const bumpPurchasesNavTick = () => {
+    setPurchasesNavTick(prev => prev + 1);
+  };
+
+  const openPurchasesSubTab = (subTab: PurchasesSubTab) => {
+    setPurchasesSubTab(subTab);
+    setPurchasesNavTick(prev => prev + 1);
+    setActiveTab('purchases');
+  };
+
+  const bumpExpensesNavTick = () => {
+    setExpensesNavTick(prev => prev + 1);
+  };
+
+  const openExpensesSubTab = (subTab: ExpensesSubTab) => {
+    setExpensesSubTab(subTab);
+    setExpensesNavTick(prev => prev + 1);
+    setActiveTab('expenses');
+  };
+
+  const bumpSellersNavTick = () => {
+    setSellersNavTick(prev => prev + 1);
+  };
+
+  const openSellersSubTab = (subTab: SellersSubTab) => {
+    setSellersSubTab(subTab);
+    setSellersNavTick(prev => prev + 1);
+    setActiveTab('sellers');
+  };
+
+  const refreshStoresFromCloud = async (
+    force: boolean = false
+  ): Promise<{ success: boolean; error?: string }> => {
+    try {
+      const online = await CloudflareApi.checkConnection();
+      if (!online) {
+        return { success: false, error: 'Offline: showing locally saved stores.' };
+      }
+
+      const cloudStores = await CloudflareApi.getStores();
+      if (Array.isArray(cloudStores)) {
+        SyncService.applyCloudStores(cloudStores, { reconcileDeleted: true });
+      }
+
+      if (force) {
+        await pushPendingItems();
+        await pullCloudData(true);
+      }
+
+      setDbState({ ...db.getState() });
+      setSyncStatus(SyncService.getSyncStatus());
+      return { success: true };
+    } catch (err: any) {
+      return {
+        success: false,
+        error: err?.message || 'Could not refresh stores from cloud.',
+      };
+    }
+  };
+
   const triggerSync = async () => {
     setSyncStatus({ state: 'SYNCING', pendingCount: syncStatus.pendingCount });
     
@@ -449,6 +607,41 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         dbState,
         activeTab,
         setActiveTab,
+        storesSubTab,
+        setStoresSubTab,
+        openStoresSubTab,
+        storesNavTick,
+        bumpStoresNavTick,
+        shopsSubTab,
+        setShopsSubTab,
+        openShopsSubTab,
+        shopsNavTick,
+        bumpShopsNavTick,
+        inventoryFilter,
+        setInventoryFilter,
+        openInventoryFilter,
+        inventoryNavTick,
+        bumpInventoryNavTick,
+        productsSubTab,
+        setProductsSubTab,
+        openProductsSubTab,
+        productsNavTick,
+        bumpProductsNavTick,
+        purchasesSubTab,
+        setPurchasesSubTab,
+        openPurchasesSubTab,
+        purchasesNavTick,
+        bumpPurchasesNavTick,
+        expensesSubTab,
+        setExpensesSubTab,
+        openExpensesSubTab,
+        expensesNavTick,
+        bumpExpensesNavTick,
+        sellersSubTab,
+        setSellersSubTab,
+        openSellersSubTab,
+        sellersNavTick,
+        bumpSellersNavTick,
         login,
         logout,
         refreshUser,
@@ -464,6 +657,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         closeReceipt,
         syncStatus,
         triggerSync,
+        refreshStoresFromCloud,
         updateSettings,
         sellerColor,
       }}

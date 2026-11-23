@@ -822,6 +822,7 @@ export class SyncService {
             productName: item.product_name,
             quantity: item.quantity,
             unitCost: item.unit_cost,
+            sellingPrice: item.selling_price ?? item.sellingPrice,
             total: item.total,
           }));
 
@@ -833,6 +834,7 @@ export class SyncService {
           storeId: cloudPurchase.store_id || undefined,
           storeName: cloudPurchase.store_name || undefined,
           supplierName: cloudPurchase.supplier_name,
+          supplierPhone: cloudPurchase.supplier_phone || cloudPurchase.supplierPhone || undefined,
           date: cloudPurchase.date,
           totalAmount: cloudPurchase.total_amount,
           paymentStatus: cloudPurchase.payment_status,

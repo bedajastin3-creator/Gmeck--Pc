@@ -1,13 +1,13 @@
-import React from 'react';
+import React, { useState, useEffect } from 'react';
 import {
-  LayoutDashboard,
+  Home,
   ShoppingCart,
   Package,
   Receipt,
   History,
   Users,
+  UserPlus,
   TrendingDown,
-  Truck,
   BarChart3,
   Database,
   Settings,
@@ -16,96 +16,604 @@ import {
   Store,
   FileText,
   Bell,
-  DollarSign,
-  Shield,
+  Car,
+  Warehouse,
+  ArrowRightLeft,
+  ClipboardList,
+  ChevronDown,
+  Plus,
+  RotateCcw,
+  FolderPlus,
+  FolderTree,
 } from 'lucide-react';
 import { useApp } from '../../context/AppContext';
+import { PurchaseIcon } from './PurchaseIcon';
 import { NotificationService } from '../../services/notificationService';
+import { DebtService } from '../../services/debtService';
+import {
+  getAdminManagedShops,
+  getEffectiveSellerPermissions,
+  getShopAdminShopIds,
+  isPlatformAdmin,
+  isShopAdmin,
+} from '../../utils/permissions';
+
+interface NavChildItem {
+  id: string;
+  label: string;
+  icon: React.ElementType;
+  iconColor: string;
+  badge?: number | string;
+}
 
 interface NavItem {
   id: string;
   label: string;
   icon: React.ElementType;
+  iconColor: string;
   badge?: number | string;
   badgeColor?: 'red' | 'amber' | 'blue';
   requiresPermission?: keyof import('../../types').SellerPermissions;
   requiresAnyPermission?: (keyof import('../../types').SellerPermissions)[];
+  children?: NavChildItem[];
 }
 
 export const Sidebar: React.FC = () => {
-  const { currentUser, activeTab, setActiveTab, sellerColor, dbState } = useApp();
+  const {
+    currentUser,
+    activeTab,
+    setActiveTab,
+    storesSubTab,
+    openStoresSubTab,
+    inventoryFilter,
+    openInventoryFilter,
+    purchasesSubTab,
+    openPurchasesSubTab,
+    expensesSubTab,
+    openExpensesSubTab,
+    productsSubTab,
+    openProductsSubTab,
+    shopsSubTab,
+    openShopsSubTab,
+    sellersSubTab,
+    openSellersSubTab,
+    sellerColor,
+    dbState,
+  } = useApp();
 
+  const [expandedGroups, setExpandedGroups] = useState<Record<string, boolean>>({
+    shops: activeTab === 'shops',
+    sell: activeTab === 'new_sale' || activeTab === 'sales' || activeTab === 'my_sales',
+    stores: activeTab === 'stores',
+    inventory: activeTab === 'inventory',
+    purchases: activeTab === 'purchases',
+    expenses: activeTab === 'expenses',
+    products: activeTab === 'products',
+    sellers: activeTab === 'sellers',
+  });
+
+  useEffect(() => {
+    if (activeTab === 'new_sale' || activeTab === 'sales' || activeTab === 'my_sales') {
+      setExpandedGroups(prev => ({ ...prev, sell: true }));
+    } else if (
+      activeTab === 'shops' ||
+      activeTab === 'stores' ||
+      activeTab === 'inventory' ||
+      activeTab === 'purchases' ||
+      activeTab === 'expenses' ||
+      activeTab === 'products' ||
+      activeTab === 'sellers'
+    ) {
+      setExpandedGroups(prev => ({ ...prev, [activeTab]: true }));
+    }
+  }, [activeTab]);
+
+  const isPlatformAdm = isPlatformAdmin(currentUser);
+  const isShopAdm = isShopAdmin(currentUser);
+  const showAdminMenu = isPlatformAdm || isShopAdm;
   const isSeller = currentUser?.role === 'SELLER';
-  const isAdmin = currentUser?.role === 'ADMIN';
-  const sellerPermissions = currentUser?.permissions || {};
+  const managedShopIds = getShopAdminShopIds(currentUser);
+  const assignedShopIds = currentUser?.assignedShopIds || [];
+  const scopedShopIds = isPlatformAdm
+    ? null
+    : isShopAdm
+    ? managedShopIds
+    : assignedShopIds;
+  const managedShops = getAdminManagedShops(currentUser, dbState.shops || []);
+  const sellerPermissions = getEffectiveSellerPermissions(currentUser);
 
   // Check if seller has a specific permission
   const hasPermission = (perm: keyof import('../../types').SellerPermissions): boolean => {
-    if (isAdmin) return true;
+    if (showAdminMenu) return true;
     return !!sellerPermissions[perm];
   };
 
   // Check if seller has ANY of the given permissions
-  const hasAnyPermission = (perms: (keyof import('../../types').SellerPermissions)[]): boolean => {
-    if (isAdmin) return true;
+  const hasAnyPermission = (
+    perms: (keyof import('../../types').SellerPermissions)[]
+  ): boolean => {
+    if (showAdminMenu) return true;
     return perms.some(perm => !!sellerPermissions[perm]);
   };
 
-  // Count low-stock items
+  // Count low-stock items within user shop scope
   const lowStockCount = (dbState.products || []).filter(
-    p => p.status === 'ACTIVE' && p.currentStock <= p.minStock
+    p =>
+      p.status === 'ACTIVE' &&
+      p.currentStock <= p.minStock &&
+      (!scopedShopIds || scopedShopIds.length === 0 || scopedShopIds.includes(p.shopId))
   ).length;
 
   // Count unread notifications
   const unreadNotifsCount = NotificationService.getUnreadCount(currentUser);
 
-  // Count pending/overdue debts
-  const debts = dbState.debts || [];
+  // Count pending/overdue debts within user scope
+  const debts = DebtService.getAllDebts(currentUser || undefined);
   const overdueDebtsCount = debts.filter(d => d.status === 'OVERDUE').length;
 
+  // Count accessible stores and stock transfers
+  const accessibleStoresCount = (dbState.stores || []).filter(
+    st => isPlatformAdm || managedShopIds.includes(st.shopId)
+  ).length;
+  const accessibleTransfersCount = (dbState.stockTransfers || []).filter(
+    t =>
+      isPlatformAdm ||
+      managedShopIds.includes(t.sourceShopId) ||
+      managedShopIds.includes(t.destShopId)
+  ).length;
+  const accessibleReturnsCount = (dbState.purchaseReturns || []).filter(
+    r => !scopedShopIds || scopedShopIds.length === 0 || scopedShopIds.includes(r.shopId)
+  ).length;
+
   const sellerNav: NavItem[] = [
-    { id: 'dashboard', label: 'Dashboard', icon: LayoutDashboard },
-    { id: 'new_sale', label: 'New Sale (POS)', icon: ShoppingCart },
-    { id: 'products', label: 'Products', icon: Package, badge: lowStockCount > 0 ? lowStockCount : undefined },
-    
-    // Purchases - always show (sellers can always view/record stock-in)
-    { id: 'purchases', label: 'Purchases & Stock In', icon: Truck },
-    
-    { id: 'my_sales', label: 'My Sales', icon: History },
-    { id: 'debts', label: 'Madeni (Debts)', icon: FileText, badge: overdueDebtsCount > 0 ? `${overdueDebtsCount} Overdue` : debts.filter(d => d.status !== 'PAID').length || undefined, badgeColor: overdueDebtsCount > 0 ? 'red' : 'amber' },
-    { id: 'notifications', label: 'Taarifa & Vikumbusho', icon: Bell, badge: unreadNotifsCount > 0 ? unreadNotifsCount : undefined, badgeColor: 'red' },
-    { id: 'receipts', label: 'Receipts', icon: Receipt },
-    
+    { id: 'dashboard', label: 'Home', icon: Home, iconColor: 'text-sky-400' },
+    {
+      id: 'shops',
+      label: 'Shops & Business Unit',
+      icon: Store,
+      iconColor: 'text-amber-400',
+      requiresPermission: 'canManageShops',
+      children: [
+        {
+          id: 'add',
+          label: 'Add Shop',
+          icon: Plus,
+          iconColor: 'text-emerald-400',
+        },
+        {
+          id: 'list',
+          label: 'All Shops (List)',
+          icon: ClipboardList,
+          iconColor: 'text-amber-400',
+        },
+      ],
+    },
+    {
+      id: 'products',
+      label: 'Products & Categories',
+      icon: Package,
+      iconColor: 'text-violet-400',
+      badge: lowStockCount > 0 ? lowStockCount : undefined,
+      children: [
+        {
+          id: 'add_product',
+          label: 'Add Products',
+          icon: Plus,
+          iconColor: 'text-emerald-400',
+        },
+        ...(hasAnyPermission(['canEditProducts', 'canDeleteProducts'])
+          ? [
+              {
+                id: 'add_category',
+                label: 'Add Category',
+                icon: FolderPlus,
+                iconColor: 'text-sky-400',
+              },
+            ]
+          : []),
+        {
+          id: 'product_list',
+          label: 'Product List',
+          icon: Package,
+          iconColor: 'text-violet-400',
+        },
+        ...(hasAnyPermission(['canEditProducts', 'canDeleteProducts'])
+          ? [
+              {
+                id: 'category_list',
+                label: 'Category List',
+                icon: FolderTree,
+                iconColor: 'text-amber-400',
+              },
+            ]
+          : []),
+      ],
+    },
+    {
+      id: 'purchases',
+      label: 'Purchases',
+      icon: PurchaseIcon,
+      iconColor: 'text-orange-400',
+      children: [
+        {
+          id: 'add',
+          label: 'Add Purchase',
+          icon: Plus,
+          iconColor: 'text-emerald-400',
+        },
+        {
+          id: 'list',
+          label: 'Purchase List',
+          icon: ClipboardList,
+          iconColor: 'text-orange-400',
+        },
+        {
+          id: 'returns',
+          label: 'Return List',
+          icon: RotateCcw,
+          iconColor: 'text-amber-400',
+          badge: accessibleReturnsCount || undefined,
+        },
+      ],
+    },
+    {
+      id: 'sell',
+      label: 'Sell',
+      icon: ShoppingCart,
+      iconColor: 'text-emerald-400',
+      children: [
+        {
+          id: 'new_sale',
+          label: 'Add Sale (POS)',
+          icon: Plus,
+          iconColor: 'text-emerald-400',
+        },
+        {
+          id: hasAnyPermission(['canEditSales', 'canDeleteSales']) ? 'sales' : 'my_sales',
+          label: 'All Sales Reports',
+          icon: History,
+          iconColor: 'text-indigo-400',
+        },
+      ],
+    },
+    {
+      id: 'debts',
+      label: 'Debt Management',
+      icon: FileText,
+      iconColor: 'text-yellow-400',
+      badge:
+        overdueDebtsCount > 0
+          ? `${overdueDebtsCount} Overdue`
+          : debts.filter(d => d.status !== 'PAID').length || undefined,
+      badgeColor: overdueDebtsCount > 0 ? 'red' : 'amber',
+    },
+    {
+      id: 'notifications',
+      label: 'Notification Center',
+      icon: Bell,
+      iconColor: 'text-pink-400',
+      badge: unreadNotifsCount > 0 ? unreadNotifsCount : undefined,
+      badgeColor: 'red',
+    },
+    { id: 'receipts', label: 'Receipts', icon: Receipt, iconColor: 'text-teal-400' },
+
     // Permission-gated items
-    { id: 'sales', label: 'Sales History', icon: History, requiresAnyPermission: ['canEditSales', 'canDeleteSales'] },
-    { id: 'inventory', label: 'Inventory Management', icon: Boxes, requiresPermission: 'canManageInventory' },
-    { id: 'expenses', label: 'Expenses', icon: DollarSign, requiresAnyPermission: ['canViewExpenses', 'canRecordExpenses'] },
-    { id: 'reports', label: 'Reports', icon: BarChart3, requiresPermission: 'canViewReports' },
-    { id: 'shops', label: 'Shops & Units', icon: Store, requiresPermission: 'canManageShops' },
-    { id: 'sellers', label: 'Sellers', icon: Users, requiresPermission: 'canManageSellers' },
-    
-    { id: 'settings', label: 'Settings', icon: Settings },
+    {
+      id: 'inventory',
+      label: 'Stock & Inventory',
+      icon: Boxes,
+      iconColor: 'text-teal-400',
+      requiresPermission: 'canManageInventory',
+      children: [
+        {
+          id: 'ALL',
+          label: 'All Inventories',
+          icon: Boxes,
+          iconColor: 'text-teal-400',
+        },
+        {
+          id: 'SHOP',
+          label: 'Shop Inventory',
+          icon: Store,
+          iconColor: 'text-emerald-400',
+        },
+        {
+          id: 'STORE',
+          label: 'Store Inventory',
+          icon: Warehouse,
+          iconColor: 'text-indigo-400',
+        },
+      ],
+    },
+    {
+      id: 'expenses',
+      label: 'Expenses',
+      icon: TrendingDown,
+      iconColor: 'text-rose-400',
+      requiresAnyPermission: ['canViewExpenses', 'canRecordExpenses'],
+      children: [
+        ...(hasPermission('canRecordExpenses')
+          ? [
+              {
+                id: 'add',
+                label: 'Add Expense',
+                icon: Plus,
+                iconColor: 'text-emerald-400',
+              },
+            ]
+          : []),
+        {
+          id: 'list',
+          label: 'List',
+          icon: ClipboardList,
+          iconColor: 'text-rose-400',
+        },
+      ],
+    },
+    {
+      id: 'reports',
+      label: 'Reports & Analytics',
+      icon: BarChart3,
+      iconColor: 'text-fuchsia-400',
+      requiresPermission: 'canViewReports',
+    },
+    {
+      id: 'sellers',
+      label: 'User Management',
+      icon: Users,
+      iconColor: 'text-blue-400',
+      requiresPermission: 'canManageSellers',
+      children: [
+        {
+          id: 'add',
+          label: 'Add Seller Account',
+          icon: UserPlus,
+          iconColor: 'text-emerald-400',
+        },
+        {
+          id: 'list',
+          label: 'All Sellers (List)',
+          icon: Users,
+          iconColor: 'text-blue-400',
+        },
+      ],
+    },
+    { id: 'settings', label: 'Account Settings', icon: Settings, iconColor: 'text-sky-300' },
   ];
 
   const adminNav: NavItem[] = [
-    { id: 'dashboard', label: 'Dashboard', icon: LayoutDashboard },
-    { id: 'new_sale', label: 'New Sale (POS)', icon: ShoppingCart },
-    { id: 'shops', label: 'Shops & Units', icon: Store, badge: (dbState.shops || []).length },
-    { id: 'sales', label: 'Sales History', icon: History },
-    { id: 'debts', label: 'Debt Management (Madeni)', icon: FileText, badge: overdueDebtsCount > 0 ? `${overdueDebtsCount} Overdue` : undefined, badgeColor: 'red' },
-    { id: 'notifications', label: 'Notification Center', icon: Bell, badge: unreadNotifsCount > 0 ? unreadNotifsCount : undefined, badgeColor: 'red' },
-    { id: 'products', label: 'Products & Categories', icon: Package },
-    { id: 'inventory', label: 'Inventory', icon: Boxes, badge: lowStockCount > 0 ? `${lowStockCount} Low` : undefined },
-    { id: 'sellers', label: 'Sellers', icon: Users },
-    { id: 'purchases', label: 'Purchases', icon: Truck },
-    { id: 'expenses', label: 'Expenses', icon: TrendingDown },
-    { id: 'reports', label: 'Reports', icon: BarChart3 },
-    { id: 'data_management', label: 'Data Management', icon: Database },
-    { id: 'settings', label: 'Settings', icon: Settings },
+    { id: 'dashboard', label: 'Home', icon: Home, iconColor: 'text-sky-400' },
+    {
+      id: 'shops',
+      label: 'Shops & Business Unit',
+      icon: Store,
+      iconColor: 'text-amber-400',
+      badge: managedShops.length,
+      children: [
+        {
+          id: 'add',
+          label: 'Add Shop',
+          icon: Plus,
+          iconColor: 'text-emerald-400',
+        },
+        {
+          id: 'list',
+          label: 'All Shops (List)',
+          icon: ClipboardList,
+          iconColor: 'text-amber-400',
+        },
+      ],
+    },
+    {
+      id: 'products',
+      label: 'Products & Categories',
+      icon: Package,
+      iconColor: 'text-violet-400',
+      children: [
+        {
+          id: 'add_product',
+          label: 'Add Products',
+          icon: Plus,
+          iconColor: 'text-emerald-400',
+        },
+        {
+          id: 'add_category',
+          label: 'Add Category',
+          icon: FolderPlus,
+          iconColor: 'text-sky-400',
+        },
+        {
+          id: 'product_list',
+          label: 'Product List',
+          icon: Package,
+          iconColor: 'text-violet-400',
+        },
+        {
+          id: 'category_list',
+          label: 'Category List',
+          icon: FolderTree,
+          iconColor: 'text-amber-400',
+        },
+      ],
+    },
+    {
+      id: 'purchases',
+      label: 'Purchases',
+      icon: PurchaseIcon,
+      iconColor: 'text-orange-400',
+      children: [
+        {
+          id: 'add',
+          label: 'Add Purchase',
+          icon: Plus,
+          iconColor: 'text-emerald-400',
+        },
+        {
+          id: 'list',
+          label: 'Purchase List',
+          icon: ClipboardList,
+          iconColor: 'text-orange-400',
+        },
+        {
+          id: 'returns',
+          label: 'Return List',
+          icon: RotateCcw,
+          iconColor: 'text-amber-400',
+          badge: accessibleReturnsCount || undefined,
+        },
+      ],
+    },
+    {
+      id: 'sell',
+      label: 'Sell',
+      icon: ShoppingCart,
+      iconColor: 'text-emerald-400',
+      children: [
+        {
+          id: 'new_sale',
+          label: 'Add Sale (POS)',
+          icon: Plus,
+          iconColor: 'text-emerald-400',
+        },
+        {
+          id: 'sales',
+          label: 'All Sales Reports',
+          icon: History,
+          iconColor: 'text-indigo-400',
+        },
+      ],
+    },
+    {
+      id: 'stores',
+      label: 'Stores & Transfer',
+      icon: Car,
+      iconColor: 'text-cyan-400',
+      badge: accessibleStoresCount || undefined,
+      badgeColor: 'blue',
+      children: [
+        {
+          id: 'stores',
+          label: 'Stores',
+          icon: Warehouse,
+          iconColor: 'text-cyan-400',
+          badge: accessibleStoresCount || undefined,
+        },
+        {
+          id: 'inventory',
+          label: 'Inventory',
+          icon: Package,
+          iconColor: 'text-blue-400',
+        },
+        {
+          id: 'transfer',
+          label: 'Transfer Stock',
+          icon: ArrowRightLeft,
+          iconColor: 'text-indigo-400',
+        },
+        {
+          id: 'list',
+          label: 'List',
+          icon: ClipboardList,
+          iconColor: 'text-emerald-400',
+          badge: accessibleTransfersCount || undefined,
+        },
+      ],
+    },
+    {
+      id: 'inventory',
+      label: 'Stock & Inventory',
+      icon: Boxes,
+      iconColor: 'text-teal-400',
+      badge: lowStockCount > 0 ? `${lowStockCount} Low` : undefined,
+      children: [
+        {
+          id: 'ALL',
+          label: 'All Inventories',
+          icon: Boxes,
+          iconColor: 'text-teal-400',
+        },
+        {
+          id: 'SHOP',
+          label: 'Shop Inventory',
+          icon: Store,
+          iconColor: 'text-emerald-400',
+        },
+        {
+          id: 'STORE',
+          label: 'Store Inventory',
+          icon: Warehouse,
+          iconColor: 'text-indigo-400',
+        },
+      ],
+    },
+    {
+      id: 'expenses',
+      label: 'Expenses',
+      icon: TrendingDown,
+      iconColor: 'text-rose-400',
+      children: [
+        {
+          id: 'add',
+          label: 'Add Expense',
+          icon: Plus,
+          iconColor: 'text-emerald-400',
+        },
+        {
+          id: 'list',
+          label: 'List',
+          icon: ClipboardList,
+          iconColor: 'text-rose-400',
+        },
+      ],
+    },
+    {
+      id: 'debts',
+      label: 'Debt Management',
+      icon: FileText,
+      iconColor: 'text-yellow-400',
+      badge: overdueDebtsCount > 0 ? `${overdueDebtsCount} Overdue` : undefined,
+      badgeColor: 'red',
+    },
+    { id: 'reports', label: 'Reports & Analytics', icon: BarChart3, iconColor: 'text-fuchsia-400' },
+    {
+      id: 'sellers',
+      label: 'User Management',
+      icon: Users,
+      iconColor: 'text-blue-400',
+      children: [
+        {
+          id: 'add',
+          label: 'Add Seller Account',
+          icon: UserPlus,
+          iconColor: 'text-emerald-400',
+        },
+        {
+          id: 'list',
+          label: 'All Sellers (List)',
+          icon: Users,
+          iconColor: 'text-blue-400',
+        },
+      ],
+    },
+    {
+      id: 'notifications',
+      label: 'Notification Center',
+      icon: Bell,
+      iconColor: 'text-pink-400',
+      badge: unreadNotifsCount > 0 ? unreadNotifsCount : undefined,
+      badgeColor: 'red',
+    },
+    {
+      id: 'data_management',
+      label: 'Shop Import & Export',
+      icon: Database,
+      iconColor: 'text-lime-400',
+    },
+    { id: 'settings', label: 'Account Settings', icon: Settings, iconColor: 'text-sky-300' },
   ];
 
   // Filter items based on permissions
-  const items = (isSeller ? sellerNav : adminNav).filter(item => {
+  const items = (showAdminMenu ? adminNav : sellerNav).filter(item => {
     if (item.requiresPermission) {
       return hasPermission(item.requiresPermission);
     }
@@ -118,20 +626,246 @@ export const Sidebar: React.FC = () => {
   return (
     <aside
       id="app-sidebar-nav"
-      className="w-64 bg-slate-900 text-slate-300 border-r border-slate-800 flex flex-col justify-between shrink-0 select-none"
+      className="flex w-64 bg-slate-900 text-slate-300 border-r border-slate-800 flex-col justify-between shrink-0 select-none overflow-hidden"
     >
       <div className="py-3 flex-1 overflow-y-auto">
         {/* Navigation Category Label */}
         <div className="px-4 pb-2 text-[11px] font-semibold uppercase tracking-wider text-slate-400 flex items-center justify-between">
-          <span>{isSeller ? 'Seller Terminal' : 'Admin Control Panel'}</span>
-          {isAdmin && <Lock className="w-3 h-3 text-amber-400" />}
+          <span>
+            {isPlatformAdm
+              ? 'Admin Control Panel'
+              : isShopAdm
+              ? 'Shop Admin Panel'
+              : 'Seller Terminal'}
+          </span>
+          {showAdminMenu && <Lock className="w-3 h-3 text-amber-400" />}
         </div>
 
         {/* Menu Items */}
         <nav className="space-y-1 px-2">
           {items.map(item => {
             const Icon = item.icon;
-            const isActive = activeTab === item.id;
+            const isActive =
+              item.id === 'sell'
+                ? activeTab === 'new_sale' ||
+                  activeTab === 'sales' ||
+                  (!showAdminMenu && activeTab === 'my_sales')
+                : activeTab === item.id;
+            const hasChildren = Boolean(item.children && item.children.length > 0);
+
+            if (hasChildren && item.children) {
+              const isExpanded = Boolean(expandedGroups[item.id]);
+              const isShopsGroup = item.id === 'shops';
+              const isSellersGroup = item.id === 'sellers';
+              const isSellGroup = item.id === 'sell';
+              const isInventoryGroup = item.id === 'inventory';
+              const isPurchasesGroup = item.id === 'purchases';
+              const isExpensesGroup = item.id === 'expenses';
+              const isProductsGroup = item.id === 'products';
+              const activeParentClasses = isSellersGroup
+                ? 'bg-blue-600/20 text-white border border-blue-500/35'
+                : isShopsGroup
+                ? 'bg-amber-600/20 text-white border border-amber-500/35'
+                : isSellGroup
+                ? 'bg-emerald-600/20 text-white border border-emerald-500/35'
+                : isProductsGroup
+                ? 'bg-violet-600/20 text-white border border-violet-500/35'
+                : isExpensesGroup
+                ? 'bg-rose-600/20 text-white border border-rose-500/35'
+                : isPurchasesGroup
+                ? 'bg-orange-600/20 text-white border border-orange-500/35'
+                : isInventoryGroup
+                ? 'bg-teal-600/20 text-white border border-teal-500/35'
+                : 'bg-cyan-600/20 text-white border border-cyan-500/35';
+              const activeIconColor = isSellersGroup
+                ? 'text-blue-300'
+                : isShopsGroup
+                ? 'text-amber-300'
+                : isSellGroup
+                ? 'text-emerald-300'
+                : isProductsGroup
+                ? 'text-violet-300'
+                : isExpensesGroup
+                ? 'text-rose-300'
+                : isPurchasesGroup
+                ? 'text-orange-300'
+                : isInventoryGroup
+                ? 'text-teal-300'
+                : 'text-cyan-300';
+              const activeChevronColor = isSellersGroup
+                ? 'text-blue-400'
+                : isShopsGroup
+                ? 'text-amber-400'
+                : isSellGroup
+                ? 'text-emerald-400'
+                : isProductsGroup
+                ? 'text-violet-400'
+                : isExpensesGroup
+                ? 'text-rose-400'
+                : isPurchasesGroup
+                ? 'text-orange-400'
+                : isInventoryGroup
+                ? 'text-teal-400'
+                : 'text-cyan-400';
+              const borderLineColor = isSellersGroup
+                ? 'border-blue-500/30'
+                : isShopsGroup
+                ? 'border-amber-500/30'
+                : isSellGroup
+                ? 'border-emerald-500/30'
+                : isProductsGroup
+                ? 'border-violet-500/30'
+                : isExpensesGroup
+                ? 'border-rose-500/30'
+                : isPurchasesGroup
+                ? 'border-orange-500/30'
+                : isInventoryGroup
+                ? 'border-teal-500/30'
+                : 'border-cyan-500/30';
+
+              return (
+                <div key={item.id} className="space-y-1">
+                  <button
+                    type="button"
+                    id={`nav-${item.id}`}
+                    onClick={() =>
+                      setExpandedGroups(prev => ({ ...prev, [item.id]: !prev[item.id] }))
+                    }
+                    aria-expanded={isExpanded}
+                    className={`w-full flex items-center justify-between px-3 py-2 rounded-lg text-xs font-medium transition-all duration-200 ${
+                      isActive
+                        ? activeParentClasses
+                        : isExpanded
+                        ? 'bg-slate-800/80 text-white'
+                        : 'text-slate-300 hover:text-white hover:bg-slate-800/60'
+                    }`}
+                  >
+                    <div className="flex items-center gap-3 min-w-0">
+                      <Icon
+                        className={`w-4 h-4 shrink-0 ${
+                          isActive ? activeIconColor : item.iconColor
+                        }`}
+                      />
+                      <span className="truncate">{item.label}</span>
+                    </div>
+
+                    <div className="flex items-center gap-1.5 shrink-0">
+                      {item.badge !== undefined && (
+                        <span
+                          className={`text-[10px] px-1.5 py-0.5 rounded-full font-bold ${
+                            item.badgeColor === 'blue'
+                              ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/30'
+                              : 'bg-amber-500/20 text-amber-400 border border-amber-500/30'
+                          }`}
+                        >
+                          {item.badge}
+                        </span>
+                      )}
+                      <ChevronDown
+                        className={`w-3.5 h-3.5 transition-transform duration-300 ease-out ${
+                          isExpanded ? `rotate-180 ${activeChevronColor}` : 'text-slate-500'
+                        }`}
+                      />
+                    </div>
+                  </button>
+
+                  {/* Animated Collapsible Submenu */}
+                  <div
+                    className={`grid transition-all duration-300 ease-out ${
+                      isExpanded
+                        ? 'grid-rows-[1fr] opacity-100 translate-y-0'
+                        : 'grid-rows-[0fr] opacity-0 -translate-y-1 pointer-events-none'
+                    }`}
+                  >
+                    <div className="overflow-hidden">
+                      <div className={`ml-4 pl-2.5 py-0.5 space-y-0.5 border-l-2 ${borderLineColor}`}>
+                        {item.children.map(child => {
+                          const ChildIcon = child.icon;
+                          const isChildActive =
+                            item.id === 'shops'
+                              ? activeTab === 'shops' && shopsSubTab === child.id
+                              : item.id === 'sellers'
+                              ? activeTab === 'sellers' && sellersSubTab === child.id
+                              : item.id === 'sell'
+                              ? activeTab === child.id
+                              : item.id === 'stores'
+                              ? activeTab === 'stores' &&
+                                (storesSubTab === child.id ||
+                                  (child.id === 'list' && storesSubTab === 'transfer_view'))
+                              : item.id === 'purchases'
+                              ? activeTab === 'purchases' && purchasesSubTab === child.id
+                              : item.id === 'expenses'
+                              ? activeTab === 'expenses' && expensesSubTab === child.id
+                              : item.id === 'products'
+                              ? activeTab === 'products' && productsSubTab === child.id
+                              : activeTab === 'inventory' && inventoryFilter === child.id;
+
+                          return (
+                            <button
+                              key={child.id}
+                              type="button"
+                              id={`nav-${item.id}-${child.id}`}
+                              onClick={() => {
+                                if (item.id === 'shops') {
+                                  openShopsSubTab(child.id as 'add' | 'list');
+                                } else if (item.id === 'sellers') {
+                                  openSellersSubTab(child.id as 'add' | 'list');
+                                } else if (item.id === 'sell') {
+                                  setActiveTab(child.id);
+                                } else if (item.id === 'stores') {
+                                  openStoresSubTab(
+                                    child.id as 'stores' | 'inventory' | 'transfer' | 'list'
+                                  );
+                                } else if (item.id === 'inventory') {
+                                  openInventoryFilter(child.id as 'ALL' | 'SHOP' | 'STORE');
+                                } else if (item.id === 'purchases') {
+                                  openPurchasesSubTab(child.id as 'add' | 'list' | 'returns');
+                                } else if (item.id === 'expenses') {
+                                  openExpensesSubTab(child.id as 'add' | 'list');
+                                } else if (item.id === 'products') {
+                                  openProductsSubTab(
+                                    child.id as
+                                      | 'product_list'
+                                      | 'add_product'
+                                      | 'category_list'
+                                      | 'add_category'
+                                  );
+                                }
+                              }}
+                              className={`w-full flex items-center justify-between px-2.5 py-1.5 rounded-lg text-xs transition-all duration-200 ${
+                                isChildActive
+                                  ? 'bg-blue-600 text-white shadow-sm font-semibold'
+                                  : 'text-slate-400 hover:text-white hover:bg-slate-800/60 font-medium'
+                              }`}
+                            >
+                              <div className="flex items-center gap-2.5 min-w-0">
+                                <ChildIcon
+                                  className={`w-3.5 h-3.5 shrink-0 ${
+                                    isChildActive ? 'text-white' : child.iconColor
+                                  }`}
+                                />
+                                <span className="truncate">{child.label}</span>
+                              </div>
+                              {child.badge !== undefined && (
+                                <span
+                                  className={`text-[10px] px-1.5 py-0.5 rounded-full font-bold ${
+                                    isChildActive
+                                      ? 'bg-white/20 text-white'
+                                      : 'bg-slate-800 text-slate-300 border border-slate-700'
+                                  }`}
+                                >
+                                  {child.badge}
+                                </span>
+                              )}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              );
+            }
 
             return (
               <button
@@ -141,24 +875,26 @@ export const Sidebar: React.FC = () => {
                 className={`w-full flex items-center justify-between px-3 py-2 rounded-lg text-xs font-medium transition-all ${
                   isActive
                     ? 'text-white shadow-sm font-semibold'
-                    : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/60'
+                    : 'text-slate-300 hover:text-white hover:bg-slate-800/60'
                 }`}
                 style={{
                   backgroundColor: isActive
                     ? isSeller
                       ? sellerColor.primary
-                      : '#3b82f6'
+                      : '#2563eb'
                     : undefined,
                 }}
               >
-                <div className="flex items-center gap-3">
-                  <Icon className={`w-4 h-4 ${isActive ? 'text-white' : 'text-slate-400'}`} />
-                  <span>{item.label}</span>
+                <div className="flex items-center gap-3 min-w-0">
+                  <Icon
+                    className={`w-4 h-4 shrink-0 ${isActive ? 'text-white' : item.iconColor}`}
+                  />
+                  <span className="truncate">{item.label}</span>
                 </div>
 
                 {item.badge !== undefined && (
                   <span
-                    className={`text-[10px] px-1.5 py-0.5 rounded-full font-bold ${
+                    className={`text-[10px] px-1.5 py-0.5 rounded-full font-bold shrink-0 ${
                       isActive
                         ? 'bg-white/20 text-white'
                         : item.badgeColor === 'red'

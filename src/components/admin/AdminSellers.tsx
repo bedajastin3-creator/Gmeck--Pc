@@ -1,4 +1,4 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import {
   Users,
   UserPlus,
@@ -26,9 +26,10 @@ import { CloudflareApi } from '../../services/cloudflareApi';
 import { User, SellerPermissions } from '../../types';
 import { SELLER_COLORS, getSellerColorById } from '../../utils/colors';
 import { formatCurrency, formatDateTime } from '../../utils/formatters';
+import { getShopAdminShopIds, hasAdminAccess } from '../../utils/permissions';
 
 export const AdminSellers: React.FC = () => {
-  const { currentUser, dbState, addToast, refreshUser } = useApp();
+  const { currentUser, dbState, addToast, refreshUser, sellersSubTab, setSellersSubTab, sellersNavTick } = useApp();
 
   // Modals
   const [isAddModalOpen, setIsAddModalOpen] = useState(false);
@@ -55,9 +56,9 @@ export const AdminSellers: React.FC = () => {
   const [uploadingSellerId, setUploadingSellerId] = useState<string | null>(null);
   const avatarInputRef = useRef<HTMLInputElement>(null);
 
-  // Permission check: Admin OR Seller with canManageSellers
+  // Permission check: Admin, Shop Admin, OR Seller with canManageSellers
   if (!currentUser) return null;
-  if (currentUser.role !== 'ADMIN' && !currentUser.permissions?.canManageSellers) return null;
+  if (!hasAdminAccess(currentUser) && !currentUser.permissions?.canManageSellers) return null;
 
   const sellers = dbState.users.filter(u => u.role === 'SELLER');
   const allShops = dbState.shops || [];
@@ -167,6 +168,16 @@ export const AdminSellers: React.FC = () => {
     setIsAddModalOpen(true);
   };
 
+  useEffect(() => {
+    if (sellersNavTick === 0) return;
+    if (sellersSubTab === 'add') {
+      openAddModal();
+    } else if (sellersSubTab === 'list') {
+      setIsAddModalOpen(false);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sellersNavTick, sellersSubTab]);
+
   const openEditModal = (s: User) => {
     setSelectedSeller(s);
     setName(s.name);
@@ -230,6 +241,7 @@ export const AdminSellers: React.FC = () => {
         description: `Account for '${name}' (@${username}) is ready for login.`,
       });
       setIsAddModalOpen(false);
+      setSellersSubTab('list');
     } else {
       setFormError(res.error || 'Failed to create seller.');
     }
@@ -369,7 +381,10 @@ export const AdminSellers: React.FC = () => {
             (sum, s) => (s.status === 'COMPLETED' ? sum + s.total : sum),
             0
           );
-          const permissionCount = Object.values(seller.permissions || {}).filter(Boolean).length;
+          const permissionCount = Object.entries(seller.permissions || {}).filter(
+            ([key, val]) => key !== 'shopAdminShopIds' && val === true
+          ).length;
+          const shopAdminShopIds = getShopAdminShopIds(seller);
 
           return (
             <div
@@ -412,7 +427,14 @@ export const AdminSellers: React.FC = () => {
                     </div>
                     
                     <div>
-                      <h3 className="font-bold text-white text-sm">{seller.name}</h3>
+                      <div className="flex items-center gap-1.5 flex-wrap">
+                        <h3 className="font-bold text-white text-sm">{seller.name}</h3>
+                        {shopAdminShopIds.length > 0 && (
+                          <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 font-semibold">
+                            Shop Admin
+                          </span>
+                        )}
+                      </div>
                       <p className="text-xs text-slate-400 font-mono">@{seller.username}</p>
                     </div>
                   </div>
@@ -652,7 +674,10 @@ export const AdminSellers: React.FC = () => {
                 <h3 className="text-base font-bold text-white">Create Seller Account</h3>
               </div>
               <button
-                onClick={() => setIsAddModalOpen(false)}
+                onClick={() => {
+                  setIsAddModalOpen(false);
+                  setSellersSubTab('list');
+                }}
                 className="text-slate-400 hover:text-white p-1"
               >
                 <X className="w-5 h-5" />
@@ -887,7 +912,10 @@ export const AdminSellers: React.FC = () => {
               <div className="pt-3 border-t border-slate-800 flex justify-end gap-2">
                 <button
                   type="button"
-                  onClick={() => setIsAddModalOpen(false)}
+                  onClick={() => {
+                    setIsAddModalOpen(false);
+                    setSellersSubTab('list');
+                  }}
                   className="px-4 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 font-semibold transition"
                 >
                   Cancel

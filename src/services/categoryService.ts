@@ -1,6 +1,7 @@
 import { db } from '../db/storage';
 import { Category, Shop, User } from '../types';
 import { generateUUID } from '../utils/crypto';
+import { hasAdminAccess } from '../utils/permissions';
 
 export interface GetCategoriesOptions {
   shopId?: string;
@@ -56,8 +57,8 @@ export class CategoryService {
     data: { name: string; shopId: string; icon?: string; color?: string },
     currentUser: User
   ): { success: boolean; category?: Category; error?: string } {
-    // FIX: Allow Admin OR Seller with canEditProducts permission
-    if (currentUser.role !== 'ADMIN' && !currentUser.permissions?.canEditProducts) {
+    // Allow Admin, Shop Admin, or Seller with canEditProducts permission
+    if (!hasAdminAccess(currentUser) && !currentUser.permissions?.canEditProducts) {
       return { success: false, error: 'Permission Denied: You do not have permission to create categories.' };
     }
 
@@ -135,8 +136,8 @@ export class CategoryService {
     data: { name?: string; shopId?: string; icon?: string; color?: string; status?: 'ACTIVE' | 'INACTIVE' },
     currentUser: User
   ): { success: boolean; category?: Category; error?: string } {
-    // FIX: Allow Admin OR Seller with canEditProducts permission
-    if (currentUser.role !== 'ADMIN' && !currentUser.permissions?.canEditProducts) {
+    // Allow Admin, Shop Admin, or Seller with canEditProducts permission
+    if (!hasAdminAccess(currentUser) && !currentUser.permissions?.canEditProducts) {
       return { success: false, error: 'Permission Denied: You do not have permission to edit categories.' };
     }
 

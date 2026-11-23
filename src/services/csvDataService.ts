@@ -11,6 +11,8 @@ import {
   ImportHistoryItem,
 } from '../types';
 import { generateUUID } from '../utils/crypto';
+import type { ImportProgressInfo } from './excelImportService';
+import { hasAdminAccess } from '../utils/permissions';
 
 // Helper to escape CSV cell
 function escapeCsvCell(val: any): string {
@@ -804,14 +806,39 @@ export class CsvDataService {
     };
   }
 
+  public static async validateCsvAsync(
+    dataType: CsvDataType,
+    csvText: string,
+    fileName: string,
+    onProgress?: (info: ImportProgressInfo) => void
+  ): Promise<ImportValidationResult> {
+    onProgress?.({
+      stage: 'PARSING',
+      percent: 30,
+      processedRows: 0,
+      totalRows: 0,
+      message: `Parsing CSV "${fileName}"...`,
+    });
+    const res = this.validateCsv(dataType, csvText, fileName);
+    onProgress?.({
+      stage: 'DONE',
+      percent: 100,
+      processedRows: res.totalRows,
+      totalRows: res.totalRows,
+      message: `Validated ${res.validRowsCount} row(s).`,
+    });
+    return res;
+  }
+
   /**
    * CONFIRM AND COMMIT IMPORT TO DATABASE
    */
   public static async commitImport(
     validationResult: ImportValidationResult,
-    currentUser: User
+    currentUser: User,
+    onProgress?: (info: ImportProgressInfo) => void
   ): Promise<{ success: boolean; importedCount: number; updatedCount: number; createdCount: number; error?: string }> {
-    if (currentUser.role !== 'ADMIN') {
+    if (!hasAdminAccess(currentUser)) {
       return { success: false, importedCount: 0, updatedCount: 0, createdCount: 0, error: 'Permission Denied: Only Admin can import CSV data.' };
     }
 
@@ -819,6 +846,14 @@ export class CsvDataService {
     if (!parsedRecords || parsedRecords.length === 0) {
       return { success: false, importedCount: 0, updatedCount: 0, createdCount: 0, error: 'No valid records to import.' };
     }
+
+    onProgress?.({
+      stage: 'SAVING',
+      percent: 40,
+      processedRows: 0,
+      totalRows: parsedRecords.length,
+      message: `Importing ${parsedRecords.length.toLocaleString()} record(s)...`,
+    });
 
     const now = new Date().toISOString();
     let updatedCount = 0;
@@ -1035,6 +1070,14 @@ export class CsvDataService {
       entityType: 'IMPORT',
       entityId: historyItem.id,
       timestamp: now,
+    });
+
+    onProgress?.({
+      stage: 'DONE',
+      percent: 100,
+      processedRows: validationResult.totalRows,
+      totalRows: validationResult.totalRows,
+      message: `Imported ${totalImported.toLocaleString()} record(s).`,
     });
 
     return {

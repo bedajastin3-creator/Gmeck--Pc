@@ -1,348 +1,687 @@
 import React, { useState, useMemo, useRef, useEffect } from 'react';
 import {
-  Truck,
   Plus,
   Trash2,
-  Calendar,
-  DollarSign,
   Search,
-  CheckCircle,
   X,
-  AlertCircle,
-  FileText,
   Pencil,
   Package,
   Check,
   ChevronDown,
   Loader2,
+  Ban,
+  RotateCcw,
   ArrowLeft,
+  ClipboardList,
+  Store,
+  Warehouse,
+  User as UserIcon,
+  Calendar,
+  Phone,
+  Download,
+  FileDown,
+  Printer,
+  PackagePlus,
+  UserPlus,
 } from 'lucide-react';
 import { useApp } from '../../context/AppContext';
+import { PurchaseIcon } from '../common/PurchaseIcon';
 import { PurchaseService } from '../../services/purchaseService';
+import { ProductService } from '../../services/productService';
 import { formatCurrency, formatDateTime } from '../../utils/formatters';
+import {
+  downloadPurchasesReportPdf,
+  downloadSinglePurchasePdf,
+  printPurchasesReportPdf,
+  printSinglePurchasePdf,
+} from '../../utils/pdfExport';
 import type { Purchase } from '../../types';
+import {
+  getAdminManagedShops,
+  hasAdminAccess,
+  isPlatformAdmin,
+  isShopAdmin,
+} from '../../utils/permissions';
 
 const PAGE_SIZE = 15;
+const SAVED_SUPPLIERS_KEY = 'omnibiz_saved_suppliers_v1';
+type PurchasePeriodFilter = 'all' | 'day' | 'week' | 'month' | 'custom';
 
-// Minimum number of products shown in the dropdown before any search
-const MIN_PRODUCTS_SHOWN = 6;
+interface SavedSupplier {
+  name: string;
+  phone?: string;
+}
+
+function loadSavedSuppliers(): SavedSupplier[] {
+  try {
+    const raw = localStorage.getItem(SAVED_SUPPLIERS_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter((s: any) => s && typeof s.name === 'string' && s.name.trim())
+      .map((s: any) => ({
+        name: s.name.trim(),
+        phone: typeof s.phone === 'string' && s.phone.trim() ? s.phone.trim() : undefined,
+      }));
+  } catch {
+    return [];
+  }
+}
+
+function persistSavedSuppliers(list: SavedSupplier[]) {
+  try {
+    localStorage.setItem(SAVED_SUPPLIERS_KEY, JSON.stringify(list));
+  } catch {
+    // ignore storage quota errors
+  }
+}
+
+function toLocalYMD(date: Date): string {
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, '0');
+  const d = String(date.getDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+}
+
+function getPurchaseLocalYMD(purchase: Purchase): string {
+  if (purchase.date && /^\d{4}-\d{2}-\d{2}$/.test(purchase.date.trim())) {
+    return purchase.date.trim();
+  }
+  const d = new Date(purchase.createdAt);
+  if (!Number.isNaN(d.getTime())) {
+    return toLocalYMD(d);
+  }
+  return toLocalYMD(new Date());
+}
+
+function formatReadableYMD(ymd: string): string {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(ymd)) return ymd;
+  const [y, m, d] = ymd.split('-').map(Number);
+  const dt = new Date(y, m - 1, d);
+  return dt.toLocaleDateString(undefined, {
+    month: 'short',
+    day: 'numeric',
+    year: 'numeric',
+  });
+}
 
 interface PurchaseItemInput {
   productId: string;
   quantity: number | string;
   unitCost: number | string;
+  sellingPrice: number | string;
 }
 
-// ─────────────────────────────────────────────────────────────
-// Inline ProductSearchSelect — used per line-item row
-// Search box stays pinned at top; results list scrolls below.
-// Always shows at least MIN_PRODUCTS_SHOWN products by default.
-// ─────────────────────────────────────────────────────────────
-interface ProductLike {
-  id: string;
-  name: string;
-  sku: string;
-  currentStock: number;
-  unit: string;
-  purchasePrice?: number;
-  sellingPrice?: number;
-}
-
-const ProductSearchSelect: React.FC<{
-  products: ProductLike[];
-  value: string;
-  onChange: (productId: string) => void;
-  currencySymbol?: string;
-  placeholder?: string;
-}> = ({ products, value, onChange, currencySymbol = 'TSh', placeholder = 'Search name or SKU...' }) => {
-  const [isOpen, setIsOpen] = useState(false);
-  const [query, setQuery] = useState('');
-  const [highlightIdx, setHighlightIdx] = useState(0);
-  const inputRef = useRef<HTMLInputElement>(null);
-  const listRef = useRef<HTMLDivElement>(null);
-  const containerRef = useRef<HTMLDivElement>(null);
-
-  const selectedProduct = useMemo(
-    () => products.find(p => p.id === value),
-    [products, value]
-  );
-
-  // Filtered results: when no query, show at least MIN_PRODUCTS_SHOWN products
-  // (or everything, capped at 100). When there is a query, apply token match.
-  const filtered = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    if (!q) {
-      // Always show at least MIN_PRODUCTS_SHOWN (up to 100) so the user can browse
-      const min = Math.max(MIN_PRODUCTS_SHOWN, MIN_PRODUCTS_SHOWN);
-      return products.slice(0, Math.max(min, Math.min(products.length, 100)));
-    }
-    const tokens = q.split(/\s+/);
-    return products
-      .filter(p => {
-        const hay = `${p.name} ${p.sku}`.toLowerCase();
-        return tokens.every(t => hay.includes(t));
-      })
-      .slice(0, 100);
-  }, [products, query]);
-
-  useEffect(() => { setHighlightIdx(0); }, [query, isOpen]);
-
-  useEffect(() => {
-    if (!isOpen || !listRef.current) return;
-    const el = listRef.current.querySelector(`[data-idx="${highlightIdx}"]`) as HTMLElement | null;
-    el?.scrollIntoView({ block: 'nearest' });
-  }, [highlightIdx, isOpen]);
-
-  useEffect(() => {
-    if (!isOpen) return;
-    const handler = (e: MouseEvent) => {
-      if (containerRef.current && !containerRef.current.contains(e.target as Node)) {
-        setIsOpen(false);
-      }
-    };
-    document.addEventListener('mousedown', handler);
-    return () => document.removeEventListener('mousedown', handler);
-  }, [isOpen]);
-
-  useEffect(() => {
-    if (isOpen) setTimeout(() => inputRef.current?.focus(), 30);
-    else setQuery('');
-  }, [isOpen]);
-
-  const handleSelect = (productId: string) => {
-    onChange(productId);
-    setIsOpen(false);
-  };
-
-  const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === 'ArrowDown') {
-      e.preventDefault();
-      setHighlightIdx(i => Math.min(i + 1, filtered.length - 1));
-    } else if (e.key === 'ArrowUp') {
-      e.preventDefault();
-      setHighlightIdx(i => Math.max(i - 1, 0));
-    } else if (e.key === 'Enter') {
-      e.preventDefault();
-      if (filtered[highlightIdx]) handleSelect(filtered[highlightIdx].id);
-    } else if (e.key === 'Escape') {
-      e.preventDefault();
-      setIsOpen(false);
-    }
-  };
-
-  return (
-    <div ref={containerRef} className="relative">
-      <button
-        type="button"
-        onClick={() => setIsOpen(o => !o)}
-        className={`w-full flex items-center justify-between gap-2 bg-slate-900 border rounded-lg px-2.5 py-1.5 text-left text-xs transition ${
-          isOpen ? 'border-blue-500 ring-1 ring-blue-500/30' : 'border-slate-800 hover:border-slate-700'
-        }`}
-      >
-        <span className="flex items-center gap-2 min-w-0 flex-1">
-          <Package className="w-3.5 h-3.5 text-slate-500 shrink-0" />
-          {selectedProduct ? (
-            <span className="min-w-0">
-              <span className="block text-white font-medium truncate leading-tight">
-                {selectedProduct.name}
-              </span>
-              <span className="block text-[10px] text-slate-500 font-mono leading-tight mt-0.5">
-                {selectedProduct.sku} • Stock: {selectedProduct.currentStock} {selectedProduct.unit}
-              </span>
-            </span>
-          ) : (
-            <span className="text-slate-500 truncate">Select a product...</span>
-          )}
-        </span>
-        <ChevronDown className={`w-3.5 h-3.5 text-slate-400 shrink-0 transition-transform ${isOpen ? 'rotate-180' : ''}`} />
-      </button>
-
-      {isOpen && (
-        <div
-          className="absolute z-50 mt-1 left-0 bg-slate-900 border border-slate-800 rounded-xl shadow-2xl w-[440px] max-w-[calc(100vw-4rem)] flex flex-col animate-in fade-in slide-in-from-top-1"
-        >
-          {/* Pinned search header — always visible, never overlaps the list */}
-          <div className="p-2.5 border-b border-slate-800 shrink-0">
-            <div className="relative">
-              <Search className="w-3.5 h-3.5 text-slate-500 absolute left-2.5 top-1/2 -translate-y-1/2" />
-              <input
-                ref={inputRef}
-                type="text"
-                value={query}
-                onChange={e => setQuery(e.target.value)}
-                onKeyDown={handleKeyDown}
-                placeholder={placeholder}
-                className="w-full bg-slate-950 border border-slate-800 rounded-lg pl-8 pr-8 py-2 text-xs text-white placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
-              />
-              {query && (
-                <button
-                  type="button"
-                  onClick={() => setQuery('')}
-                  className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-500 hover:text-white p-0.5"
-                >
-                  <X className="w-3.5 h-3.5" />
-                </button>
-              )}
-            </div>
-            <p className="text-[10px] text-slate-500 mt-1.5">
-              {query
-                ? `${filtered.length} match${filtered.length === 1 ? '' : 'es'} — scroll to see more`
-                : `Showing first ${filtered.length} of ${products.length} — type to search`}
-            </p>
-          </div>
-
-          {/* Scrollable results — fixed height so at least MIN_PRODUCTS_SHOWN visible */}
-          <div
-            ref={listRef}
-            className="overflow-y-auto"
-            style={{ maxHeight: '320px' }}
-          >
-            {filtered.length === 0 ? (
-              <div className="p-6 text-center">
-                <Package className="w-7 h-7 mx-auto text-slate-600 mb-2" />
-                <p className="text-xs text-slate-500">No products match "{query}"</p>
-                <p className="text-[10px] text-slate-600 mt-1">Try a shorter search or check the SKU</p>
-              </div>
-            ) : (
-              filtered.map((p, idx) => {
-                const isSelected = p.id === value;
-                const isHighlighted = idx === highlightIdx;
-                return (
-                  <button
-                    key={p.id}
-                    type="button"
-                    data-idx={idx}
-                    onMouseEnter={() => setHighlightIdx(idx)}
-                    onClick={() => handleSelect(p.id)}
-                    className={`w-full text-left px-3 py-2 border-b border-slate-800/40 last:border-b-0 transition flex items-center gap-2 ${
-                      isHighlighted ? 'bg-slate-800/60' : 'hover:bg-slate-800/40'
-                    }`}
-                  >
-                    <div className="flex-1 min-w-0">
-                      <div className="flex items-center gap-2">
-                        <span className="text-xs font-medium text-white truncate">{p.name}</span>
-                        {isSelected && <Check className="w-3 h-3 text-blue-400 shrink-0" />}
-                      </div>
-                      <div className="flex items-center gap-3 mt-0.5 text-[10px] text-slate-500 font-mono">
-                        <span>{p.sku}</span>
-                        <span className={p.currentStock <= 0 ? 'text-rose-400' : ''}>
-                          Stock: {p.currentStock} {p.unit}
-                        </span>
-                        {p.purchasePrice !== undefined && p.purchasePrice !== null && (
-                          <span className="text-amber-400/80">
-                            Cost: {formatCurrency(p.purchasePrice, currencySymbol)}
-                          </span>
-                        )}
-                      </div>
-                    </div>
-                  </button>
-                );
-              })
-            )}
-          </div>
-
-          {/* Footer hint */}
-          <div className="flex items-center justify-between px-3 py-1.5 border-t border-slate-800 bg-slate-950/60 text-[10px] text-slate-500 shrink-0">
-            <span>↑↓ navigate • Enter select • Esc close</span>
-            <span>{products.length} products</span>
-          </div>
-        </div>
-      )}
-    </div>
-  );
-};
-
-// ─────────────────────────────────────────────────────────────
-// Main component
-// ─────────────────────────────────────────────────────────────
 export const AdminPurchases: React.FC = () => {
-  const { currentUser, dbState, addToast, selectedShopId, currentShop } = useApp();
-  const [isModalOpen, setIsModalOpen] = useState(false);
+  const {
+    currentUser,
+    dbState,
+    addToast,
+    selectedShopId,
+    currentShop,
+    purchasesSubTab,
+    setPurchasesSubTab,
+    purchasesNavTick,
+  } = useApp();
+
   const [isEditMode, setIsEditMode] = useState(false);
   const [editingPurchase, setEditingPurchase] = useState<Purchase | null>(null);
-  const [searchQuery, setSearchQuery] = useState('');
+  const [voidingPurchase, setVoidingPurchase] = useState<Purchase | null>(null);
+  const [voidReason, setVoidReason] = useState('');
+  const [isVoiding, setIsVoiding] = useState(false);
 
-  // Pagination state
+  // Purchase Return modal state
+  const [returningPurchase, setReturningPurchase] = useState<Purchase | null>(null);
+  const [returnQuantities, setReturnQuantities] = useState<Record<string, string>>({});
+  const [returnReason, setReturnReason] = useState('');
+  const [returnError, setReturnError] = useState('');
+  const [isReturning, setIsReturning] = useState(false);
+
+  // List search, period filter & pagination
+  const todayYMD = toLocalYMD(new Date());
+  const [searchQuery, setSearchQuery] = useState('');
+  const [periodFilter, setPeriodFilter] = useState<PurchasePeriodFilter>('all');
+  const [customStartDate, setCustomStartDate] = useState(() => {
+    const d = new Date();
+    d.setDate(1);
+    return toLocalYMD(d);
+  });
+  const [customEndDate, setCustomEndDate] = useState(() => toLocalYMD(new Date()));
+  const [searchPeriodOnly, setSearchPeriodOnly] = useState(false);
+  const [isDownloadingPdf, setIsDownloadingPdf] = useState(false);
+  const [isPrintingPdf, setIsPrintingPdf] = useState(false);
+  const [downloadingPurchaseId, setDownloadingPurchaseId] = useState<string | null>(null);
+  const [printingPurchaseId, setPrintingPurchaseId] = useState<string | null>(null);
   const [visibleCount, setVisibleCount] = useState(PAGE_SIZE);
   const [isLoadingMore, setIsLoadingMore] = useState(false);
 
-  // Purchase Form state
+  // Return List search, period filter & pagination
+  const [returnSearchQuery, setReturnSearchQuery] = useState('');
+  const [returnPeriod, setReturnPeriod] = useState<'ALL' | 'TODAY' | 'WEEK' | 'MONTH'>('ALL');
+  const [visibleReturnsCount, setVisibleReturnsCount] = useState(PAGE_SIZE);
+
+  // Form state (full-page Add / Edit Purchase)
   const [purchaseShopId, setPurchaseShopId] = useState('');
+  const [destinationType, setDestinationType] = useState<'SHOP_FLOOR' | 'STORE'>('SHOP_FLOOR');
+  const [purchaseStoreId, setPurchaseStoreId] = useState('');
+  const [purchaseDate, setPurchaseDate] = useState(() => toLocalYMD(new Date()));
   const [supplierName, setSupplierName] = useState('');
+  const [supplierPhone, setSupplierPhone] = useState('');
   const [invoiceNumber, setInvoiceNumber] = useState('');
   const [paymentStatus, setPaymentStatus] = useState<'PAID' | 'PARTIAL' | 'UNPAID'>('PAID');
   const [notes, setNotes] = useState('');
   const [items, setItems] = useState<PurchaseItemInput[]>([]);
   const [formError, setFormError] = useState('');
+  const [purchaseProductSearch, setPurchaseProductSearch] = useState('');
+  const [purchaseSearchLimit, setPurchaseSearchLimit] = useState(PAGE_SIZE);
+  const purchaseProductSearchRef = useRef<HTMLInputElement>(null);
 
-  if (!currentUser) return null;
+  // Inline Create Product Modal state (from Add/Edit Purchase page)
+  const [isCreateProductOpen, setIsCreateProductOpen] = useState(false);
+  const [newProdName, setNewProdName] = useState('');
+  const [newProdVariation, setNewProdVariation] = useState('');
+  const [newProdCategoryId, setNewProdCategoryId] = useState('');
+  const [newProdUnit, setNewProdUnit] = useState('pcs');
+  const [newProdBuyPrice, setNewProdBuyPrice] = useState('');
+  const [newProdSellPrice, setNewProdSellPrice] = useState('');
+  const [newProdSku, setNewProdSku] = useState('');
+  const [newProdMinStock, setNewProdMinStock] = useState('0');
+  const [newProdSecondLocationKey, setNewProdSecondLocationKey] = useState('');
+  const [createProdError, setCreateProdError] = useState('');
+  const [isCreatingProduct, setIsCreatingProduct] = useState(false);
+
+  // Saved suppliers directory + Add New Supplier modal state
+  const [savedSuppliers, setSavedSuppliers] = useState<SavedSupplier[]>(() => loadSavedSuppliers());
+  const [isAddSupplierOpen, setIsAddSupplierOpen] = useState(false);
+  const [newSupplierName, setNewSupplierName] = useState('');
+  const [newSupplierPhone, setNewSupplierPhone] = useState('');
+  const [newSupplierError, setNewSupplierError] = useState('');
 
   const canRecordPurchase = true;
   const settings = dbState.settings;
-  const isSeller = currentUser.role === 'SELLER';
+  const platformAdmin = currentUser ? isPlatformAdmin(currentUser) : false;
+  const shopAdmin = currentUser ? isShopAdmin(currentUser) : false;
+  const isSeller = currentUser ? !hasAdminAccess(currentUser) : false;
 
-  const availableShops = dbState.shops.filter(s => {
-    if (currentUser.role === 'ADMIN') return true;
-    const assigned = currentUser.assignedShopIds || [];
-    return assigned.length === 0 || assigned.includes(s.id);
-  });
+  const availableShops = useMemo(() => {
+    const allShops = dbState.shops || [];
+    if (!currentUser) return [];
+    if (platformAdmin) return allShops;
+    if (shopAdmin) return getAdminManagedShops(currentUser, allShops);
+    return allShops.filter(s => {
+      const assigned = currentUser.assignedShopIds || [];
+      return assigned.length === 0 || assigned.includes(s.id);
+    });
+  }, [dbState.shops, currentUser, platformAdmin, shopAdmin]);
 
-  const activeShopId =
-    purchaseShopId ||
-    currentShop?.id ||
-    (selectedShopId !== 'ALL' ? selectedShopId : '') ||
-    availableShops[0]?.id ||
-    '';
+  const visibleShopIdSet = useMemo(() => new Set(availableShops.map(s => s.id)), [availableShops]);
 
-  const shopProducts = dbState.products.filter(
-    p => !purchaseShopId || purchaseShopId === 'ALL' || p.shopId === purchaseShopId
+  const visibleProducts = useMemo(
+    () =>
+      (dbState.products || []).filter(
+        p => platformAdmin || (!!p.shopId && visibleShopIdSet.has(p.shopId))
+      ),
+    [dbState.products, platformAdmin, visibleShopIdSet]
   );
 
-  // ✅ 1. Fetch + filter by search (UNCHANGED behavior)
-  // ✅ 2. Sort newest → oldest (newest first)
+  const shopProducts = useMemo(
+    () =>
+      visibleProducts.filter(
+        p => !purchaseShopId || purchaseShopId === 'ALL' || p.shopId === purchaseShopId
+      ),
+    [visibleProducts, purchaseShopId]
+  );
+
+  const purchaseProductPool = shopProducts.length > 0 ? shopProducts : visibleProducts;
+
+  const purchaseSearchResults = useMemo(() => {
+    const raw = purchaseProductSearch.trim().toLowerCase();
+    if (!raw) return [];
+    const tokens = raw.split(/\s+/).filter(Boolean);
+    const matches = purchaseProductPool.filter(p => {
+      const hay = `${p.name || ''} ${p.sku || ''} ${p.barcode || ''} ${p.variation || ''}`.toLowerCase();
+      return tokens.every(tok => hay.includes(tok));
+    });
+    return matches.sort((a, b) => {
+      const aName = (a.name || '').toLowerCase();
+      const bName = (b.name || '').toLowerCase();
+      const aExact = aName === raw || (a.sku || '').toLowerCase() === raw ? 0 : 1;
+      const bExact = bName === raw || (b.sku || '').toLowerCase() === raw ? 0 : 1;
+      if (aExact !== bExact) return aExact - bExact;
+      const aStarts = aName.startsWith(raw) ? 0 : 1;
+      const bStarts = bName.startsWith(raw) ? 0 : 1;
+      if (aStarts !== bStarts) return aStarts - bStarts;
+      return aName.localeCompare(bName);
+    });
+  }, [purchaseProductPool, purchaseProductSearch]);
+
+  // Compute active date range for Purchase List period filter
+  const periodRange = useMemo(() => {
+    const now = new Date();
+    const today = toLocalYMD(now);
+    if (periodFilter === 'day') {
+      return {
+        startDate: today,
+        endDate: today,
+        periodTitle: 'Daily Purchases Report',
+        periodLabel: 'Day (Today)',
+        dateRangeText: formatReadableYMD(today),
+      };
+    }
+    if (periodFilter === 'week') {
+      const start = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 6);
+      const startStr = toLocalYMD(start);
+      return {
+        startDate: startStr,
+        endDate: today,
+        periodTitle: 'Weekly Purchases Report',
+        periodLabel: 'Week (Last 7 Days)',
+        dateRangeText: `${formatReadableYMD(startStr)} - ${formatReadableYMD(today)}`,
+      };
+    }
+    if (periodFilter === 'month') {
+      const start = new Date(now.getFullYear(), now.getMonth(), 1);
+      const startStr = toLocalYMD(start);
+      return {
+        startDate: startStr,
+        endDate: today,
+        periodTitle: 'Monthly Purchases Report',
+        periodLabel: 'Month (This Month)',
+        dateRangeText: `${formatReadableYMD(startStr)} - ${formatReadableYMD(today)}`,
+      };
+    }
+    if (periodFilter === 'custom') {
+      const s = customStartDate || today;
+      const e = customEndDate || today;
+      const [lo, hi] = s <= e ? [s, e] : [e, s];
+      return {
+        startDate: lo,
+        endDate: hi,
+        periodTitle: 'Custom Period Purchases Report',
+        periodLabel: 'Custom Range',
+        dateRangeText:
+          lo === hi
+            ? formatReadableYMD(lo)
+            : `${formatReadableYMD(lo)} - ${formatReadableYMD(hi)}`,
+      };
+    }
+    return {
+      startDate: undefined as string | undefined,
+      endDate: undefined as string | undefined,
+      periodTitle: 'All Purchases Report',
+      periodLabel: 'All Dates',
+      dateRangeText: 'All Recorded Dates',
+    };
+  }, [periodFilter, customStartDate, customEndDate]);
+
+  const storeNameMap = useMemo(() => {
+    const map: Record<string, string> = {};
+    for (const st of dbState.stores || []) {
+      map[st.id] = st.name;
+    }
+    return map;
+  }, [dbState.stores]);
+
+  const isGlobalSearchActive = Boolean(searchQuery.trim()) && !searchPeriodOnly && periodFilter !== 'all';
+
+  // Filter (period + multi-token search) -> sort by purchase date desc, then createdAt desc
   const purchases = useMemo(() => {
-    const filtered = PurchaseService.getPurchases(
+    if (!currentUser) return [];
+    const base = PurchaseService.getPurchases(
       {
         shopId: isSeller
-          ? (currentShop?.id || selectedShopId)
-          : (selectedShopId === 'ALL' ? undefined : selectedShopId),
+          ? currentShop?.id || selectedShopId
+          : selectedShopId === 'ALL'
+          ? undefined
+          : selectedShopId,
       },
       currentUser
-    ).filter(purchase => {
-      if (!searchQuery.trim()) return true;
-      const q = searchQuery.trim().toLowerCase();
-      if (purchase.supplierName.toLowerCase().includes(q)) return true;
-      if (purchase.purchaseNumber.toLowerCase().includes(q)) return true;
-      if (purchase.invoiceNumber && purchase.invoiceNumber.toLowerCase().includes(q)) return true;
-      if (
-        (purchase.items || []).some(
-          item =>
-            item.productName.toLowerCase().includes(q) ||
-            item.productId.toLowerCase().includes(q)
-        )
-      )
-        return true;
-      if (purchase.shopName && purchase.shopName.toLowerCase().includes(q)) return true;
-      return false;
+    );
+
+    const rawQ = searchQuery.trim().toLowerCase();
+    const tokens = rawQ ? rawQ.split(/\s+/).filter(Boolean) : [];
+    const applyDateWindow = periodFilter !== 'all' && (!rawQ || searchPeriodOnly);
+
+    const filtered = base.filter(purchase => {
+      if (applyDateWindow && periodRange.startDate && periodRange.endDate) {
+        const pYmd = getPurchaseLocalYMD(purchase);
+        if (pYmd < periodRange.startDate || pYmd > periodRange.endDate) {
+          return false;
+        }
+      }
+
+      if (tokens.length === 0) return true;
+
+      const storeLabel =
+        purchase.storeName || (purchase.storeId ? storeNameMap[purchase.storeId] || '' : '');
+      const itemsText = (purchase.items || [])
+        .map(i => `${i.productName} ${i.productId}`)
+        .join(' ');
+      const haystack = [
+        purchase.supplierName,
+        purchase.supplierPhone || '',
+        purchase.purchaseNumber,
+        purchase.invoiceNumber || '',
+        purchase.shopName || '',
+        storeLabel,
+        purchase.notes || '',
+        purchase.paymentStatus,
+        purchase.date || '',
+        getPurchaseLocalYMD(purchase),
+        purchase.createdByName || '',
+        itemsText,
+      ]
+        .join(' ')
+        .toLowerCase();
+
+      return tokens.every(tok => haystack.includes(tok));
     });
 
-    // Sort: newest first (top) → oldest (bottom)
     return [...filtered].sort((a, b) => {
-      const da = new Date(a.createdAt).getTime();
-      const db = new Date(b.createdAt).getTime();
-      return db - da;
+      const ymdA = getPurchaseLocalYMD(a);
+      const ymdB = getPurchaseLocalYMD(b);
+      if (ymdA !== ymdB) return ymdB.localeCompare(ymdA);
+      return new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime();
     });
-  }, [dbState.purchases, searchQuery, selectedShopId, currentShop, currentUser, isSeller]);
+  }, [
+    dbState.purchases,
+    searchQuery,
+    periodFilter,
+    periodRange,
+    searchPeriodOnly,
+    storeNameMap,
+    selectedShopId,
+    currentShop,
+    currentUser,
+    isSeller,
+  ]);
 
-  // Reset pagination when search or shop changes
+  const listMetrics = useMemo(() => {
+    const totalSpend = purchases.reduce((sum, p) => sum + (Number(p.totalAmount) || 0), 0);
+    const totalUnits = purchases.reduce(
+      (sum, p) => sum + (p.items || []).reduce((s, i) => s + (Number(i.quantity) || 0), 0),
+      0
+    );
+    return {
+      orderCount: purchases.length,
+      totalSpend,
+      totalUnits: Number(totalUnits.toFixed(3)),
+    };
+  }, [purchases]);
+
+  // Filter purchase returns (Return List)
+  const purchaseReturns = useMemo(() => {
+    if (!currentUser) return [];
+    const raw = PurchaseService.getPurchaseReturns(
+      {
+        shopId: isSeller
+          ? currentShop?.id || selectedShopId
+          : selectedShopId === 'ALL'
+          ? undefined
+          : selectedShopId,
+        search: returnSearchQuery,
+      },
+      currentUser
+    );
+
+    const now = new Date();
+    const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+    const weekAgo = startOfToday - 6 * 24 * 60 * 60 * 1000;
+    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1).getTime();
+
+    const periodFiltered = raw.filter(ret => {
+      if (returnPeriod === 'ALL') return true;
+      const t = new Date(ret.createdAt).getTime();
+      if (returnPeriod === 'TODAY') return t >= startOfToday;
+      if (returnPeriod === 'WEEK') return t >= weekAgo;
+      if (returnPeriod === 'MONTH') return t >= startOfMonth;
+      return true;
+    });
+
+    return [...periodFiltered].sort(
+      (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+    );
+  }, [
+    dbState.purchaseReturns,
+    returnSearchQuery,
+    returnPeriod,
+    selectedShopId,
+    currentShop,
+    currentUser,
+    isSeller,
+  ]);
+
+  const returnMetrics = useMemo(() => {
+    const totalReturns = purchaseReturns.length;
+    const totalUnits = purchaseReturns.reduce((s, r) => s + (r.totalReturnQty || 0), 0);
+    const totalValue = purchaseReturns.reduce((s, r) => s + (r.totalReturnAmount || 0), 0);
+    return { totalReturns, totalUnits, totalValue };
+  }, [purchaseReturns]);
+
+  // Reset pagination on search, period, or shop change
   useEffect(() => {
     setVisibleCount(PAGE_SIZE);
-  }, [searchQuery, selectedShopId]);
+  }, [searchQuery, periodFilter, customStartDate, customEndDate, searchPeriodOnly, selectedShopId]);
 
-  // Visible slice
+  useEffect(() => {
+    setVisibleReturnsCount(PAGE_SIZE);
+  }, [returnSearchQuery, returnPeriod, selectedShopId]);
+
+  const initNewPurchaseForm = () => {
+    const targetShop =
+      (currentShop?.id && visibleShopIdSet.has(currentShop.id) ? currentShop.id : undefined) ||
+      (selectedShopId !== 'ALL' && visibleShopIdSet.has(selectedShopId)
+        ? selectedShopId
+        : availableShops[0]?.id) ||
+      '';
+    setPurchaseShopId(targetShop);
+    setDestinationType('SHOP_FLOOR');
+    setPurchaseStoreId('');
+    setPurchaseDate(toLocalYMD(new Date()));
+    setSupplierName('');
+    setSupplierPhone('');
+    setInvoiceNumber('');
+    setPaymentStatus('PAID');
+    setNotes('');
+    setIsEditMode(false);
+    setEditingPurchase(null);
+
+    setItems([]);
+    setPurchaseProductSearch('');
+    setPurchaseSearchLimit(PAGE_SIZE);
+    setFormError('');
+  };
+
+  // Initialize fresh Add Purchase form whenever user selects "Add Purchase" from menu
+  useEffect(() => {
+    if (purchasesSubTab === 'add' && !isEditMode) {
+      initNewPurchaseForm();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [purchasesSubTab, purchasesNavTick]);
+
+  // Clicking "Add Purchase" in menu while editing resets to fresh new purchase form
+  const prevNavTickRef = useRef(purchasesNavTick);
+  useEffect(() => {
+    if (prevNavTickRef.current !== purchasesNavTick) {
+      prevNavTickRef.current = purchasesNavTick;
+      if (purchasesSubTab === 'add') {
+        initNewPurchaseForm();
+      } else {
+        setEditingPurchase(null);
+        setIsEditMode(false);
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [purchasesNavTick, purchasesSubTab]);
+
+  // Build deduplicated list of existing suppliers (from past purchases + locally added suppliers)
+  const existingSuppliers = useMemo(() => {
+    const map = new Map<string, SavedSupplier>();
+
+    const sortedPurchases = [...(dbState.purchases || [])].sort(
+      (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+    );
+    for (const p of sortedPurchases) {
+      const cleanName = (p.supplierName || '').trim();
+      if (!cleanName || cleanName.toLowerCase() === 'walk-in supplier') continue;
+      const key = cleanName.toLowerCase();
+      const existing = map.get(key);
+      if (!existing) {
+        map.set(key, {
+          name: cleanName,
+          phone: p.supplierPhone?.trim() || undefined,
+        });
+      } else if (!existing.phone && p.supplierPhone?.trim()) {
+        existing.phone = p.supplierPhone.trim();
+      }
+    }
+
+    for (const s of savedSuppliers) {
+      const cleanName = s.name.trim();
+      if (!cleanName || cleanName.toLowerCase() === 'walk-in supplier') continue;
+      const key = cleanName.toLowerCase();
+      const existing = map.get(key);
+      if (!existing) {
+        map.set(key, { name: cleanName, phone: s.phone });
+      } else if (s.phone) {
+        existing.phone = s.phone;
+      }
+    }
+
+    const currentClean = supplierName.trim();
+    if (currentClean && currentClean.toLowerCase() !== 'walk-in supplier') {
+      const key = currentClean.toLowerCase();
+      if (!map.has(key)) {
+        map.set(key, {
+          name: currentClean,
+          phone: supplierPhone.trim() || undefined,
+        });
+      }
+    }
+
+    return Array.from(map.values()).sort((a, b) => a.name.localeCompare(b.name));
+  }, [dbState.purchases, savedSuppliers, supplierName, supplierPhone]);
+
+  // Categories scoped to the active purchase shop (for inline Create Product modal)
+  const purchaseShopCategories = useMemo(() => {
+    const allCats = dbState.categories || [];
+    const shopSpecific = allCats.filter(c => !c.shopId || c.shopId === purchaseShopId);
+    return shopSpecific.length > 0 ? shopSpecific : allCats;
+  }, [dbState.categories, purchaseShopId]);
+
+  // Primary location resolved from the purchase form (Shop Floor vs Warehouse Store)
+  const createProdPrimaryLocation = useMemo(() => {
+    const targetShopId = purchaseShopId || availableShops[0]?.id || '';
+    const shopObj = availableShops.find(s => s.id === targetShopId);
+    const shopName = shopObj?.name || 'Selected Shop';
+
+    if (destinationType === 'STORE' && purchaseStoreId) {
+      const storeObj = (dbState.stores || []).find(
+        st => st.id === purchaseStoreId && st.shopId === targetShopId
+      );
+      if (storeObj) {
+        return {
+          key: `STORE:${storeObj.id}`,
+          type: 'STORE' as const,
+          shopId: targetShopId,
+          storeId: storeObj.id,
+          label: `Store: ${storeObj.name} (${shopName})`,
+        };
+      }
+    }
+
+    return {
+      key: targetShopId ? `SHOP:${targetShopId}` : '',
+      type: 'SHOP_FLOOR' as const,
+      shopId: targetShopId,
+      storeId: undefined as string | undefined,
+      label: `Shop Floor: ${shopName}`,
+    };
+  }, [purchaseShopId, availableShops, destinationType, purchaseStoreId, dbState.stores]);
+
+  const createProdSecondLocationOptions = useMemo(() => {
+    const targetShopId = createProdPrimaryLocation.shopId;
+    const primaryKey = createProdPrimaryLocation.key;
+    if (!targetShopId) return [] as { key: string; label: string }[];
+
+    const targetShop = availableShops.find(s => s.id === targetShopId);
+    const targetShopName = targetShop?.name || 'Shop';
+    const sameShopWarehouseStores = (dbState.stores || []).filter(
+      st => st.shopId === targetShopId && st.status === 'ACTIVE' && !st.isShopFloor
+    );
+
+    const options: { key: string; label: string }[] = [];
+
+    const floorKey = `SHOP:${targetShopId}`;
+    if (floorKey !== primaryKey) {
+      options.push({
+        key: floorKey,
+        label: `${targetShopName} — Shop Floor`,
+      });
+    }
+
+    for (const st of sameShopWarehouseStores) {
+      const storeKey = `STORE:${st.id}`;
+      if (storeKey === primaryKey) continue;
+      options.push({
+        key: storeKey,
+        label: `${st.name} (Store)${st.location ? ` — ${st.location}` : ''}`,
+      });
+    }
+
+    return options;
+  }, [createProdPrimaryLocation, availableShops, dbState.stores]);
+
+  const effectiveSecondLocationKey = useMemo(() => {
+    if (!newProdSecondLocationKey) return '';
+    return createProdSecondLocationOptions.some(opt => opt.key === newProdSecondLocationKey)
+      ? newProdSecondLocationKey
+      : '';
+  }, [newProdSecondLocationKey, createProdSecondLocationOptions]);
+
+  const selectedSecondLocationLabel = useMemo(() => {
+    if (!effectiveSecondLocationKey) return '';
+    return (
+      createProdSecondLocationOptions.find(opt => opt.key === effectiveSecondLocationKey)?.label || ''
+    );
+  }, [effectiveSecondLocationKey, createProdSecondLocationOptions]);
+
+  const returnPreview = useMemo(() => {
+    if (!returningPurchase) {
+      return { totalReturnUnits: 0, totalReturnAmount: 0, updatedPurchaseTotal: 0 };
+    }
+    let totalReturnUnits = 0;
+    let totalReturnAmount = 0;
+    for (const item of returningPurchase.items || []) {
+      const qty = Math.max(0, parseFloat(returnQuantities[item.id] || '0') || 0);
+      const clamped = Math.min(qty, item.quantity);
+      if (clamped > 0) {
+        totalReturnUnits += clamped;
+        totalReturnAmount += clamped * item.unitCost;
+      }
+    }
+    const updatedPurchaseTotal = Math.max(
+      0,
+      Number((returningPurchase.totalAmount - totalReturnAmount).toFixed(2))
+    );
+    return {
+      totalReturnUnits: Number(totalReturnUnits.toFixed(4)),
+      totalReturnAmount: Number(totalReturnAmount.toFixed(2)),
+      updatedPurchaseTotal,
+    };
+  }, [returningPurchase, returnQuantities]);
+
+  if (!currentUser) return null;
+
+  // Visible slices
   const visiblePurchases = purchases.slice(0, visibleCount);
   const hasMore = purchases.length > visibleCount;
   const remaining = purchases.length - visibleCount;
+
+  const visibleReturns = purchaseReturns.slice(0, visibleReturnsCount);
+  const hasMoreReturns = purchaseReturns.length > visibleReturnsCount;
 
   const handleSeeMore = () => {
     setIsLoadingMore(true);
@@ -356,65 +695,157 @@ export const AdminPurchases: React.FC = () => {
     setVisibleCount(PAGE_SIZE);
   };
 
-  const openNewPurchaseModal = () => {
-    const targetShop =
-      currentShop?.id ||
-      (selectedShopId !== 'ALL' ? selectedShopId : availableShops[0]?.id) ||
-      '';
-    setPurchaseShopId(targetShop);
-    setSupplierName('');
-    setInvoiceNumber('');
-    setPaymentStatus('PAID');
-    setNotes('');
-    setIsEditMode(false);
-    setEditingPurchase(null);
+  const openNewPurchasePage = () => {
+    initNewPurchaseForm();
+    setPurchasesSubTab('add');
+  };
 
-    const prodList = dbState.products.filter(p => p.shopId === targetShop);
-    const initialProd = prodList[0] || dbState.products[0];
+  const handleSelectSupplier = (selectedValue: string) => {
+    if (selectedValue === '__ADD_NEW_SUPPLIER__') {
+      setNewSupplierName('');
+      setNewSupplierPhone('');
+      setNewSupplierError('');
+      setIsAddSupplierOpen(true);
+      return;
+    }
 
-    setItems([
-      {
-        productId: initialProd?.id || '',
-        quantity: '',
-        unitCost: initialProd?.purchasePrice ? initialProd.purchasePrice.toString() : '',
-      },
-    ]);
-    setFormError('');
-    setIsModalOpen(true);
+    if (!selectedValue) {
+      setSupplierName('');
+      setSupplierPhone('');
+      return;
+    }
+
+    const matched = existingSuppliers.find(
+      s => s.name.toLowerCase() === selectedValue.toLowerCase()
+    );
+    setSupplierName(matched ? matched.name : selectedValue);
+    setSupplierPhone(matched?.phone || '');
+  };
+
+  const handleSaveNewSupplier = (e: React.FormEvent) => {
+    e.preventDefault();
+    setNewSupplierError('');
+    const cleanName = newSupplierName.trim();
+    const cleanPhone = newSupplierPhone.trim() || undefined;
+
+    if (!cleanName) {
+      setNewSupplierError('Please enter the supplier name.');
+      return;
+    }
+
+    const nextList: SavedSupplier[] = [
+      { name: cleanName, phone: cleanPhone },
+      ...savedSuppliers.filter(s => s.name.toLowerCase() !== cleanName.toLowerCase()),
+    ];
+    setSavedSuppliers(nextList);
+    persistSavedSuppliers(nextList);
+
+    setSupplierName(cleanName);
+    setSupplierPhone(cleanPhone || '');
+    setIsAddSupplierOpen(false);
+    setNewSupplierName('');
+    setNewSupplierPhone('');
+
+    addToast({
+      type: 'success',
+      title: 'Supplier Added & Selected',
+      description: `${cleanName}${cleanPhone ? ` (${cleanPhone})` : ''} is now selected for this purchase.`,
+    });
   };
 
   const openEditPurchase = (purchase: Purchase) => {
     setEditingPurchase(purchase);
     setIsEditMode(true);
     setPurchaseShopId(purchase.shopId);
-    setSupplierName(purchase.supplierName);
+    setDestinationType(purchase.storeId ? 'STORE' : 'SHOP_FLOOR');
+    setPurchaseStoreId(purchase.storeId || '');
+    setPurchaseDate(getPurchaseLocalYMD(purchase));
+    setSupplierName(
+      purchase.supplierName && purchase.supplierName.toLowerCase() !== 'walk-in supplier'
+        ? purchase.supplierName
+        : ''
+    );
+    setSupplierPhone(purchase.supplierPhone || '');
     setInvoiceNumber(purchase.invoiceNumber || '');
     setPaymentStatus(purchase.paymentStatus);
     setNotes(purchase.notes || '');
 
     setItems(
-      (purchase.items || []).map(item => ({
-        productId: item.productId,
-        quantity: item.quantity.toString(),
-        unitCost: item.unitCost.toString(),
-      }))
+      (purchase.items || []).map(item => {
+        const matchedProd = visibleProducts.find(p => p.id === item.productId);
+        const currentSell =
+          item.sellingPrice !== undefined && item.sellingPrice !== null
+            ? item.sellingPrice
+            : matchedProd?.sellingPrice;
+        return {
+          productId: item.productId,
+          quantity: item.quantity.toString(),
+          unitCost: item.unitCost.toString(),
+          sellingPrice:
+            currentSell !== undefined && currentSell !== null ? currentSell.toString() : '',
+        };
+      })
     );
 
+    setPurchaseProductSearch('');
+    setPurchaseSearchLimit(PAGE_SIZE);
     setFormError('');
-    setIsModalOpen(true);
+    setPurchasesSubTab('add');
   };
 
-  const addItemRow = () => {
-    const prodList = dbState.products.filter(p => !purchaseShopId || p.shopId === purchaseShopId);
-    const prod = prodList[0] || dbState.products[0];
-    setItems(prev => [
-      ...prev,
-      {
-        productId: prod?.id || '',
-        quantity: '',
-        unitCost: prod?.purchasePrice ? prod.purchasePrice.toString() : '',
-      },
-    ]);
+  const handleSelectPurchaseProduct = (product: (typeof visibleProducts)[number]) => {
+    setFormError('');
+    setItems(prev => {
+      const existingIdx = prev.findIndex(i => i.productId === product.id);
+      if (existingIdx >= 0) {
+        const existing = prev[existingIdx];
+        const currentQty = parseFloat(String(existing.quantity)) || 0;
+        const nextQty = currentQty > 0 ? currentQty + 1 : 1;
+        const updatedItem: PurchaseItemInput = {
+          ...existing,
+          quantity: String(Number(nextQty.toFixed(3))),
+        };
+        return [updatedItem, ...prev.filter((_, idx) => idx !== existingIdx)];
+      }
+      return [
+        {
+          productId: product.id,
+          quantity: '1',
+          unitCost:
+            product.purchasePrice !== undefined && product.purchasePrice !== null && product.purchasePrice > 0
+              ? product.purchasePrice.toString()
+              : '',
+          sellingPrice:
+            product.sellingPrice !== undefined && product.sellingPrice !== null && product.sellingPrice > 0
+              ? product.sellingPrice.toString()
+              : '',
+        },
+        ...prev,
+      ];
+    });
+    setPurchaseProductSearch('');
+    setPurchaseSearchLimit(PAGE_SIZE);
+    window.setTimeout(() => {
+      purchaseProductSearchRef.current?.focus();
+    }, 30);
+  };
+
+  const handlePurchaseSearchKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === 'Enter' && purchaseProductSearch.trim()) {
+      e.preventDefault();
+      const q = purchaseProductSearch.trim().toLowerCase();
+      const exact = purchaseSearchResults.find(
+        p =>
+          (p.sku || '').toLowerCase() === q ||
+          (p.barcode || '').toLowerCase() === q ||
+          (p.name || '').toLowerCase() === q
+      );
+      if (exact) {
+        handleSelectPurchaseProduct(exact);
+      } else if (purchaseSearchResults.length === 1) {
+        handleSelectPurchaseProduct(purchaseSearchResults[0]);
+      }
+    }
   };
 
   const removeItemRow = (idx: number) => {
@@ -426,13 +857,17 @@ export const AdminPurchases: React.FC = () => {
       prev.map((item, i) => {
         if (i !== idx) return item;
         if (field === 'productId') {
-          const matched = dbState.products.find(p => p.id === value);
+          const matched = visibleProducts.find(p => p.id === value);
           return {
             ...item,
             productId: value,
             unitCost:
               matched?.purchasePrice !== undefined && matched?.purchasePrice !== null
                 ? matched.purchasePrice.toString()
+                : '',
+            sellingPrice:
+              matched?.sellingPrice !== undefined && matched?.sellingPrice !== null
+                ? matched.sellingPrice.toString()
                 : '',
           };
         }
@@ -447,20 +882,301 @@ export const AdminPurchases: React.FC = () => {
     return sum + qty * cost;
   }, 0);
 
+  const openCreateProductModal = (prefillName?: string) => {
+    const trimmedPrefill = (prefillName ?? purchaseProductSearch).trim();
+    setNewProdName(trimmedPrefill);
+    setNewProdVariation('');
+    setNewProdCategoryId('');
+    setNewProdUnit('pcs');
+    setNewProdBuyPrice('');
+    setNewProdSellPrice('');
+    setNewProdSku('');
+    setNewProdMinStock('0');
+    setNewProdSecondLocationKey('');
+    setCreateProdError('');
+    setIsCreateProductOpen(true);
+  };
+
+  const closeCreateProductModal = () => {
+    if (isCreatingProduct) return;
+    setIsCreateProductOpen(false);
+    setCreateProdError('');
+  };
+
+  const handleCreateProductAndAttach = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setCreateProdError('');
+
+    const targetShopId = purchaseShopId || availableShops[0]?.id || '';
+    if (!targetShopId) {
+      setCreateProdError('Please select a Target Shop / Unit first.');
+      return;
+    }
+
+    const isStoreDirected = destinationType === 'STORE';
+    if (isStoreDirected && !purchaseStoreId) {
+      setCreateProdError('Please select a destination Store on the purchase form first.');
+      return;
+    }
+
+    const trimmedName = newProdName.trim();
+    if (!trimmedName) {
+      setCreateProdError('Product name is required.');
+      return;
+    }
+
+    const buyPriceVal = newProdBuyPrice.trim() ? parseFloat(newProdBuyPrice) : 0;
+    if (!Number.isFinite(buyPriceVal) || buyPriceVal < 0) {
+      setCreateProdError('Buy price must be a valid non-negative number.');
+      return;
+    }
+
+    const sellPriceVal = newProdSellPrice.trim() ? parseFloat(newProdSellPrice) : buyPriceVal;
+    if (!Number.isFinite(sellPriceVal) || sellPriceVal < 0) {
+      setCreateProdError('Selling price must be a valid non-negative number.');
+      return;
+    }
+
+    const minStockVal = newProdMinStock.trim() ? parseFloat(newProdMinStock) : 0;
+
+    let secondLocation:
+      | { type: 'SHOP_FLOOR' | 'STORE'; shopId: string; storeId?: string }
+      | undefined;
+
+    if (effectiveSecondLocationKey) {
+      if (effectiveSecondLocationKey.startsWith('SHOP:')) {
+        const secShopId = effectiveSecondLocationKey.slice('SHOP:'.length);
+        if (secShopId && secShopId === targetShopId) {
+          secondLocation = { type: 'SHOP_FLOOR', shopId: secShopId };
+        }
+      } else if (effectiveSecondLocationKey.startsWith('STORE:')) {
+        const secStoreId = effectiveSecondLocationKey.slice('STORE:'.length);
+        const secStore = (dbState.stores || []).find(
+          st => st.id === secStoreId && st.shopId === targetShopId
+        );
+        if (!secStore) {
+          setCreateProdError('Selected second location store must belong to this same shop.');
+          return;
+        }
+        secondLocation = {
+          type: 'STORE',
+          shopId: targetShopId,
+          storeId: secStore.id,
+        };
+      }
+    }
+
+    setIsCreatingProduct(true);
+    try {
+      const res = await ProductService.createProduct(
+        {
+          shopId: targetShopId,
+          storeId: isStoreDirected ? purchaseStoreId : undefined,
+          secondLocation,
+          name: trimmedName,
+          variation: newProdVariation.trim() || undefined,
+          categoryId: newProdCategoryId || '',
+          unit: newProdUnit.trim() || 'pcs',
+          purchasePrice: buyPriceVal,
+          sellingPrice: sellPriceVal,
+          currentStock: 0,
+          minStock: Number.isFinite(minStockVal) && minStockVal >= 0 ? minStockVal : 0,
+          sku: newProdSku.trim() || undefined,
+          status: 'ACTIVE',
+        },
+        currentUser
+      );
+
+      if (!res.success || !res.product) {
+        setCreateProdError(res.error || 'Could not create product.');
+        return;
+      }
+
+      const createdProduct = res.product;
+
+      setItems(prev => [
+        {
+          productId: createdProduct.id,
+          quantity: '1',
+          unitCost:
+            createdProduct.purchasePrice && createdProduct.purchasePrice > 0
+              ? createdProduct.purchasePrice.toString()
+              : buyPriceVal > 0
+                ? buyPriceVal.toString()
+                : '',
+          sellingPrice:
+            createdProduct.sellingPrice !== undefined && createdProduct.sellingPrice !== null
+              ? createdProduct.sellingPrice.toString()
+              : sellPriceVal > 0
+                ? sellPriceVal.toString()
+                : '',
+        },
+        ...prev.filter(i => i.productId !== createdProduct.id),
+      ]);
+
+      setPurchaseProductSearch('');
+      setPurchaseSearchLimit(PAGE_SIZE);
+      setNewProdSecondLocationKey('');
+      setIsCreateProductOpen(false);
+      setFormError('');
+
+      addToast({
+        type: 'success',
+        title: secondLocation
+          ? 'Product Created in Both Locations & Attached'
+          : 'Product Created & Added to Purchase',
+        description:
+          secondLocation && selectedSecondLocationLabel
+            ? `"${createdProduct.name}" was created at 0 qty in ${createProdPrimaryLocation.label} & ${selectedSecondLocationLabel}, and attached to this purchase.`
+            : `"${createdProduct.name}" was created in ${createProdPrimaryLocation.label} and attached to your purchase list.`,
+      });
+    } finally {
+      setIsCreatingProduct(false);
+    }
+  };
+
+  const buildPurchasesPdfMeta = () => {
+    const scopeLabel = isSeller
+      ? currentShop?.name || 'My Shop'
+      : selectedShopId === 'ALL'
+        ? 'All Shops'
+        : availableShops.find(s => s.id === selectedShopId)?.name || 'Shop';
+
+    const effectivePeriodKey = isGlobalSearchActive ? 'search' : periodFilter;
+    return {
+      shopLabel: scopeLabel,
+      periodKey: effectivePeriodKey,
+      periodTitle: isGlobalSearchActive
+        ? 'Purchases Search Report'
+        : periodRange.periodTitle,
+      periodLabel: isGlobalSearchActive
+        ? 'Search Results (All Dates)'
+        : periodRange.periodLabel,
+      dateRangeText: isGlobalSearchActive ? 'All Dates' : periodRange.dateRangeText,
+      startDate: isGlobalSearchActive ? undefined : periodRange.startDate,
+      endDate: isGlobalSearchActive ? undefined : periodRange.endDate,
+      searchQuery: searchQuery.trim() || undefined,
+      storeNameById: storeNameMap,
+    };
+  };
+
+  const handleDownloadPurchasesPdf = async () => {
+    if (isDownloadingPdf) return;
+    setIsDownloadingPdf(true);
+    try {
+      const ok = await downloadPurchasesReportPdf(purchases, settings, buildPurchasesPdfMeta());
+      if (ok) {
+        addToast({
+          type: 'success',
+          title: 'Purchases PDF Downloaded',
+          description: `Exported ${purchases.length} purchase order(s) for ${
+            isGlobalSearchActive ? 'your search' : periodRange.periodLabel
+          }.`,
+        });
+      }
+    } finally {
+      setIsDownloadingPdf(false);
+    }
+  };
+
+  const handlePrintPurchasesPdf = async () => {
+    if (isPrintingPdf) return;
+    setIsPrintingPdf(true);
+    try {
+      const res = await printPurchasesReportPdf(purchases, settings, buildPurchasesPdfMeta());
+      if (res.ok) {
+        addToast({
+          type: 'success',
+          title: res.mode === 'fallback_download' ? 'Opened Purchases PDF' : 'Print Dialog Opened',
+          description:
+            res.mode === 'fallback_download'
+              ? 'Use the printer option in your PDF viewer to print.'
+              : `Ready to print ${purchases.length} purchase order(s).`,
+        });
+      } else {
+        addToast({
+          type: 'error',
+          title: 'Print Failed',
+          description: res.error || 'Could not open print dialog on this device.',
+        });
+      }
+    } finally {
+      setIsPrintingPdf(false);
+    }
+  };
+
+  const handleDownloadSinglePurchasePdf = async (purchase: Purchase) => {
+    if (downloadingPurchaseId) return;
+    setDownloadingPurchaseId(purchase.id);
+    try {
+      const resolvedStore =
+        purchase.storeName ||
+        (purchase.storeId ? storeNameMap[purchase.storeId] : undefined);
+      const ok = await downloadSinglePurchasePdf(purchase, settings, resolvedStore);
+      if (ok) {
+        addToast({
+          type: 'success',
+          title: 'Purchase Voucher Downloaded',
+          description: `Saved PDF for ${purchase.purchaseNumber || purchase.supplierName}.`,
+        });
+      }
+    } finally {
+      setDownloadingPurchaseId(null);
+    }
+  };
+
+  const handlePrintSinglePurchasePdf = async (purchase: Purchase) => {
+    if (printingPurchaseId) return;
+    setPrintingPurchaseId(purchase.id);
+    try {
+      const resolvedStore =
+        purchase.storeName ||
+        (purchase.storeId ? storeNameMap[purchase.storeId] : undefined);
+      const res = await printSinglePurchasePdf(purchase, settings, resolvedStore);
+      if (res.ok) {
+        addToast({
+          type: 'success',
+          title: res.mode === 'fallback_download' ? 'Opened Purchase Voucher' : 'Print Dialog Opened',
+          description: `Ready to print ${purchase.purchaseNumber || purchase.supplierName}.`,
+        });
+      } else {
+        addToast({
+          type: 'error',
+          title: 'Print Failed',
+          description: res.error || 'Could not open print dialog on this device.',
+        });
+      }
+    } finally {
+      setPrintingPurchaseId(null);
+    }
+  };
+
   const handleSavePurchase = (e: React.FormEvent) => {
     e.preventDefault();
     setFormError('');
+
+    const effectiveDate = purchaseDate.trim() || toLocalYMD(new Date());
+    if (effectiveDate > toLocalYMD(new Date())) {
+      setFormError('Purchase date cannot be in the future. Choose today or a previous date.');
+      return;
+    }
 
     if (items.length === 0) {
       setFormError('Please add at least one line item.');
       return;
     }
 
-    const finalItems = items.map(item => ({
-      productId: item.productId,
-      quantity: parseFloat(item.quantity as string) || 0,
-      unitCost: parseFloat(item.unitCost as string) || 0,
-    }));
+    const finalItems = items.map(item => {
+      const rawSell = String(item.sellingPrice ?? '').trim();
+      const parsedSell = rawSell !== '' ? parseFloat(rawSell) : undefined;
+      return {
+        productId: item.productId,
+        quantity: parseFloat(item.quantity as string) || 0,
+        unitCost: parseFloat(item.unitCost as string) || 0,
+        sellingPrice:
+          parsedSell !== undefined && Number.isFinite(parsedSell) ? parsedSell : undefined,
+      };
+    });
 
     for (const item of finalItems) {
       if (item.quantity <= 0) {
@@ -471,6 +1187,10 @@ export const AdminPurchases: React.FC = () => {
         setFormError('Unit cost must be greater than 0 for all items.');
         return;
       }
+      if (item.sellingPrice !== undefined && item.sellingPrice < 0) {
+        setFormError('Selling price cannot be negative.');
+        return;
+      }
       if (!item.productId) {
         setFormError('Please select a product for all items.');
         return;
@@ -478,12 +1198,29 @@ export const AdminPurchases: React.FC = () => {
     }
 
     const finalSupplierName = supplierName.trim() || 'Walk-in Supplier';
+    const finalSupplierPhone = supplierPhone.trim() || undefined;
+
+    if (
+      finalSupplierName.toLowerCase() !== 'walk-in supplier' &&
+      finalSupplierPhone
+    ) {
+      const nextSaved: SavedSupplier[] = [
+        { name: finalSupplierName, phone: finalSupplierPhone },
+        ...savedSuppliers.filter(
+          s => s.name.toLowerCase() !== finalSupplierName.toLowerCase()
+        ),
+      ];
+      setSavedSuppliers(nextSaved);
+      persistSavedSuppliers(nextSaved);
+    }
 
     if (editingPurchase) {
       const res = PurchaseService.updatePurchase(
         editingPurchase.id,
         {
           supplierName: finalSupplierName,
+          supplierPhone: finalSupplierPhone ?? '',
+          date: effectiveDate,
           invoiceNumber: invoiceNumber.trim() || undefined,
           paymentStatus,
           notes,
@@ -496,19 +1233,29 @@ export const AdminPurchases: React.FC = () => {
         addToast({
           type: 'success',
           title: 'Purchase Updated',
-          description: `Purchase ${editingPurchase.purchaseNumber || editingPurchase.id} updated. Stock recalculated.`,
+          description: `Purchase ${
+            editingPurchase.purchaseNumber || editingPurchase.id
+          } updated (${effectiveDate}). Stock recalculated.`,
         });
-        setIsModalOpen(false);
         setEditingPurchase(null);
         setIsEditMode(false);
+        setPurchasesSubTab('list');
       } else {
         setFormError(res.error || 'Failed to update purchase.');
       }
     } else {
+      if (destinationType === 'STORE' && !purchaseStoreId) {
+        setFormError('Please select a destination store or switch to Direct to Shop Floor.');
+        return;
+      }
+
       const res = PurchaseService.createPurchase(
         {
           shopId: purchaseShopId || availableShops[0]?.id || '',
+          storeId: destinationType === 'STORE' ? purchaseStoreId : undefined,
           supplierName: finalSupplierName,
+          supplierPhone: finalSupplierPhone,
+          date: effectiveDate,
           invoiceNumber: invoiceNumber.trim() || undefined,
           items: finalItems,
           paymentStatus,
@@ -518,489 +1265,2454 @@ export const AdminPurchases: React.FC = () => {
       );
 
       if (res.success) {
+        const isPast = effectiveDate < toLocalYMD(new Date());
         addToast({
           type: 'success',
-          title: 'Purchase Recorded & Stock Ingested',
-          description: `Order from ${finalSupplierName} recorded. Product inventories were automatically restocked.`,
+          title: isPast ? `Past Purchase Recorded (${effectiveDate})` : 'Purchase Recorded & Stock Ingested',
+          description:
+            destinationType === 'STORE'
+              ? `Order from ${finalSupplierName} recorded for ${effectiveDate} and added to Store warehouse stock.`
+              : `Order from ${finalSupplierName} recorded for ${effectiveDate}. Shop floor inventories were restocked.`,
         });
-        setIsModalOpen(false);
+        setPurchasesSubTab('list');
       } else {
         setFormError(res.error || 'Failed to record purchase.');
       }
     }
   };
 
-  // ─────────────────────────────────────────────────────────────
-  // FULL-SCREEN Record Stock In / Purchase Page
-  // Renders in place of the list view when isModalOpen is true.
-  // ─────────────────────────────────────────────────────────────
-  if (isModalOpen && canRecordPurchase) {
-    return (
-      <div className="flex-1 flex flex-col bg-slate-950 text-slate-100 overflow-hidden">
-        {/* Full-screen header bar */}
-        <div className="px-6 py-4 bg-slate-900 border-b border-slate-800 flex items-center justify-between gap-4 shrink-0">
-          <div className="flex items-center gap-3 min-w-0">
-            <button
-              type="button"
-              onClick={() => {
-                setIsModalOpen(false);
-                setEditingPurchase(null);
-                setIsEditMode(false);
-              }}
-              className="flex items-center gap-1.5 px-3 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold transition shrink-0"
-            >
-              <ArrowLeft className="w-3.5 h-3.5" />
-              <span>Back</span>
-            </button>
+  const handleCancelForm = () => {
+    setEditingPurchase(null);
+    setIsEditMode(false);
+    setFormError('');
+    setPurchasesSubTab('list');
+  };
 
-            <div className="flex items-center gap-2 min-w-0">
-              {isEditMode ? (
-                <Pencil className="w-5 h-5 text-amber-400 shrink-0" />
-              ) : (
-                <Truck className="w-5 h-5 text-blue-400 shrink-0" />
-              )}
+  // Purchase Return handlers
+  const openReturnPurchaseModal = (purchase: Purchase) => {
+    setReturningPurchase(purchase);
+    const initialMap: Record<string, string> = {};
+    (purchase.items || []).forEach(item => {
+      initialMap[item.id] = '';
+    });
+    setReturnQuantities(initialMap);
+    setReturnReason('');
+    setReturnError('');
+  };
+
+  const closeReturnPurchaseModal = () => {
+    setReturningPurchase(null);
+    setReturnQuantities({});
+    setReturnReason('');
+    setReturnError('');
+  };
+
+  const handleExecuteReturn = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!returningPurchase) return;
+    setReturnError('');
+
+    const selections: { productId: string; itemId: string; returnQty: number }[] = [];
+    for (const item of returningPurchase.items || []) {
+      const raw = returnQuantities[item.id];
+      if (!raw || !raw.trim()) continue;
+      const qty = parseFloat(raw);
+      if (!Number.isFinite(qty) || qty < 0) {
+        setReturnError(`Enter a valid return quantity for ${item.productName}.`);
+        return;
+      }
+      if (qty > item.quantity) {
+        setReturnError(
+          `Return quantity (${qty}) for ${item.productName} exceeds purchased quantity (${item.quantity}).`
+        );
+        return;
+      }
+      if (qty > 0) {
+        selections.push({ productId: item.productId, itemId: item.id, returnQty: qty });
+      }
+    }
+
+    if (selections.length === 0) {
+      setReturnError('Enter a return quantity greater than 0 for at least one product.');
+      return;
+    }
+
+    if (!returnReason.trim()) {
+      setReturnError('Please provide a reason for returning these items.');
+      return;
+    }
+
+    setIsReturning(true);
+    const res = PurchaseService.returnPurchaseItems(
+      returningPurchase.id,
+      selections,
+      returnReason,
+      currentUser
+    );
+    setIsReturning(false);
+
+    if (res.success && res.purchaseReturn) {
+      addToast({
+        type: 'success',
+        title: 'Purchase Return Processed',
+        description: `Returned ${res.purchaseReturn.totalReturnQty} unit(s) (${formatCurrency(
+          res.purchaseReturn.totalReturnAmount,
+          settings.currencySymbol
+        )}). Stock and purchase total reduced.`,
+      });
+      closeReturnPurchaseModal();
+    } else {
+      setReturnError(res.error || 'Could not process purchase return.');
+    }
+  };
+
+  const openVoidPurchaseModal = (purchase: Purchase) => {
+    setVoidingPurchase(purchase);
+    setVoidReason('');
+  };
+
+  const handleExecuteVoid = () => {
+    if (!voidingPurchase) return;
+    if (!voidReason.trim()) {
+      addToast({
+        type: 'warning',
+        title: 'Reason Required',
+        description: 'Please enter a reason for voiding this purchase.',
+      });
+      return;
+    }
+
+    setIsVoiding(true);
+    const res = PurchaseService.voidPurchase(voidingPurchase.id, voidReason, currentUser);
+    setIsVoiding(false);
+
+    if (res.success) {
+      addToast({
+        type: 'success',
+        title: 'Purchase Voided & Deleted',
+        description: `${voidingPurchase.purchaseNumber || voidingPurchase.supplierName} was deleted and ${res.revertedUnits || 0} unit(s) were reverted from stock.`,
+      });
+      setVoidingPurchase(null);
+      setVoidReason('');
+    } else {
+      addToast({
+        type: 'error',
+        title: 'Void Failed',
+        description: res.error || 'Could not void this purchase.',
+      });
+    }
+  };
+
+  // ─────────────────────────────────────────────────────────────
+  // VIEW 1: FULL-PAGE ADD / EDIT PURCHASE
+  // ─────────────────────────────────────────────────────────────
+  if (purchasesSubTab === 'add' && canRecordPurchase) {
+    const activeShopStores = (dbState.stores || []).filter(
+      st => st.shopId === purchaseShopId && st.status === 'ACTIVE'
+    );
+
+    return (
+      <div
+        id="admin-purchases-add-page"
+        className="flex-1 p-3.5 sm:p-6 bg-slate-950 text-slate-100 overflow-y-auto pb-24 sm:pb-8"
+      >
+        <div className="max-w-3xl mx-auto">
+          {/* Page Header */}
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-5 pb-4 border-b border-slate-800">
+            <div className="flex items-center gap-3 min-w-0">
+              <button
+                type="button"
+                onClick={handleCancelForm}
+                className="p-2 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-800 text-slate-300 hover:text-white transition shrink-0"
+                title="Back to Purchase List"
+              >
+                <ArrowLeft className="w-4 h-4" />
+              </button>
               <div className="min-w-0">
-                <h2 className="text-base font-bold text-white truncate">
+                <div className="flex items-center gap-2">
+                  {isEditMode ? (
+                    <Pencil className="w-5 h-5 text-amber-400 shrink-0" />
+                  ) : (
+                    <PurchaseIcon className="w-5 h-5 text-orange-400 shrink-0" />
+                  )}
+                  <h2 className="text-lg sm:text-xl font-bold text-white tracking-tight truncate">
+                    {editingPurchase
+                      ? `Edit Purchase ${editingPurchase.purchaseNumber || ''}`
+                      : 'Add Purchase'}
+                  </h2>
+                </div>
+                <p className="text-xs text-slate-400 mt-0.5">
                   {editingPurchase
-                    ? 'Edit Purchase / Correct Quantity'
-                    : 'Record Stock In / Purchase'}
-                </h2>
-                <p className="text-[11px] text-slate-400 truncate">
-                  {isEditMode
-                    ? 'Update line items — stock is automatically recalculated'
-                    : 'Log a supplier delivery and restock inventory automatically'}
+                    ? 'Correct purchased quantities or costs and recalculate inventory automatically'
+                    : 'Record incoming supplier stock and add quantities directly to Shop Floor or Store Warehouse'}
                 </p>
               </div>
             </div>
-          </div>
 
-          <div className="flex items-center gap-2 shrink-0">
-            <div className="hidden md:block text-right mr-2">
-              <div className="text-[10px] uppercase tracking-wider text-slate-500 font-semibold">
-                Total Purchase Cost
-              </div>
-              <div className="text-lg font-extrabold font-mono text-emerald-400">
-                {formatCurrency(calculatedTotal, settings.currencySymbol)}
-              </div>
-            </div>
             <button
               type="button"
-              onClick={() => {
-                setIsModalOpen(false);
-                setEditingPurchase(null);
-                setIsEditMode(false);
-              }}
-              className="text-slate-400 hover:text-white p-2 rounded-lg hover:bg-slate-800 transition"
-              title="Close"
+              onClick={handleCancelForm}
+              className="inline-flex items-center justify-center gap-1.5 px-3.5 py-2 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-800 text-slate-300 hover:text-white text-xs font-semibold transition shrink-0"
             >
-              <X className="w-5 h-5" />
+              <ClipboardList className="w-3.5 h-3.5 text-orange-400" />
+              <span>Purchase List</span>
             </button>
           </div>
-        </div>
 
-        {/* Scrollable form body */}
-        <div className="flex-1 overflow-y-auto">
-          <div className="max-w-5xl mx-auto px-6 py-6">
-            {formError && (
-              <div className="mb-5 p-3.5 rounded-lg bg-rose-500/15 border border-rose-500/30 text-rose-300 text-xs flex items-start gap-2">
-                <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
-                <span>{formError}</span>
+          {formError && (
+            <div className="mb-4 p-3.5 rounded-xl bg-rose-500/15 border border-rose-500/30 text-rose-300 text-xs font-medium">
+              {formError}
+            </div>
+          )}
+
+          {/* Full-Page Form Card */}
+          <form
+            onSubmit={handleSavePurchase}
+            className="bg-slate-900 border border-slate-800 rounded-2xl p-4 sm:p-6 shadow-xl space-y-5 text-xs"
+          >
+            {!isEditMode && (
+              <div className="space-y-4">
+                <div>
+                  <label className="block text-slate-300 font-semibold mb-1.5">
+                    Target Shop / Unit *
+                  </label>
+                  <select
+                    value={purchaseShopId}
+                    onChange={e => {
+                      const nextShopId = e.target.value;
+                      setPurchaseShopId(nextShopId);
+                      setPurchaseProductSearch('');
+                      setPurchaseSearchLimit(PAGE_SIZE);
+                      setPurchaseStoreId('');
+                    }}
+                    className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2.5 text-white focus:outline-none focus:ring-1 focus:ring-blue-500"
+                  >
+                    {availableShops.map(s => (
+                      <option key={s.id} value={s.id}>
+                        {s.name} ({s.code || 'UNIT'})
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                <div className="p-3.5 rounded-xl bg-slate-950/80 border border-slate-800 space-y-2.5">
+                  <label className="block text-slate-300 font-semibold">Destination *</label>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setDestinationType('SHOP_FLOOR');
+                        setPurchaseStoreId('');
+                      }}
+                      className={`px-3.5 py-2.5 rounded-xl border text-left font-semibold flex items-center gap-2 transition ${
+                        destinationType === 'SHOP_FLOOR'
+                          ? 'bg-blue-600/20 border-blue-500 text-blue-300'
+                          : 'bg-slate-900 border-slate-800 text-slate-400 hover:text-slate-200'
+                      }`}
+                    >
+                      <Store className="w-4 h-4 shrink-0" />
+                      <span>Direct to Shop Floor</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setDestinationType('STORE');
+                      }}
+                      className={`px-3.5 py-2.5 rounded-xl border text-left font-semibold flex items-center gap-2 transition ${
+                        destinationType === 'STORE'
+                          ? 'bg-blue-600/20 border-blue-500 text-blue-300'
+                          : 'bg-slate-900 border-slate-800 text-slate-400 hover:text-slate-200'
+                      }`}
+                    >
+                      <Warehouse className="w-4 h-4 shrink-0" />
+                      <span>Send to Store (Warehouse)</span>
+                    </button>
+                  </div>
+
+                  {destinationType === 'STORE' && (
+                    <div className="pt-1">
+                      <label className="block text-slate-400 text-[11px] mb-1">
+                        Select Store (Warehouse) *
+                      </label>
+                      {activeShopStores.length > 0 ? (
+                        <select
+                          value={purchaseStoreId}
+                          onChange={e => setPurchaseStoreId(e.target.value)}
+                          className="w-full bg-slate-900 border border-slate-700 rounded-xl px-3 py-2.5 text-white focus:outline-none focus:ring-1 focus:ring-blue-500"
+                        >
+                          <option value="">Select destination store...</option>
+                          {activeShopStores.map(st => (
+                            <option key={st.id} value={st.id}>
+                              {st.name}
+                              {st.location ? ` — ${st.location}` : ''}
+                            </option>
+                          ))}
+                        </select>
+                      ) : (
+                        <p className="text-[11px] text-amber-400 py-1">
+                          No active stores exist for this shop yet. Create one in Stores &amp;
+                          Transfer or choose Direct to Shop Floor.
+                        </p>
+                      )}
+                    </div>
+                  )}
+                </div>
               </div>
             )}
 
-            <form onSubmit={handleSavePurchase} className="space-y-6 text-xs">
-              {/* Section: Purchase details */}
-              <div className="bg-slate-900 border border-slate-800 rounded-xl p-5">
-                <h3 className="text-[11px] uppercase tracking-wider text-slate-400 font-bold mb-4">
-                  Purchase Details
-                </h3>
-
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  {!isEditMode && (
-                    <div className="md:col-span-2">
-                      <label className="block text-slate-300 font-medium mb-1.5">
-                        Target Shop / Unit *
-                      </label>
-                      <select
-                        value={purchaseShopId}
-                        onChange={e => setPurchaseShopId(e.target.value)}
-                        className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2.5 text-white focus:outline-none focus:ring-1 focus:ring-blue-500"
-                      >
-                        {availableShops.map(s => (
-                          <option key={s.id} value={s.id}>
-                            {s.name} ({s.code || 'UNIT'})
-                          </option>
-                        ))}
-                      </select>
-                    </div>
+            {/* Purchase Date Calendar (Default Today — Switch to Past Date to Backdate) */}
+            <div
+              className={`p-3.5 rounded-xl border space-y-2 transition ${
+                purchaseDate < todayYMD
+                  ? 'bg-amber-500/10 border-amber-500/35'
+                  : 'bg-slate-950/80 border-slate-800'
+              }`}
+            >
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <label className="text-slate-200 font-semibold flex items-center gap-1.5">
+                  <Calendar
+                    className={`w-4 h-4 ${
+                      purchaseDate < todayYMD ? 'text-amber-400' : 'text-blue-400'
+                    }`}
+                  />
+                  <span>Purchase Date</span>
+                  {purchaseDate === todayYMD ? (
+                    <span className="px-1.5 py-0.5 rounded bg-blue-500/15 border border-blue-500/30 text-blue-300 text-[10px] font-bold">
+                      Today
+                    </span>
+                  ) : (
+                    <span className="px-1.5 py-0.5 rounded bg-amber-500/20 border border-amber-500/40 text-amber-300 text-[10px] font-bold">
+                      Past Date ({formatReadableYMD(purchaseDate)})
+                    </span>
                   )}
+                </label>
 
-                  <div>
-                    <label className="block text-slate-300 font-medium mb-1.5">
-                      Supplier / Vendor Name (Optional)
-                    </label>
-                    <input
-                      type="text"
-                      value={supplierName}
-                      onChange={e => setSupplierName(e.target.value)}
-                      placeholder="e.g. Apex Hardware Distro"
-                      className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2.5 text-white focus:outline-none focus:ring-1 focus:ring-blue-500"
-                    />
-                  </div>
+                <div className="flex items-center gap-2">
+                  <input
+                    type="date"
+                    value={purchaseDate}
+                    max={todayYMD}
+                    onChange={e => {
+                      const val = e.target.value;
+                      if (!val) {
+                        setPurchaseDate(todayYMD);
+                        return;
+                      }
+                      setPurchaseDate(val > todayYMD ? todayYMD : val);
+                    }}
+                    className={`bg-slate-900 border rounded-lg px-3 py-1.5 text-xs font-mono text-white focus:outline-none focus:ring-1 ${
+                      purchaseDate < todayYMD
+                        ? 'border-amber-500/50 focus:ring-amber-500'
+                        : 'border-slate-700 focus:ring-blue-500'
+                    }`}
+                  />
+                  {purchaseDate !== todayYMD && (
+                    <button
+                      type="button"
+                      onClick={() => setPurchaseDate(todayYMD)}
+                      className="px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-amber-300 text-[11px] font-semibold transition"
+                    >
+                      Back to Today
+                    </button>
+                  )}
+                </div>
+              </div>
+              <p
+                className={`text-[11px] ${
+                  purchaseDate < todayYMD ? 'text-amber-300/90' : 'text-slate-500'
+                }`}
+              >
+                {purchaseDate < todayYMD
+                  ? `This purchase will be listed and filtered under ${formatReadableYMD(purchaseDate)}.`
+                  : 'Defaults to today. Pick an earlier calendar date to record a past purchase.'}
+              </p>
+            </div>
 
-                  <div>
-                    <label className="block text-slate-300 font-medium mb-1.5">
-                      Vendor Invoice # (Optional)
-                    </label>
-                    <input
-                      type="text"
-                      value={invoiceNumber}
-                      onChange={e => setInvoiceNumber(e.target.value)}
-                      placeholder="e.g. INV-98442"
-                      className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2.5 text-white font-mono focus:outline-none focus:ring-1 focus:ring-blue-500"
-                    />
-                  </div>
+            {/* Supplier Selector (+ New Supplier), Supplier Phone Number, Vendor Invoice # */}
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3.5">
+              <div>
+                <div className="flex items-center justify-between mb-1.5">
+                  <label className="text-slate-300 font-semibold">Supplier / Vendor</label>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setNewSupplierName('');
+                      setNewSupplierPhone('');
+                      setNewSupplierError('');
+                      setIsAddSupplierOpen(true);
+                    }}
+                    className="inline-flex items-center gap-1 text-[11px] font-semibold text-emerald-400 hover:text-emerald-300 transition"
+                  >
+                    <UserPlus className="w-3 h-3" />
+                    <span>+ New Supplier</span>
+                  </button>
+                </div>
+                <div className="flex items-center gap-1.5">
+                  <select
+                    value={supplierName}
+                    onChange={e => handleSelectSupplier(e.target.value)}
+                    className="flex-1 min-w-0 bg-slate-950 border border-slate-800 rounded-xl px-3 py-2.5 text-white focus:outline-none focus:ring-1 focus:ring-blue-500"
+                  >
+                    <option value="">Walk-in Supplier (Default)</option>
+                    {existingSuppliers.map(sup => (
+                      <option key={sup.name.toLowerCase()} value={sup.name}>
+                        {sup.name}
+                        {sup.phone ? ` (${sup.phone})` : ''}
+                      </option>
+                    ))}
+                    <option value="__ADD_NEW_SUPPLIER__">+ Add New Supplier...</option>
+                  </select>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setNewSupplierName('');
+                      setNewSupplierPhone('');
+                      setNewSupplierError('');
+                      setIsAddSupplierOpen(true);
+                    }}
+                    title="Add New Supplier"
+                    aria-label="Add New Supplier"
+                    className="shrink-0 p-2.5 rounded-xl bg-emerald-600/15 hover:bg-emerald-600 border border-emerald-500/30 text-emerald-400 hover:text-white transition"
+                  >
+                    <UserPlus className="w-4 h-4" />
+                  </button>
                 </div>
               </div>
 
-              {/* Section: Line items */}
-              <div className="bg-slate-900 border border-slate-800 rounded-xl p-5">
-                <div className="flex items-center justify-between mb-4">
-                  <h3 className="text-[11px] uppercase tracking-wider text-slate-400 font-bold">
-                    {isEditMode ? 'Correct Item Quantities / Costs' : 'Received Inventory Items'}
-                  </h3>
+              <div>
+                <label className="block text-slate-300 font-semibold mb-1.5">
+                  Supplier Number / Phone
+                </label>
+                <div className="relative">
+                  <Phone className="w-3.5 h-3.5 text-slate-500 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+                  <input
+                    type="tel"
+                    inputMode="tel"
+                    value={supplierPhone}
+                    onChange={e => setSupplierPhone(e.target.value)}
+                    placeholder="Auto-fills or enter phone"
+                    className="w-full bg-slate-950 border border-slate-800 rounded-xl pl-8 pr-3.5 py-2.5 text-white font-mono focus:outline-none focus:ring-1 focus:ring-blue-500"
+                  />
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-slate-300 font-semibold mb-1.5">
+                  Vendor Invoice # (Optional)
+                </label>
+                <input
+                  type="text"
+                  value={invoiceNumber}
+                  onChange={e => setInvoiceNumber(e.target.value)}
+                  placeholder="e.g. INV-98442"
+                  className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2.5 text-white font-mono focus:outline-none focus:ring-1 focus:ring-blue-500"
+                />
+              </div>
+            </div>
+
+            {/* Line Items — Quick Search Bar + Create Product Button */}
+            <div className="space-y-3">
+              {isEditMode && (
+                <div className="p-2.5 rounded-xl bg-amber-500/10 border border-amber-500/25 text-amber-300 text-[11px]">
+                  Changing quantities recalculates stock automatically. Old quantities will be
+                  reversed and new ones applied.
+                </div>
+              )}
+
+              {/* Search Bar + Create Product + Clear All */}
+              <div className="flex flex-wrap sm:flex-nowrap items-center gap-2">
+                <div className="relative flex-1 min-w-[200px]">
+                  <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+                  <input
+                    ref={purchaseProductSearchRef}
+                    type="text"
+                    value={purchaseProductSearch}
+                    inputMode="search"
+                    autoComplete="off"
+                    onChange={e => {
+                      setPurchaseProductSearch(e.target.value);
+                      setPurchaseSearchLimit(PAGE_SIZE);
+                    }}
+                    onKeyDown={handlePurchaseSearchKeyDown}
+                    placeholder="Search product name, SKU, or barcode — click to add..."
+                    className="w-full bg-slate-950 border border-slate-700 rounded-xl pl-9 pr-9 py-2.5 text-xs text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500 transition"
+                  />
+                  {purchaseProductSearch && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setPurchaseProductSearch('');
+                        setPurchaseSearchLimit(PAGE_SIZE);
+                        purchaseProductSearchRef.current?.focus();
+                      }}
+                      aria-label="Clear search"
+                      className="absolute right-2.5 top-1/2 -translate-y-1/2 p-1 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition"
+                    >
+                      <X className="w-4 h-4" />
+                    </button>
+                  )}
+                </div>
+
+                <button
+                  type="button"
+                  onClick={() => openCreateProductModal()}
+                  className="shrink-0 inline-flex items-center justify-center gap-1.5 px-3.5 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 active:bg-emerald-700 text-white text-xs font-semibold shadow-sm whitespace-nowrap transition"
+                >
+                  <PackagePlus className="w-4 h-4" />
+                  <span>Create Product</span>
+                </button>
+
+                {items.length > 0 && (
                   <button
                     type="button"
-                    onClick={addItemRow}
-                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-blue-600/20 hover:bg-blue-600/30 text-blue-300 font-semibold text-[11px] transition"
+                    onClick={() => {
+                      setItems([]);
+                      setFormError('');
+                    }}
+                    className="shrink-0 px-3 py-2.5 rounded-xl bg-rose-500/15 hover:bg-rose-500/25 active:bg-rose-500/30 border border-rose-500/30 text-rose-300 text-xs font-semibold whitespace-nowrap transition"
                   >
-                    <Plus className="w-3.5 h-3.5" />
-                    <span>Add Item</span>
+                    Clear All
                   </button>
-                </div>
+                )}
+              </div>
 
-                {isEditMode && (
-                  <div className="mb-3 p-2.5 rounded-lg bg-amber-500/10 border border-amber-500/20 text-amber-300 text-[11px] flex items-start gap-2">
-                    <AlertCircle className="w-3.5 h-3.5 shrink-0 mt-0.5" />
-                    <span>
-                      Changing quantities will recalculate stock. The system will reverse old
-                      quantities and apply new ones.
+              {/* Matching Results Dropdown — shown strictly when user types in search */}
+              {purchaseProductSearch.trim() && (
+                <div className="bg-slate-950 border border-slate-800 rounded-xl overflow-hidden shadow-xl">
+                  <div className="px-3 py-2 bg-slate-900/90 border-b border-slate-800 flex items-center justify-between gap-2 text-[11px]">
+                    <span className="text-slate-400">
+                      <strong className="text-white">
+                        {purchaseSearchResults.length.toLocaleString()}
+                      </strong>{' '}
+                      match{purchaseSearchResults.length === 1 ? '' : 'es'} for &ldquo;
+                      {purchaseProductSearch.trim()}&rdquo; — select a product to add
                     </span>
                   </div>
-                )}
 
-                {/* Column headers for clarity */}
-                <div className="hidden md:grid grid-cols-[1fr_100px_130px_120px_40px] gap-2 px-2.5 pb-2 text-[10px] uppercase tracking-wider text-slate-500 font-semibold border-b border-slate-800 mb-2">
-                  <div>Product</div>
-                  <div className="text-center">Quantity</div>
-                  <div className="text-center">Unit Cost</div>
-                  <div className="text-right">Line Total</div>
-                  <div></div>
+                  {purchaseSearchResults.length === 0 ? (
+                    <div className="py-7 px-4 text-center space-y-2.5">
+                      <Package className="w-8 h-8 mx-auto text-slate-600" />
+                      <div>
+                        <p className="text-xs font-medium text-slate-300">
+                          No products match &ldquo;{purchaseProductSearch.trim()}&rdquo;
+                        </p>
+                        <p className="text-[11px] text-slate-500 mt-0.5">
+                          Create it now and it will attach directly to your purchase list.
+                        </p>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => openCreateProductModal(purchaseProductSearch.trim())}
+                        className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold shadow transition"
+                      >
+                        <PackagePlus className="w-4 h-4" />
+                        <span>Create &ldquo;{purchaseProductSearch.trim()}&rdquo;</span>
+                      </button>
+                    </div>
+                  ) : (
+                    <div className="max-h-72 overflow-y-auto divide-y divide-slate-800/70 overscroll-contain">
+                      {purchaseSearchResults.slice(0, purchaseSearchLimit).map(p => {
+                        const existingItem = items.find(i => i.productId === p.id);
+                        const isAdded = Boolean(existingItem);
+
+                        return (
+                          <button
+                            key={p.id}
+                            type="button"
+                            onClick={() => handleSelectPurchaseProduct(p)}
+                            className={`w-full text-left px-3 py-3 flex items-center justify-between gap-3 transition active:bg-slate-800/80 ${
+                              isAdded
+                                ? 'bg-blue-950/25 hover:bg-blue-950/40'
+                                : 'hover:bg-slate-900/80'
+                            }`}
+                          >
+                            <div className="min-w-0 flex-1">
+                              <div className="flex items-center gap-1.5 flex-wrap">
+                                <span className="text-xs sm:text-sm font-medium text-white truncate">
+                                  {p.name}
+                                </span>
+                                {p.variation && (
+                                  <span className="px-1.5 py-0.5 rounded bg-violet-500/15 border border-violet-500/30 text-violet-300 text-[10px]">
+                                    {p.variation}
+                                  </span>
+                                )}
+                                {isAdded && (
+                                  <span className="px-1.5 py-0.5 rounded bg-blue-500/20 border border-blue-500/30 text-blue-300 text-[10px] font-semibold">
+                                    In List ({existingItem?.quantity || 0})
+                                  </span>
+                                )}
+                              </div>
+                              <div className="flex items-center flex-wrap gap-x-2.5 gap-y-0.5 mt-1 text-[11px] text-slate-400 font-mono">
+                                <span>{p.sku}</span>
+                                <span className="text-blue-400">
+                                  Shop: {(p.currentStock ?? 0).toLocaleString()} {p.unit}
+                                </span>
+                                {(p.storeStock ?? 0) > 0 && (
+                                  <span className="text-violet-400">
+                                    Store: {(p.storeStock ?? 0).toLocaleString()} {p.unit}
+                                  </span>
+                                )}
+                                <span className="text-emerald-400/90">
+                                  Buy: {formatCurrency(Number(p.purchasePrice || 0), settings.currencySymbol)}
+                                </span>
+                              </div>
+                            </div>
+
+                            <span
+                              className={`inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-[11px] font-semibold shrink-0 transition ${
+                                isAdded
+                                  ? 'bg-blue-600/25 text-blue-200 border border-blue-500/40'
+                                  : 'bg-blue-600 text-white shadow-sm'
+                              }`}
+                            >
+                              <Plus className="w-3.5 h-3.5" />
+                              <span>{isAdded ? '+1' : 'Add'}</span>
+                            </span>
+                          </button>
+                        );
+                      })}
+
+                      {purchaseSearchResults.length > purchaseSearchLimit && (
+                        <button
+                          type="button"
+                          onClick={() => setPurchaseSearchLimit(prev => prev + PAGE_SIZE)}
+                          className="w-full py-2.5 text-center text-xs font-semibold text-blue-400 hover:bg-slate-900 transition"
+                        >
+                          Show More ({purchaseSearchResults.length - purchaseSearchLimit} remaining)
+                        </button>
+                      )}
+                    </div>
+                  )}
                 </div>
+              )}
 
-                <div className="space-y-2">
-                  {items.map((item, idx) => (
-                    <div
-                      key={idx}
-                      className="p-2.5 rounded-lg bg-slate-950 border border-slate-800 grid grid-cols-1 md:grid-cols-[1fr_100px_130px_120px_40px] gap-2 items-center"
-                    >
-                      <div className="min-w-0">
-                        <ProductSearchSelect
-                          products={shopProducts.length > 0 ? shopProducts : dbState.products}
-                          value={item.productId}
-                          onChange={productId => updateItemRow(idx, 'productId', productId)}
-                          currencySymbol={settings.currencySymbol}
-                          placeholder="Search name or SKU..."
-                        />
-                      </div>
+              {/* Selected Purchase Products List */}
+              {items.length === 0 ? (
+                <div className="p-6 rounded-xl bg-slate-950/60 border border-dashed border-slate-800 text-center">
+                  <Package className="w-7 h-7 mx-auto text-slate-600 mb-1.5" />
+                  <p className="text-xs font-medium text-slate-400">No products added yet</p>
+                  <p className="text-[11px] text-slate-500 mt-0.5">
+                    Search above and select a product to add it to this purchase.
+                  </p>
+                </div>
+              ) : (
+                <div className="space-y-2.5">
+                  <div className="flex items-center justify-between px-0.5">
+                    <span className="text-slate-400 font-bold uppercase tracking-wider text-[11px]">
+                      {isEditMode ? 'Purchase Items' : 'Selected Products'} ({items.length})
+                    </span>
+                  </div>
 
-                      <div className="md:w-full">
-                        <input
-                          type="number"
-                          min="0"
-                          value={item.quantity}
-                          onChange={e => updateItemRow(idx, 'quantity', e.target.value)}
-                          placeholder="Qty"
-                          className="w-full bg-slate-900 border border-slate-800 rounded px-2 py-2 text-white font-mono text-center focus:outline-none focus:ring-1 focus:ring-blue-500"
-                        />
-                      </div>
+                  {items.map((item, idx) => {
+                    const matchedProduct = visibleProducts.find(p => p.id === item.productId);
+                    const qtyVal = parseFloat(item.quantity as string) || 0;
+                    const costVal = parseFloat(item.unitCost as string) || 0;
+                    const lineTotal = qtyVal * costVal;
 
-                      <div className="md:w-full">
-                        <input
-                          type="number"
-                          step="0.01"
-                          min="0"
-                          value={item.unitCost}
-                          onChange={e => updateItemRow(idx, 'unitCost', e.target.value)}
-                          placeholder="Cost"
-                          className="w-full bg-slate-900 border border-slate-800 rounded px-2 py-2 text-white font-mono text-center focus:outline-none focus:ring-1 focus:ring-blue-500"
-                        />
-                      </div>
+                    return (
+                      <div
+                        key={item.productId || idx}
+                        className="p-3 rounded-xl bg-slate-950 border border-slate-800 space-y-2.5"
+                      >
+                        <div className="flex items-start justify-between gap-2">
+                          <div className="min-w-0 flex-1">
+                            <div className="flex items-center gap-1.5 flex-wrap">
+                              <span className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-slate-800 text-slate-400 font-mono">
+                                #{idx + 1}
+                              </span>
+                              <span className="text-xs sm:text-sm font-semibold text-white truncate">
+                                {matchedProduct?.name || 'Unknown Product'}
+                              </span>
+                              {matchedProduct?.variation && (
+                                <span className="px-1.5 py-0.5 rounded bg-violet-500/15 border border-violet-500/30 text-violet-300 text-[10px]">
+                                  {matchedProduct.variation}
+                                </span>
+                              )}
+                            </div>
+                            {matchedProduct && (
+                              <div className="flex items-center flex-wrap gap-x-2.5 gap-y-0.5 mt-1 text-[10px] text-slate-400 font-mono">
+                                <span>{matchedProduct.sku}</span>
+                                <span className="text-blue-400">
+                                  Shop: {(matchedProduct.currentStock ?? 0).toLocaleString()}{' '}
+                                  {matchedProduct.unit}
+                                </span>
+                                {(matchedProduct.storeStock ?? 0) > 0 && (
+                                  <span className="text-violet-400">
+                                    Store: {(matchedProduct.storeStock ?? 0).toLocaleString()}{' '}
+                                    {matchedProduct.unit}
+                                  </span>
+                                )}
+                              </div>
+                            )}
+                          </div>
 
-                      <div className="text-right font-mono font-bold text-white text-sm px-1">
-                        {formatCurrency(
-                          (parseFloat(item.quantity as string) || 0) *
-                            (parseFloat(item.unitCost as string) || 0),
-                          settings.currencySymbol
-                        )}
-                      </div>
-
-                      <div className="flex justify-end md:justify-center">
-                        {items.length > 1 ? (
                           <button
                             type="button"
                             onClick={() => removeItemRow(idx)}
-                            className="text-slate-500 hover:text-rose-400 p-1.5 rounded hover:bg-slate-800 transition"
-                            title="Remove item"
+                            className="shrink-0 p-1.5 rounded-lg text-slate-500 hover:text-rose-400 hover:bg-rose-500/10 transition"
+                            title="Remove product"
+                            aria-label="Remove product"
                           >
-                            <Trash2 className="w-3.5 h-3.5" />
+                            <Trash2 className="w-4 h-4" />
                           </button>
-                        ) : (
-                          <div className="w-7" />
-                        )}
+                        </div>
+
+                        {(() => {
+                          const sellVal = parseFloat(String(item.sellingPrice ?? '')) || 0;
+                          const originalSell = matchedProduct?.sellingPrice ?? 0;
+                          const sellChanged =
+                            String(item.sellingPrice ?? '').trim() !== '' &&
+                            Math.abs(sellVal - originalSell) > 0.001;
+                          const isBelowCost =
+                            String(item.sellingPrice ?? '').trim() !== '' &&
+                            costVal > 0 &&
+                            sellVal < costVal;
+                          const unitMargin = sellVal - costVal;
+
+                          return (
+                            <>
+                              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5 items-end pt-1.5 border-t border-slate-900">
+                                <div>
+                                  <label className="block text-slate-400 text-[10px] mb-1">
+                                    Quantity{matchedProduct?.unit ? ` (${matchedProduct.unit})` : ''}
+                                  </label>
+                                  <input
+                                    type="number"
+                                    inputMode="decimal"
+                                    min="0"
+                                    step="any"
+                                    value={item.quantity}
+                                    onChange={e => updateItemRow(idx, 'quantity', e.target.value)}
+                                    onFocus={e => e.target.select()}
+                                    placeholder="0"
+                                    className="w-full bg-slate-900 border border-slate-800 rounded-lg px-2.5 py-2 text-white font-mono text-xs text-center focus:outline-none focus:ring-1 focus:ring-blue-500"
+                                  />
+                                </div>
+
+                                <div>
+                                  <label className="block text-slate-400 text-[10px] mb-1">
+                                    Buy Price ({settings.currencySymbol})
+                                  </label>
+                                  <input
+                                    type="number"
+                                    inputMode="decimal"
+                                    step="0.01"
+                                    min="0"
+                                    value={item.unitCost}
+                                    onChange={e => updateItemRow(idx, 'unitCost', e.target.value)}
+                                    onFocus={e => e.target.select()}
+                                    placeholder="0"
+                                    className="w-full bg-slate-900 border border-slate-800 rounded-lg px-2.5 py-2 text-white font-mono text-xs focus:outline-none focus:ring-1 focus:ring-blue-500"
+                                  />
+                                </div>
+
+                                <div>
+                                  <label className="flex items-center justify-between text-slate-400 text-[10px] mb-1">
+                                    <span>Sell Price ({settings.currencySymbol})</span>
+                                    {sellChanged && (
+                                      <span className="text-[9px] font-bold text-amber-300 bg-amber-500/15 px-1 rounded">
+                                        New
+                                      </span>
+                                    )}
+                                  </label>
+                                  <input
+                                    type="number"
+                                    inputMode="decimal"
+                                    step="0.01"
+                                    min="0"
+                                    value={item.sellingPrice}
+                                    onChange={e =>
+                                      updateItemRow(idx, 'sellingPrice', e.target.value)
+                                    }
+                                    onFocus={e => e.target.select()}
+                                    placeholder="0"
+                                    className={`w-full bg-slate-900 border rounded-lg px-2.5 py-2 text-white font-mono text-xs focus:outline-none focus:ring-1 ${
+                                      isBelowCost
+                                        ? 'border-rose-500/60 focus:ring-rose-500'
+                                        : sellChanged
+                                          ? 'border-amber-500/60 focus:ring-amber-500'
+                                          : 'border-slate-800 focus:ring-blue-500'
+                                    }`}
+                                  />
+                                </div>
+
+                                <div className="text-right pb-1.5">
+                                  <label className="block text-slate-500 text-[10px] mb-1">
+                                    Subtotal
+                                  </label>
+                                  <div className="font-mono font-bold text-emerald-400 text-xs sm:text-sm truncate">
+                                    {formatCurrency(lineTotal, settings.currencySymbol)}
+                                  </div>
+                                </div>
+                              </div>
+
+                              {(sellChanged || isBelowCost || (costVal > 0 && sellVal > 0)) && (
+                                <div className="flex flex-wrap items-center justify-between gap-2 text-[10px] pt-0.5">
+                                  <span
+                                    className={
+                                      isBelowCost
+                                        ? 'text-rose-400 font-semibold'
+                                        : 'text-slate-400'
+                                    }
+                                  >
+                                    {isBelowCost
+                                      ? `Warning: Selling price is below buy cost (${formatCurrency(unitMargin, settings.currencySymbol)}/unit)`
+                                      : costVal > 0 && sellVal > 0
+                                        ? `Profit/unit: ${formatCurrency(unitMargin, settings.currencySymbol)}`
+                                        : ''}
+                                  </span>
+                                  {sellChanged && (
+                                    <span className="text-amber-300/90 font-medium">
+                                      Updates product price: {formatCurrency(originalSell, settings.currencySymbol)} →{' '}
+                                      {formatCurrency(sellVal, settings.currencySymbol)}
+                                    </span>
+                                  )}
+                                </div>
+                              )}
+                            </>
+                          );
+                        })()}
                       </div>
-                    </div>
-                  ))}
+                    );
+                  })}
                 </div>
+              )}
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5 pt-2">
+              <div>
+                <label className="block text-slate-300 font-semibold mb-1.5">Payment Status</label>
+                <select
+                  value={paymentStatus}
+                  onChange={e => setPaymentStatus(e.target.value as any)}
+                  className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2.5 text-white focus:outline-none focus:ring-1 focus:ring-blue-500"
+                >
+                  <option value="PAID">Paid in Full</option>
+                  <option value="PARTIAL">Partially Paid</option>
+                  <option value="UNPAID">Pending / On Credit</option>
+                </select>
               </div>
 
-              {/* Section: Payment & notes */}
-              <div className="bg-slate-900 border border-slate-800 rounded-xl p-5">
-                <h3 className="text-[11px] uppercase tracking-wider text-slate-400 font-bold mb-4">
-                  Payment & Notes
-                </h3>
+              <div>
+                <label className="block text-slate-300 font-semibold mb-1.5">Notes</label>
+                <input
+                  type="text"
+                  value={notes}
+                  onChange={e => setNotes(e.target.value)}
+                  placeholder="e.g. Delivered by freight truck"
+                  className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2.5 text-white focus:outline-none focus:ring-1 focus:ring-blue-500"
+                />
+              </div>
+            </div>
 
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            {/* Footer Total & Actions */}
+            <div className="pt-4 border-t border-slate-800 space-y-3.5">
+              <div className="flex items-center justify-between p-3.5 rounded-xl bg-slate-950 border border-slate-800">
+                <div>
+                  <span className="text-slate-400 font-medium block">Total Purchase Cost</span>
+                  <span className="text-[10px] text-slate-500">
+                    {items.reduce((s, i) => s + (parseFloat(i.quantity as string) || 0), 0)} total
+                    units across {items.length} item(s)
+                  </span>
+                </div>
+                <span className="text-lg sm:text-xl font-bold font-mono text-white">
+                  {formatCurrency(calculatedTotal, settings.currencySymbol)}
+                </span>
+              </div>
+
+              <div className="flex flex-col sm:flex-row gap-2.5">
+                <button
+                  type="button"
+                  onClick={handleCancelForm}
+                  className="sm:w-40 px-4 py-3 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 font-semibold transition"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  className="flex-1 px-4 py-3 rounded-xl bg-blue-600 hover:bg-blue-500 active:bg-blue-700 text-white font-bold shadow-lg transition flex items-center justify-center gap-2"
+                >
+                  <Check className="w-4 h-4" />
+                  <span>{editingPurchase ? 'Update & Recalculate Stock' : 'Record Purchase & Add Stock'}</span>
+                </button>
+              </div>
+            </div>
+          </form>
+        </div>
+
+        {/* Inline Create Product Modal */}
+        {isCreateProductOpen && (
+          <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-slate-950/80 backdrop-blur-sm sm:p-4 overflow-y-auto">
+            <div className="bg-slate-900 border border-slate-800 rounded-t-2xl sm:rounded-2xl max-w-lg w-full p-4 sm:p-6 shadow-2xl max-h-[92vh] overflow-y-auto my-auto">
+              <div className="flex items-center justify-between pb-3 border-b border-slate-800 mb-4">
+                <div className="flex items-center gap-2 text-emerald-400 min-w-0">
+                  <PackagePlus className="w-5 h-5 shrink-0" />
+                  <div className="min-w-0">
+                    <h3 className="text-sm sm:text-base font-bold text-white truncate">
+                      Create New Product
+                    </h3>
+                    <p className="text-[11px] text-slate-400 truncate">
+                      Saves to {createProdPrimaryLocation.label} &amp; attaches directly to this purchase
+                    </p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={closeCreateProductModal}
+                  className="text-slate-400 hover:text-white p-1 shrink-0"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+
+              {createProdError && (
+                <div className="mb-3.5 p-3 rounded-xl bg-rose-500/15 border border-rose-500/30 text-rose-300 text-xs font-medium">
+                  {createProdError}
+                </div>
+              )}
+
+              <form onSubmit={handleCreateProductAndAttach} className="space-y-3.5 text-xs">
+                <div>
+                  <label className="block text-slate-300 font-semibold mb-1">
+                    Product Name *
+                  </label>
+                  <input
+                    type="text"
+                    required
+                    autoFocus
+                    value={newProdName}
+                    onChange={e => setNewProdName(e.target.value)}
+                    placeholder="e.g. Samsung Galaxy A15 128GB"
+                    className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2.5 text-white focus:outline-none focus:ring-1 focus:ring-emerald-500"
+                  />
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                   <div>
-                    <label className="block text-slate-300 font-medium mb-1.5">Payment Status</label>
+                    <label className="block text-slate-300 font-semibold mb-1">
+                      Category (Optional)
+                    </label>
                     <select
-                      value={paymentStatus}
-                      onChange={e => setPaymentStatus(e.target.value as any)}
-                      className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2.5 text-white focus:outline-none focus:ring-1 focus:ring-blue-500"
+                      value={newProdCategoryId}
+                      onChange={e => setNewProdCategoryId(e.target.value)}
+                      className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2.5 text-white focus:outline-none focus:ring-1 focus:ring-emerald-500"
                     >
-                      <option value="PAID">Paid in Full</option>
-                      <option value="PARTIAL">Partially Paid</option>
-                      <option value="UNPAID">Pending / On Credit</option>
+                      <option value="">Select category (Optional)...</option>
+                      {purchaseShopCategories.map(c => (
+                        <option key={c.id} value={c.id}>
+                          {c.name}
+                        </option>
+                      ))}
                     </select>
                   </div>
 
                   <div>
-                    <label className="block text-slate-300 font-medium mb-1.5">Notes</label>
+                    <label className="block text-slate-300 font-semibold mb-1">
+                      Unit of Measure *
+                    </label>
+                    <select
+                      value={newProdUnit}
+                      onChange={e => setNewProdUnit(e.target.value)}
+                      className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2.5 text-white focus:outline-none focus:ring-1 focus:ring-emerald-500"
+                    >
+                      <option value="pcs">Pieces (pcs)</option>
+                      <option value="meter">Meter (m)</option>
+                      <option value="pack">Pack</option>
+                      <option value="box">Box</option>
+                      <option value="kg">Kilogram (kg)</option>
+                      <option value="pair">Pair</option>
+                      <option value="roll">Roll</option>
+                      <option value="liter">Liter</option>
+                      <option value="set">Set</option>
+                    </select>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-slate-300 font-semibold mb-1">
+                      Buy Price / Cost ({settings.currencySymbol})
+                    </label>
                     <input
-                      type="text"
-                      value={notes}
-                      onChange={e => setNotes(e.target.value)}
-                      placeholder="e.g. Delivered by freight truck"
-                      className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2.5 text-white focus:outline-none focus:ring-1 focus:ring-blue-500"
+                      type="number"
+                      inputMode="decimal"
+                      step="0.01"
+                      min="0"
+                      value={newProdBuyPrice}
+                      onChange={e => setNewProdBuyPrice(e.target.value)}
+                      placeholder="0"
+                      className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2.5 text-white font-mono focus:outline-none focus:ring-1 focus:ring-emerald-500"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-slate-300 font-semibold mb-1">
+                      Selling Price ({settings.currencySymbol}) *
+                    </label>
+                    <input
+                      type="number"
+                      inputMode="decimal"
+                      step="0.01"
+                      min="0"
+                      required
+                      value={newProdSellPrice}
+                      onChange={e => setNewProdSellPrice(e.target.value)}
+                      placeholder="0"
+                      className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2.5 text-white font-mono focus:outline-none focus:ring-1 focus:ring-emerald-500"
                     />
                   </div>
                 </div>
-              </div>
 
-              {/* Sticky action footer */}
-              <div className="sticky bottom-0 -mx-6 px-6 py-4 bg-slate-900/95 backdrop-blur border-t border-slate-800 flex items-center justify-between gap-3">
-                <div className="text-xs">
-                  <div className="text-slate-400 text-[10px] uppercase tracking-wider font-semibold">
-                    Total Purchase Cost
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                  <div>
+                    <label className="block text-slate-400 font-medium mb-1">
+                      Variation (Optional)
+                    </label>
+                    <input
+                      type="text"
+                      value={newProdVariation}
+                      onChange={e => setNewProdVariation(e.target.value)}
+                      placeholder="e.g. 500ml, Red"
+                      className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-white focus:outline-none focus:ring-1 focus:ring-emerald-500"
+                    />
                   </div>
-                  <div className="text-xl font-extrabold font-mono text-white">
-                    {formatCurrency(calculatedTotal, settings.currencySymbol)}
+
+                  <div>
+                    <label className="block text-slate-400 font-medium mb-1">
+                      SKU (Auto if blank)
+                    </label>
+                    <input
+                      type="text"
+                      value={newProdSku}
+                      onChange={e => setNewProdSku(e.target.value)}
+                      placeholder="Auto-generated"
+                      className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-white font-mono focus:outline-none focus:ring-1 focus:ring-emerald-500"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-slate-400 font-medium mb-1">
+                      Min Stock Alert
+                    </label>
+                    <input
+                      type="number"
+                      inputMode="numeric"
+                      min="0"
+                      value={newProdMinStock}
+                      onChange={e => setNewProdMinStock(e.target.value)}
+                      className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-white font-mono focus:outline-none focus:ring-1 focus:ring-emerald-500"
+                    />
                   </div>
                 </div>
 
-                <div className="flex gap-2">
+                {/* Location Assignment (Primary from Purchase + Optional Second Location at 0 Qty) */}
+                <div className="p-3 rounded-xl bg-slate-950/80 border border-slate-800 space-y-2.5">
+                  <div className="flex items-center justify-between gap-2 flex-wrap">
+                    <span className="text-[11px] font-semibold text-slate-300">
+                      Product Locations
+                    </span>
+                    <span className="px-2 py-0.5 rounded-full bg-blue-500/15 border border-blue-500/30 text-blue-300 text-[10px] font-bold">
+                      Initial Qty: 0
+                    </span>
+                  </div>
+
+                  <div className="flex items-center gap-2 px-3 py-2 rounded-lg bg-slate-900 border border-slate-800 text-[11px]">
+                    {createProdPrimaryLocation.type === 'STORE' ? (
+                      <Warehouse className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
+                    ) : (
+                      <Store className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                    )}
+                    <div className="min-w-0 flex-1">
+                      <span className="text-slate-400">Primary (Purchase Destination): </span>
+                      <span className="text-white font-semibold">
+                        {createProdPrimaryLocation.label}
+                      </span>
+                    </div>
+                  </div>
+
+                  <div>
+                    <label className="block text-slate-300 font-semibold mb-1">
+                      Second Location (Optional — Same Shop Only)
+                    </label>
+                    {createProdSecondLocationOptions.length > 0 ? (
+                      <select
+                        value={effectiveSecondLocationKey}
+                        onChange={e => setNewProdSecondLocationKey(e.target.value)}
+                        className="w-full bg-slate-900 border border-slate-700 rounded-xl px-3 py-2.5 text-white focus:outline-none focus:ring-1 focus:ring-emerald-500"
+                      >
+                        <option value="">None — Single Location Only (Default)</option>
+                        {createProdSecondLocationOptions.map(opt => (
+                          <option key={opt.key} value={opt.key}>
+                            {opt.label}
+                          </option>
+                        ))}
+                      </select>
+                    ) : (
+                      <div className="px-3 py-2 rounded-xl bg-slate-900/70 border border-slate-800 text-[11px] text-slate-400">
+                        No other active stores under this shop yet. Create a store under this shop
+                        to assign a second location.
+                      </div>
+                    )}
+                  </div>
+
+                  <p className="text-[11px] text-slate-400 leading-relaxed">
+                    {effectiveSecondLocationKey && selectedSecondLocationLabel ? (
+                      <>
+                        Multi-location rule: Only products with{' '}
+                        <strong className="text-white">0 quantity</strong> qualify for multiple
+                        locations within the same shop. This product will be visible in both{' '}
+                        <strong className="text-emerald-300">
+                          {createProdPrimaryLocation.label}
+                        </strong>{' '}
+                        and{' '}
+                        <strong className="text-blue-300">{selectedSecondLocationLabel}</strong>{' '}
+                        starting at <strong className="text-white">0</strong> qty (and{' '}
+                        <strong className="text-blue-300">{selectedSecondLocationLabel}</strong>{' '}
+                        stays at <strong className="text-white">0</strong> when this purchase is
+                        saved).
+                      </>
+                    ) : (
+                      <>
+                        Initial stock starts at <strong className="text-white">0</strong> in{' '}
+                        <strong className="text-white">{createProdPrimaryLocation.label}</strong> so
+                        saving this purchase adds the exact purchased quantity without
+                        double-counting.
+                      </>
+                    )}
+                  </p>
+                </div>
+
+                <div className="flex items-center gap-2.5 pt-2">
                   <button
                     type="button"
-                    onClick={() => {
-                      setIsModalOpen(false);
-                      setEditingPurchase(null);
-                      setIsEditMode(false);
-                    }}
-                    className="px-4 py-2.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 font-semibold transition"
+                    onClick={closeCreateProductModal}
+                    disabled={isCreatingProduct}
+                    className="px-4 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 font-semibold transition"
                   >
                     Cancel
                   </button>
                   <button
                     type="submit"
-                    className="px-5 py-2.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-white font-semibold shadow transition flex items-center gap-2"
+                    disabled={isCreatingProduct}
+                    className="flex-1 px-4 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 active:bg-emerald-700 text-white font-bold shadow-lg transition flex items-center justify-center gap-2 disabled:opacity-60"
                   >
-                    <CheckCircle className="w-4 h-4" />
-                    <span>
-                      {editingPurchase ? 'Update Purchase & Recalculate Stock' : 'Record & Ingest Stock'}
-                    </span>
+                    {isCreatingProduct ? (
+                      <>
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                        <span>Creating...</span>
+                      </>
+                    ) : (
+                      <>
+                        <PackagePlus className="w-4 h-4" />
+                        <span>Create &amp; Attach to Purchase</span>
+                      </>
+                    )}
                   </button>
                 </div>
-              </div>
-            </form>
+              </form>
+            </div>
           </div>
+        )}
+
+        {/* Add New Supplier Modal */}
+        {isAddSupplierOpen && (
+          <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-slate-950/80 backdrop-blur-sm sm:p-4 overflow-y-auto">
+            <div className="bg-slate-900 border border-slate-800 rounded-t-2xl sm:rounded-2xl max-w-md w-full p-4 sm:p-6 shadow-2xl my-auto">
+              <div className="flex items-center justify-between pb-3 border-b border-slate-800 mb-4">
+                <div className="flex items-center gap-2 text-emerald-400 min-w-0">
+                  <UserPlus className="w-5 h-5 shrink-0" />
+                  <div className="min-w-0">
+                    <h3 className="text-sm sm:text-base font-bold text-white truncate">
+                      Add New Supplier
+                    </h3>
+                    <p className="text-[11px] text-slate-400 truncate">
+                      Saves supplier for future purchases &amp; selects them now
+                    </p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setIsAddSupplierOpen(false)}
+                  className="text-slate-400 hover:text-white p-1 shrink-0"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+
+              {newSupplierError && (
+                <div className="mb-3.5 p-3 rounded-xl bg-rose-500/15 border border-rose-500/30 text-rose-300 text-xs font-medium">
+                  {newSupplierError}
+                </div>
+              )}
+
+              <form onSubmit={handleSaveNewSupplier} className="space-y-3.5 text-xs">
+                <div>
+                  <label className="block text-slate-300 font-semibold mb-1">
+                    Supplier Name *
+                  </label>
+                  <input
+                    type="text"
+                    required
+                    autoFocus
+                    value={newSupplierName}
+                    onChange={e => setNewSupplierName(e.target.value)}
+                    placeholder="e.g. Kariakoo Wholesale Ltd"
+                    className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2.5 text-white focus:outline-none focus:ring-1 focus:ring-emerald-500"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-slate-300 font-semibold mb-1">
+                    Supplier Number / Phone (Optional)
+                  </label>
+                  <div className="relative">
+                    <Phone className="w-3.5 h-3.5 text-slate-500 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+                    <input
+                      type="tel"
+                      inputMode="tel"
+                      value={newSupplierPhone}
+                      onChange={e => setNewSupplierPhone(e.target.value)}
+                      placeholder="e.g. +255 712 345 678"
+                      className="w-full bg-slate-950 border border-slate-800 rounded-xl pl-8 pr-3.5 py-2.5 text-white font-mono focus:outline-none focus:ring-1 focus:ring-emerald-500"
+                    />
+                  </div>
+                </div>
+
+                <div className="flex items-center gap-2.5 pt-2">
+                  <button
+                    type="button"
+                    onClick={() => setIsAddSupplierOpen(false)}
+                    className="px-4 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 font-semibold transition"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="submit"
+                    className="flex-1 px-4 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 active:bg-emerald-700 text-white font-bold shadow-lg transition flex items-center justify-center gap-2"
+                  >
+                    <UserPlus className="w-4 h-4" />
+                    <span>Save &amp; Select Supplier</span>
+                  </button>
+                </div>
+              </form>
+            </div>
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // VIEW 2: PURCHASE RETURN LIST
+  // ─────────────────────────────────────────────────────────────
+  if (purchasesSubTab === 'returns') {
+    return (
+      <div
+        id="admin-purchase-returns-view"
+        className="flex-1 p-3.5 sm:p-6 bg-slate-950 text-slate-100 overflow-y-auto pb-24 sm:pb-6"
+      >
+        {/* Header */}
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-5 pb-4 border-b border-slate-800">
+          <div>
+            <div className="flex items-center gap-2">
+              <div className="p-2 rounded-xl bg-amber-500/15 border border-amber-500/25">
+                <RotateCcw className="w-5 h-5 text-amber-400" />
+              </div>
+              <div>
+                <h2 className="text-lg sm:text-xl font-bold text-white tracking-tight">
+                  Purchase Return List
+                </h2>
+                <p className="text-xs text-slate-400 mt-0.5">
+                  Complete audit trail of returned supplier items, stock deductions, and value
+                  adjustments
+                </p>
+              </div>
+            </div>
+          </div>
+
+          <button
+            type="button"
+            onClick={() => setPurchasesSubTab('list')}
+            className="inline-flex items-center justify-center gap-2 px-3.5 py-2.5 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-800 text-slate-200 font-semibold text-xs transition"
+          >
+            <ClipboardList className="w-4 h-4 text-orange-400" />
+            <span>Purchase List</span>
+          </button>
+        </div>
+
+        {/* Summary KPI Cards */}
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 mb-4">
+          <div className="bg-slate-900 border border-slate-800 rounded-xl p-3.5">
+            <div className="text-[11px] font-medium text-slate-400 flex items-center justify-between">
+              <span>Total Returns</span>
+              <RotateCcw className="w-4 h-4 text-amber-400" />
+            </div>
+            <div className="text-xl font-bold font-mono text-white mt-1">
+              {returnMetrics.totalReturns}
+            </div>
+          </div>
+
+          <div className="bg-slate-900 border border-slate-800 rounded-xl p-3.5">
+            <div className="text-[11px] font-medium text-slate-400 flex items-center justify-between">
+              <span>Units Returned</span>
+              <Package className="w-4 h-4 text-orange-400" />
+            </div>
+            <div className="text-xl font-bold font-mono text-amber-300 mt-1">
+              {returnMetrics.totalUnits}
+            </div>
+          </div>
+
+          <div className="bg-slate-900 border border-slate-800 rounded-xl p-3.5">
+            <div className="text-[11px] font-medium text-slate-400 flex items-center justify-between">
+              <span>Total Deducted Value</span>
+              <PurchaseIcon className="w-4 h-4 text-rose-400" />
+            </div>
+            <div className="text-xl font-bold font-mono text-rose-400 mt-1">
+              {formatCurrency(returnMetrics.totalValue, settings.currencySymbol)}
+            </div>
+          </div>
+        </div>
+
+        {/* Toolbar: Search + Period Filter */}
+        <div className="bg-slate-900 border border-slate-800 rounded-xl p-3 mb-4 space-y-2.5 text-xs">
+          <div className="flex flex-col sm:flex-row gap-2.5">
+            <div className="relative flex-1">
+              <Search className="w-4 h-4 text-slate-400 absolute left-3 top-2.5" />
+              <input
+                type="text"
+                value={returnSearchQuery}
+                onChange={e => setReturnSearchQuery(e.target.value)}
+                placeholder="Search return #, PO #, supplier, product, reason..."
+                className="w-full bg-slate-950 border border-slate-800 rounded-lg pl-9 pr-3 py-2.5 text-xs text-white placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-amber-500"
+              />
+            </div>
+
+            <div className="flex items-center gap-1 bg-slate-950 p-1 rounded-lg border border-slate-800 shrink-0">
+              {(
+                [
+                  { id: 'ALL', label: 'All' },
+                  { id: 'TODAY', label: 'Today' },
+                  { id: 'WEEK', label: 'Week' },
+                  { id: 'MONTH', label: 'Month' },
+                ] as const
+              ).map(p => (
+                <button
+                  key={p.id}
+                  type="button"
+                  onClick={() => setReturnPeriod(p.id)}
+                  className={`px-3 py-1.5 rounded-md text-[11px] font-semibold transition ${
+                    returnPeriod === p.id
+                      ? 'bg-amber-500/20 text-amber-300 border border-amber-500/30'
+                      : 'text-slate-400 hover:text-white'
+                  }`}
+                >
+                  {p.label}
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+
+        {/* Returns List Container */}
+        <div className="bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden shadow-xl">
+          {purchaseReturns.length === 0 ? (
+            <div className="py-14 text-center text-slate-500 px-4">
+              <RotateCcw className="w-9 h-9 mx-auto mb-2.5 opacity-35 text-amber-400" />
+              <p className="text-sm font-semibold text-slate-300">No purchase returns recorded</p>
+              <p className="text-xs text-slate-500 mt-1 max-w-sm mx-auto">
+                Use the Return button on any purchase in Purchase List to return items to a
+                supplier and automatically adjust stock and purchase totals.
+              </p>
+            </div>
+          ) : (
+            <>
+              {/* Mobile Cards (< md) */}
+              <div className="md:hidden divide-y divide-slate-800/80">
+                {visibleReturns.map(ret => (
+                  <div key={ret.id} className="p-3.5 space-y-2.5">
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center gap-1.5 flex-wrap">
+                          <span className="font-mono text-[11px] font-bold text-amber-300 bg-amber-500/15 border border-amber-500/30 px-2 py-0.5 rounded">
+                            {ret.returnNumber}
+                          </span>
+                          <span className="text-[10px] font-mono text-slate-400">
+                            PO: {ret.purchaseNumber}
+                          </span>
+                        </div>
+                        <h4 className="font-bold text-xs text-white truncate mt-1">
+                          {ret.supplierName}
+                        </h4>
+                        <div className="flex items-center gap-2 text-[10px] text-slate-400 mt-0.5">
+                          <span className="inline-flex items-center gap-1 font-mono">
+                            <Calendar className="w-3 h-3" />
+                            {formatDateTime(ret.createdAt)}
+                          </span>
+                        </div>
+                      </div>
+                      <div className="text-right shrink-0">
+                        <div className="font-mono font-bold text-rose-400 text-sm">
+                          -{formatCurrency(ret.totalReturnAmount, settings.currencySymbol)}
+                        </div>
+                        <span className="text-[10px] font-bold text-amber-300">
+                          -{ret.totalReturnQty} unit{ret.totalReturnQty === 1 ? '' : 's'}
+                        </span>
+                      </div>
+                    </div>
+
+                    <div className="bg-slate-950/70 border border-slate-800 rounded-xl p-2.5 space-y-1.5">
+                      <div className="flex items-center justify-between text-[10px] text-slate-400">
+                        <span className="font-semibold uppercase tracking-wider">
+                          Returned Items
+                        </span>
+                        <span
+                          className={`px-1.5 py-0.5 rounded font-semibold ${
+                            ret.storeId
+                              ? 'bg-indigo-500/15 text-indigo-300'
+                              : 'bg-emerald-500/15 text-emerald-300'
+                          }`}
+                        >
+                          {ret.storeId ? `Store: ${ret.storeName || 'Warehouse'}` : 'Shop Floor'}
+                        </span>
+                      </div>
+                      {(ret.items || []).map(item => (
+                        <div
+                          key={item.id}
+                          className="flex items-center justify-between gap-2 text-[11px] pt-1 border-t border-slate-800/60"
+                        >
+                          <div className="min-w-0">
+                            <div className="text-slate-200 font-medium truncate">
+                              {item.productName}
+                            </div>
+                            <div className="text-[10px] text-slate-400 font-mono">
+                              Purchased {item.originalQty} → Returned{' '}
+                              <span className="text-amber-300 font-bold">{item.returnQty}</span> ·{' '}
+                              <span className="text-emerald-400">{item.remainingQty} left</span>
+                            </div>
+                          </div>
+                          <div className="font-mono font-bold text-rose-300 shrink-0">
+                            -{formatCurrency(item.returnTotal, settings.currencySymbol)}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+
+                    <div className="flex items-start justify-between gap-2 text-[11px] bg-amber-500/5 border border-amber-500/20 rounded-lg px-2.5 py-2">
+                      <div className="text-slate-300">
+                        <span className="text-amber-400 font-semibold">Reason: </span>
+                        {ret.reason}
+                      </div>
+                    </div>
+                    <div className="flex items-center justify-between text-[10px] text-slate-400 pt-0.5">
+                      <span className="inline-flex items-center gap-1">
+                        <UserIcon className="w-3 h-3 text-slate-500" />
+                        Processed by <strong className="text-slate-300">{ret.returnedByName}</strong>
+                      </span>
+                      {ret.shopName && <span>{ret.shopName}</span>}
+                    </div>
+                  </div>
+                ))}
+              </div>
+
+              {/* Desktop Table (md+) */}
+              <div className="hidden md:block overflow-x-auto">
+                <table className="w-full text-left text-xs">
+                  <thead>
+                    <tr className="border-b border-slate-800 bg-slate-950/70 text-slate-400">
+                      <th className="py-3 px-4 font-semibold">Return # &amp; Date</th>
+                      <th className="py-3 px-4 font-semibold">Supplier &amp; PO #</th>
+                      <th className="py-3 px-4 font-semibold">Returned Products</th>
+                      <th className="py-3 px-4 font-semibold">Reason</th>
+                      <th className="py-3 px-4 font-semibold">Processed By</th>
+                      <th className="py-3 px-4 text-right font-semibold">Deducted Value</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-800/60">
+                    {visibleReturns.map(ret => (
+                      <tr key={ret.id} className="hover:bg-slate-800/30 transition align-top">
+                        <td className="py-3.5 px-4 whitespace-nowrap">
+                          <span className="font-mono text-[11px] font-bold text-amber-300 bg-amber-500/15 border border-amber-500/30 px-2 py-0.5 rounded inline-block">
+                            {ret.returnNumber}
+                          </span>
+                          <div className="text-[10px] font-mono text-slate-400 mt-1">
+                            {formatDateTime(ret.createdAt)}
+                          </div>
+                        </td>
+                        <td className="py-3.5 px-4">
+                          <div className="font-bold text-white">{ret.supplierName}</div>
+                          <div className="text-[11px] font-mono text-slate-400 mt-0.5">
+                            PO: {ret.purchaseNumber}
+                          </div>
+                          <span
+                            className={`inline-block mt-1 text-[10px] px-1.5 py-0.5 rounded font-semibold ${
+                              ret.storeId
+                                ? 'bg-indigo-500/15 text-indigo-300'
+                                : 'bg-emerald-500/15 text-emerald-300'
+                            }`}
+                          >
+                            {ret.storeId ? `Store: ${ret.storeName || 'Warehouse'}` : 'Shop Floor'}
+                          </span>
+                        </td>
+                        <td className="py-3.5 px-4">
+                          <div className="space-y-1.5 max-w-sm">
+                            {(ret.items || []).map(item => (
+                              <div
+                                key={item.id}
+                                className="flex items-center justify-between gap-3 bg-slate-950/70 border border-slate-800/80 rounded-lg px-2.5 py-1.5"
+                              >
+                                <div className="min-w-0">
+                                  <div className="text-slate-200 font-semibold truncate">
+                                    {item.productName}
+                                  </div>
+                                  <div className="text-[10px] font-mono text-slate-400">
+                                    Qty: {item.originalQty} →{' '}
+                                    <span className="text-amber-300 font-bold">
+                                      -{item.returnQty} returned
+                                    </span>{' '}
+                                    ({item.remainingQty} left) @{' '}
+                                    {formatCurrency(item.unitCost, settings.currencySymbol)}
+                                  </div>
+                                </div>
+                                <div className="font-mono text-[11px] font-bold text-rose-300 shrink-0">
+                                  -{formatCurrency(item.returnTotal, settings.currencySymbol)}
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        </td>
+                        <td className="py-3.5 px-4 max-w-xs">
+                          <p className="text-slate-300 text-xs leading-relaxed">{ret.reason}</p>
+                        </td>
+                        <td className="py-3.5 px-4 whitespace-nowrap">
+                          <div className="text-slate-200 font-medium">{ret.returnedByName}</div>
+                          {ret.shopName && (
+                            <div className="text-[10px] text-slate-500 mt-0.5">{ret.shopName}</div>
+                          )}
+                        </td>
+                        <td className="py-3.5 px-4 text-right whitespace-nowrap">
+                          <div className="font-mono font-bold text-rose-400 text-sm">
+                            -{formatCurrency(ret.totalReturnAmount, settings.currencySymbol)}
+                          </div>
+                          <div className="text-[10px] font-semibold text-amber-300 mt-0.5">
+                            -{ret.totalReturnQty} unit{ret.totalReturnQty === 1 ? '' : 's'}
+                          </div>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+
+              {purchaseReturns.length > PAGE_SIZE && (
+                <div className="p-3 bg-slate-950/40 border-t border-slate-800/80 flex items-center justify-between gap-2">
+                  <span className="text-[11px] text-slate-400">
+                    Showing {Math.min(visibleReturnsCount, purchaseReturns.length)} of{' '}
+                    {purchaseReturns.length} returns
+                  </span>
+                  <div className="flex items-center gap-2">
+                    {visibleReturnsCount > PAGE_SIZE && (
+                      <button
+                        type="button"
+                        onClick={() => setVisibleReturnsCount(PAGE_SIZE)}
+                        className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-[11px] font-semibold"
+                      >
+                        Show Less
+                      </button>
+                    )}
+                    {hasMoreReturns && (
+                      <button
+                        type="button"
+                        onClick={() => setVisibleReturnsCount(prev => prev + PAGE_SIZE)}
+                        className="px-3 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-500 text-white text-[11px] font-semibold"
+                      >
+                        See More
+                      </button>
+                    )}
+                  </div>
+                </div>
+              )}
+            </>
+          )}
         </div>
       </div>
     );
   }
 
   // ─────────────────────────────────────────────────────────────
-  // LIST VIEW (purchases table) — unchanged
+  // VIEW 3: PURCHASE LIST (Default)
   // ─────────────────────────────────────────────────────────────
   return (
-    <div id="admin-purchases-view" className="flex-1 p-6 bg-slate-950 text-slate-100 overflow-y-auto">
+    <div
+      id="admin-purchases-view"
+      className="flex-1 p-3.5 sm:p-6 bg-slate-950 text-slate-100 overflow-y-auto pb-24 sm:pb-6"
+    >
       {/* Header */}
-      <div className="flex flex-wrap items-center justify-between gap-4 mb-6 pb-4 border-b border-slate-800">
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-5 pb-4 border-b border-slate-800">
         <div>
-          <h2 className="text-xl font-bold text-white tracking-tight">Supplier Purchases & Stock In</h2>
+          <h2 className="text-lg sm:text-xl font-bold text-white tracking-tight">
+            Purchase List
+          </h2>
           <p className="text-xs text-slate-400 mt-0.5">
-            Log procurement orders, record cost of goods, and automatically increase inventory counts
+            Filter procurement orders by period, download PDF reports, edit, return, or void
           </p>
         </div>
 
-        {canRecordPurchase && (
+        <div className="flex flex-wrap items-center gap-2">
           <button
-            id="new-purchase-btn"
-            onClick={openNewPurchaseModal}
-            className="flex items-center gap-2 px-4 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-500 text-white font-semibold text-xs shadow-lg transition"
+            type="button"
+            onClick={handlePrintPurchasesPdf}
+            disabled={isPrintingPdf}
+            className="flex items-center justify-center gap-1.5 px-3.5 py-2.5 rounded-xl bg-indigo-600/20 hover:bg-indigo-600 border border-indigo-500/35 text-indigo-300 hover:text-white font-semibold text-xs transition disabled:opacity-60"
           >
-            <Plus className="w-4 h-4" />
-            <span>Record Supplier Purchase</span>
+            {isPrintingPdf ? (
+              <Loader2 className="w-4 h-4 animate-spin" />
+            ) : (
+              <Printer className="w-4 h-4" />
+            )}
+            <span>
+              Print (
+              {isGlobalSearchActive
+                ? 'Search'
+                : periodFilter === 'all'
+                  ? 'All'
+                  : periodFilter === 'day'
+                    ? 'Day'
+                    : periodFilter === 'week'
+                      ? 'Week'
+                      : periodFilter === 'month'
+                        ? 'Month'
+                        : 'Custom'}
+              )
+            </span>
           </button>
-        )}
+
+          <button
+            type="button"
+            onClick={handleDownloadPurchasesPdf}
+            disabled={isDownloadingPdf}
+            className="flex items-center justify-center gap-1.5 px-3.5 py-2.5 rounded-xl bg-emerald-600/15 hover:bg-emerald-600 border border-emerald-500/30 text-emerald-300 hover:text-white font-semibold text-xs transition disabled:opacity-60"
+          >
+            {isDownloadingPdf ? (
+              <Loader2 className="w-4 h-4 animate-spin" />
+            ) : (
+              <Download className="w-4 h-4" />
+            )}
+            <span>
+              Download PDF (
+              {isGlobalSearchActive
+                ? 'Search'
+                : periodFilter === 'all'
+                  ? 'All'
+                  : periodFilter === 'day'
+                    ? 'Day'
+                    : periodFilter === 'week'
+                      ? 'Week'
+                      : periodFilter === 'month'
+                        ? 'Month'
+                        : 'Custom'}
+              )
+            </span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setPurchasesSubTab('returns')}
+            className="flex items-center justify-center gap-1.5 px-3.5 py-2.5 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-800 text-amber-300 font-semibold text-xs transition"
+          >
+            <RotateCcw className="w-4 h-4" />
+            <span>Return List</span>
+            {purchaseReturns.length > 0 && (
+              <span className="px-1.5 py-0.5 rounded-full bg-amber-500/20 text-amber-300 text-[10px] font-bold">
+                {purchaseReturns.length}
+              </span>
+            )}
+          </button>
+
+          {canRecordPurchase && (
+            <button
+              id="new-purchase-btn"
+              onClick={openNewPurchasePage}
+              className="flex items-center justify-center gap-2 px-3.5 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-500 active:bg-blue-700 text-white font-semibold text-xs shadow-lg transition"
+            >
+              <Plus className="w-4 h-4" />
+              <span>Add Purchase</span>
+            </button>
+          )}
+        </div>
       </div>
 
-      {/* Toolbar */}
-      <div className="bg-slate-900 border border-slate-800 rounded-xl p-3.5 mb-5 flex items-center justify-between gap-3 text-xs">
-        <div className="relative max-w-md flex-1">
-          <Search className="w-4 h-4 text-slate-400 absolute left-3 top-2.5" />
-          <input
-            type="text"
-            value={searchQuery}
-            onChange={e => setSearchQuery(e.target.value)}
-            placeholder="Search by supplier, product, or invoice #..."
-            className="w-full bg-slate-950 border border-slate-800 rounded-lg pl-9 pr-3 py-2 text-xs text-white placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
-          />
+      {/* Period Filter + Search Toolbar */}
+      <div className="bg-slate-900 border border-slate-800 rounded-xl p-3 sm:p-3.5 mb-4 space-y-3 text-xs">
+        <div className="flex flex-col md:flex-row md:items-center gap-2.5">
+          {/* Search Input */}
+          <div className="relative flex-1 min-w-0">
+            <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+            <input
+              type="text"
+              value={searchQuery}
+              onChange={e => setSearchQuery(e.target.value)}
+              placeholder="Search supplier, phone, PO #, product, invoice #, date..."
+              className="w-full bg-slate-950 border border-slate-800 rounded-lg pl-9 pr-9 py-2.5 text-xs text-white placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
+            />
+            {searchQuery && (
+              <button
+                type="button"
+                onClick={() => setSearchQuery('')}
+                className="absolute right-2.5 top-1/2 -translate-y-1/2 p-1 rounded text-slate-400 hover:text-white"
+                aria-label="Clear search"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            )}
+          </div>
+
+          {/* Period Pills: All | Day | Week | Month | Custom */}
+          <div className="flex items-center gap-1 bg-slate-950 p-1 rounded-lg border border-slate-800 overflow-x-auto shrink-0">
+            {(
+              [
+                { id: 'all', label: 'All' },
+                { id: 'day', label: 'Day' },
+                { id: 'week', label: 'Week' },
+                { id: 'month', label: 'Month' },
+                { id: 'custom', label: 'Custom' },
+              ] as const
+            ).map(p => (
+              <button
+                key={p.id}
+                type="button"
+                onClick={() => setPeriodFilter(p.id)}
+                className={`px-3 py-1.5 rounded-md text-[11px] font-semibold whitespace-nowrap transition ${
+                  periodFilter === p.id
+                    ? 'bg-blue-600 text-white shadow-sm'
+                    : 'text-slate-400 hover:text-white'
+                }`}
+              >
+                {p.label}
+              </button>
+            ))}
+          </div>
         </div>
 
-        <div className="text-slate-400 font-medium">
-          Total Purchase Orders: <span className="text-white font-bold">{purchases.length}</span>
-        </div>
-      </div>
-
-      {/* Purchases Table */}
-      <div className="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden shadow-xl">
-        <div className="overflow-x-auto">
-          <table className="w-full text-left text-xs">
-            <thead>
-              <tr className="border-b border-slate-800 bg-slate-950/60 text-slate-400">
-                <th className="py-3 px-4 font-semibold">Date</th>
-                <th className="py-3 px-4 font-semibold">Supplier Name</th>
-                <th className="py-3 px-4 font-semibold">Invoice / Ref #</th>
-                <th className="py-3 px-4 font-semibold">Items Received</th>
-                <th className="py-3 px-4 font-semibold">Payment Status</th>
-                <th className="py-3 px-4 text-right font-semibold">Total Cost</th>
-                {canRecordPurchase && (
-                  <th className="py-3 px-4 text-right font-semibold">Actions</th>
-                )}
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-slate-800/60">
-              {purchases.length === 0 ? (
-                <tr>
-                  <td colSpan={canRecordPurchase ? 7 : 6} className="py-10 text-center text-slate-500">
-                    <Truck className="w-8 h-8 mx-auto mb-2 opacity-40" />
-                    <p>No supplier purchases recorded yet.</p>
-                  </td>
-                </tr>
-              ) : (
-                visiblePurchases.map(purchase => (
-                  <tr key={purchase.id} className="hover:bg-slate-850/60 transition">
-                    <td className="py-3.5 px-4 text-slate-400 font-mono">
-                      {formatDateTime(purchase.createdAt)}
-                    </td>
-                    <td className="py-3.5 px-4 font-bold text-white">{purchase.supplierName}</td>
-                    <td className="py-3.5 px-4 font-mono text-slate-400">
-                      {purchase.invoiceNumber || '—'}
-                    </td>
-                    <td className="py-3.5 px-4 text-slate-300">
-                      <div>{(purchase.items || []).length} items</div>
-                      <div className="text-[10px] text-slate-500 truncate max-w-xs">
-                        {(purchase.items || []).map(i => `${i.quantity}x ${i.productName}`).join(', ')}
-                      </div>
-                    </td>
-                    <td className="py-3.5 px-4">
-                      <span
-                        className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${
-                          purchase.paymentStatus === 'PAID'
-                            ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30'
-                            : 'bg-amber-500/20 text-amber-300 border border-amber-500/30'
-                        }`}
-                      >
-                        {purchase.paymentStatus}
-                      </span>
-                    </td>
-                    <td className="py-3.5 px-4 text-right font-mono font-bold text-white text-sm">
-                      {formatCurrency(purchase.totalAmount, settings.currencySymbol)}
-                    </td>
-                    {canRecordPurchase && (
-                      <td className="py-3.5 px-4 text-right space-x-1.5">
-                        <button
-                          onClick={() => openEditPurchase(purchase)}
-                          className="px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 text-[11px] font-medium transition"
-                        >
-                          <Pencil className="w-3 h-3 inline mr-1" />
-                          Edit
-                        </button>
-                      </td>
-                    )}
-                  </tr>
-                ))
-              )}
-            </tbody>
-          </table>
-        </div>
-
-        {/* Pagination Footer */}
-        {purchases.length > PAGE_SIZE && (
-          <div className="px-5 py-3 border-t border-slate-800/60 bg-slate-950/30 flex items-center justify-between gap-3">
-            <div className="text-[11px] text-slate-500">
-              Showing{' '}
-              <span className="text-slate-300 font-semibold">
-                {Math.min(visibleCount, purchases.length)}
-              </span>{' '}
-              of{' '}
-              <span className="text-slate-300 font-semibold">{purchases.length}</span>{' '}
-              purchase orders
+        {/* Custom Date Range Inputs */}
+        {periodFilter === 'custom' && (
+          <div className="flex flex-wrap items-center gap-2.5 pt-2 border-t border-slate-800/80">
+            <div className="flex items-center gap-2">
+              <label className="text-[11px] text-slate-400 font-medium">From</label>
+              <input
+                type="date"
+                value={customStartDate}
+                max={todayYMD}
+                onChange={e => setCustomStartDate(e.target.value)}
+                className="bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs font-mono text-white focus:outline-none focus:ring-1 focus:ring-blue-500"
+              />
             </div>
             <div className="flex items-center gap-2">
-              {visibleCount > PAGE_SIZE && (
-                <button
-                  onClick={handleSeeLess}
-                  className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold transition"
-                >
-                  Show Less
-                </button>
-              )}
-              {hasMore && (
-                <button
-                  onClick={handleSeeMore}
-                  disabled={isLoadingMore}
-                  className="flex items-center gap-1.5 px-4 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 active:bg-blue-700 text-white text-xs font-semibold shadow transition disabled:opacity-60 disabled:cursor-wait"
-                >
-                  {isLoadingMore ? (
-                    <>
-                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                      <span>Loading...</span>
-                    </>
-                  ) : (
-                    <>
-                      <ChevronDown className="w-3.5 h-3.5" />
-                      <span>
-                        See More ({Math.min(PAGE_SIZE, remaining)} of {remaining})
-                      </span>
-                    </>
-                  )}
-                </button>
-              )}
+              <label className="text-[11px] text-slate-400 font-medium">To</label>
+              <input
+                type="date"
+                value={customEndDate}
+                max={todayYMD}
+                onChange={e => setCustomEndDate(e.target.value)}
+                className="bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs font-mono text-white focus:outline-none focus:ring-1 focus:ring-blue-500"
+              />
             </div>
           </div>
         )}
+
+        {/* Search-across-all-dates indicator + Period Summary Strip */}
+        <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-slate-800/70 text-[11px]">
+          <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-slate-400">
+            <span>
+              Orders: <strong className="text-white font-mono">{listMetrics.orderCount}</strong>
+            </span>
+            <span>
+              Units: <strong className="text-blue-300 font-mono">{listMetrics.totalUnits.toLocaleString()}</strong>
+            </span>
+            <span>
+              Total Spend:{' '}
+              <strong className="text-emerald-400 font-mono">
+                {formatCurrency(listMetrics.totalSpend, settings.currencySymbol)}
+              </strong>
+            </span>
+            <span className="text-slate-500 hidden sm:inline">
+              · {isGlobalSearchActive ? 'Searching across all dates' : periodRange.dateRangeText}
+            </span>
+          </div>
+
+          {searchQuery.trim() && periodFilter !== 'all' && (
+            <button
+              type="button"
+              onClick={() => setSearchPeriodOnly(prev => !prev)}
+              className="text-[11px] font-semibold text-blue-400 hover:text-blue-300 underline-offset-2 hover:underline"
+            >
+              {searchPeriodOnly
+                ? `Searching ${periodRange.periodLabel} only — Search all dates`
+                : `Searching all dates — Filter to ${periodRange.periodLabel} only`}
+            </button>
+          )}
+        </div>
       </div>
+
+      {/* Purchases: Cards + Table */}
+      <div className="bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden shadow-xl">
+        {purchases.length === 0 ? (
+          <div className="py-12 text-center text-slate-500 px-4">
+            <PurchaseIcon className="w-8 h-8 mx-auto mb-2 opacity-40" />
+            <p className="text-xs text-slate-300 font-medium">
+              {searchQuery.trim()
+                ? `No purchases match "${searchQuery.trim()}".`
+                : periodFilter === 'all'
+                  ? 'No supplier purchases recorded yet.'
+                  : `No purchases recorded for ${periodRange.periodLabel} (${periodRange.dateRangeText}).`}
+            </p>
+          </div>
+        ) : (
+          <>
+            {/* Mobile Cards (< md) */}
+            <div className="md:hidden divide-y divide-slate-800/80">
+              {visiblePurchases.map(purchase => {
+                const purchaseYmd = getPurchaseLocalYMD(purchase);
+                return (
+                  <div key={purchase.id} className="p-3.5 space-y-2.5">
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center gap-1.5 flex-wrap">
+                          <h4 className="font-bold text-xs text-white truncate">
+                            {purchase.supplierName}
+                          </h4>
+                          {purchase.purchaseNumber && (
+                            <span className="text-[10px] font-mono text-slate-400 bg-slate-800/80 px-1.5 py-0.5 rounded">
+                              {purchase.purchaseNumber}
+                            </span>
+                          )}
+                        </div>
+                        {purchase.supplierPhone && (
+                          <div className="flex items-center gap-1 text-[10px] font-mono text-sky-400 mt-0.5">
+                            <Phone className="w-2.5 h-2.5 shrink-0" />
+                            <span>{purchase.supplierPhone}</span>
+                          </div>
+                        )}
+                        <p className="text-[10px] font-mono text-slate-400 mt-0.5">
+                          {formatReadableYMD(purchaseYmd)} · {formatDateTime(purchase.createdAt)}
+                        </p>
+                      </div>
+                      <div className="text-right shrink-0">
+                        <div className="font-mono font-bold text-white text-sm">
+                          {formatCurrency(purchase.totalAmount, settings.currencySymbol)}
+                        </div>
+                        <span
+                          className={`px-1.5 py-0.5 rounded text-[9px] font-bold inline-block mt-0.5 ${
+                            purchase.paymentStatus === 'PAID'
+                              ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30'
+                              : 'bg-amber-500/20 text-amber-300 border border-amber-500/30'
+                          }`}
+                        >
+                          {purchase.paymentStatus}
+                        </span>
+                      </div>
+                    </div>
+
+                    <div className="text-xs text-slate-300 bg-slate-950/60 p-2 rounded-lg border border-slate-800 space-y-1">
+                      <div className="flex items-center justify-between text-[11px]">
+                        <span className="text-slate-400 font-medium">
+                          {(purchase.items || []).length} items received
+                          {purchase.storeId && (
+                            <span className="text-blue-400 ml-1.5">
+                              · Store:{' '}
+                              {purchase.storeName || storeNameMap[purchase.storeId] || 'Warehouse'}
+                            </span>
+                          )}
+                        </span>
+                        {purchase.invoiceNumber && (
+                          <span className="font-mono text-slate-400">
+                            Inv: {purchase.invoiceNumber}
+                          </span>
+                        )}
+                      </div>
+                      <p className="text-[10px] text-slate-500 truncate">
+                        {(purchase.items || [])
+                          .map(i => `${i.quantity}x ${i.productName}`)
+                          .join(', ')}
+                      </p>
+                    </div>
+
+                    <div className="flex items-center gap-1.5 pt-1.5 border-t border-slate-800/60">
+                      <button
+                        type="button"
+                        onClick={() => handlePrintSinglePurchasePdf(purchase)}
+                        disabled={printingPurchaseId === purchase.id}
+                        className="flex items-center justify-center gap-1 px-2.5 py-2 rounded-lg bg-indigo-500/15 hover:bg-indigo-600 text-indigo-300 hover:text-white border border-indigo-500/30 transition text-[11px] font-semibold disabled:opacity-50"
+                        title="Print Purchase Voucher"
+                      >
+                        {printingPurchaseId === purchase.id ? (
+                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                        ) : (
+                          <Printer className="w-3.5 h-3.5" />
+                        )}
+                        <span>Print</span>
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() => handleDownloadSinglePurchasePdf(purchase)}
+                        disabled={downloadingPurchaseId === purchase.id}
+                        className="flex items-center justify-center gap-1 px-2.5 py-2 rounded-lg bg-emerald-500/10 hover:bg-emerald-600 text-emerald-400 hover:text-white border border-emerald-500/25 transition text-[11px] font-semibold disabled:opacity-50"
+                        title="Download Purchase PDF"
+                      >
+                        {downloadingPurchaseId === purchase.id ? (
+                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                        ) : (
+                          <FileDown className="w-3.5 h-3.5" />
+                        )}
+                        <span>PDF</span>
+                      </button>
+
+                      {canRecordPurchase && (
+                        <>
+                          <button
+                            onClick={() => openEditPurchase(purchase)}
+                            className="flex-1 flex items-center justify-center gap-1.5 py-2 rounded-lg bg-slate-800 hover:bg-blue-600 active:bg-blue-700 text-slate-300 hover:text-white transition text-[11px] font-semibold"
+                          >
+                            <Pencil className="w-3.5 h-3.5" />
+                            Edit
+                          </button>
+                          <button
+                            onClick={() => openReturnPurchaseModal(purchase)}
+                            disabled={(purchase.items || []).length === 0}
+                            className="flex-1 flex items-center justify-center gap-1.5 py-2 rounded-lg bg-amber-500/10 hover:bg-amber-600 active:bg-amber-700 text-amber-400 hover:text-white border border-amber-500/25 transition text-[11px] font-semibold disabled:opacity-40 disabled:cursor-not-allowed"
+                          >
+                            <RotateCcw className="w-3.5 h-3.5" />
+                            Return
+                          </button>
+                          <button
+                            onClick={() => openVoidPurchaseModal(purchase)}
+                            className="flex items-center justify-center gap-1 px-2.5 py-2 rounded-lg bg-rose-500/10 hover:bg-rose-600 active:bg-rose-700 text-rose-400 hover:text-white border border-rose-500/20 transition text-[11px] font-semibold"
+                          >
+                            <Ban className="w-3.5 h-3.5" />
+                            Void
+                          </button>
+                        </>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+
+            {/* Tablet / Desktop Table (md+) */}
+            <div className="hidden md:block overflow-x-auto">
+              <table className="w-full text-left text-xs">
+                <thead>
+                  <tr className="border-b border-slate-800 bg-slate-950/60 text-slate-400">
+                    <th className="py-3 px-4 font-semibold">Date &amp; PO #</th>
+                    <th className="py-3 px-4 font-semibold">Supplier &amp; Phone</th>
+                    <th className="py-3 px-4 font-semibold">Invoice #</th>
+                    <th className="py-3 px-4 font-semibold">Items</th>
+                    <th className="py-3 px-4 font-semibold">Payment</th>
+                    <th className="py-3 px-4 text-right font-semibold">Total</th>
+                    <th className="py-3 px-4 text-right font-semibold">Actions</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-800/60">
+                  {visiblePurchases.map(purchase => {
+                    const purchaseYmd = getPurchaseLocalYMD(purchase);
+                    return (
+                      <tr key={purchase.id} className="hover:bg-slate-800/30 transition">
+                        <td className="py-3.5 px-4 whitespace-nowrap">
+                          <div className="text-slate-200 font-semibold font-mono text-[11px]">
+                            {formatReadableYMD(purchaseYmd)}
+                          </div>
+                          <div className="text-[10px] font-mono text-slate-500 mt-0.5">
+                            {purchase.purchaseNumber || formatDateTime(purchase.createdAt)}
+                          </div>
+                        </td>
+                        <td className="py-3.5 px-4">
+                          <div className="font-bold text-white">{purchase.supplierName}</div>
+                          {purchase.supplierPhone && (
+                            <div className="flex items-center gap-1 text-[10px] font-mono text-sky-400 mt-0.5">
+                              <Phone className="w-2.5 h-2.5 shrink-0" />
+                              <span>{purchase.supplierPhone}</span>
+                            </div>
+                          )}
+                        </td>
+                        <td className="py-3.5 px-4 font-mono text-slate-400">
+                          {purchase.invoiceNumber || '—'}
+                        </td>
+                        <td className="py-3.5 px-4 text-slate-300">
+                          <div>
+                            {(purchase.items || []).length} items
+                            {purchase.storeId && (
+                              <span className="text-[11px] text-blue-400 ml-1.5">
+                                · Store:{' '}
+                                {purchase.storeName || storeNameMap[purchase.storeId] || 'Warehouse'}
+                              </span>
+                            )}
+                          </div>
+                          <div className="text-[10px] text-slate-500 truncate max-w-xs">
+                            {(purchase.items || [])
+                              .map(i => `${i.quantity}x ${i.productName}`)
+                              .join(', ')}
+                          </div>
+                        </td>
+                        <td className="py-3.5 px-4">
+                          <span
+                            className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${
+                              purchase.paymentStatus === 'PAID'
+                                ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30'
+                                : 'bg-amber-500/20 text-amber-300 border border-amber-500/30'
+                            }`}
+                          >
+                            {purchase.paymentStatus}
+                          </span>
+                        </td>
+                        <td className="py-3.5 px-4 text-right font-mono font-bold text-white text-sm">
+                          {formatCurrency(purchase.totalAmount, settings.currencySymbol)}
+                        </td>
+                        <td className="py-3.5 px-4 text-right whitespace-nowrap">
+                          <div className="inline-flex items-center justify-end gap-1.5">
+                            <button
+                              type="button"
+                              onClick={() => handlePrintSinglePurchasePdf(purchase)}
+                              disabled={printingPurchaseId === purchase.id}
+                              className="px-2.5 py-1.5 rounded bg-indigo-500/15 hover:bg-indigo-600 text-indigo-300 hover:text-white border border-indigo-500/30 text-[11px] font-medium transition inline-flex items-center gap-1 disabled:opacity-50"
+                              title="Print Purchase Voucher"
+                            >
+                              {printingPurchaseId === purchase.id ? (
+                                <Loader2 className="w-3 h-3 animate-spin" />
+                              ) : (
+                                <Printer className="w-3 h-3" />
+                              )}
+                              Print
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => handleDownloadSinglePurchasePdf(purchase)}
+                              disabled={downloadingPurchaseId === purchase.id}
+                              className="px-2.5 py-1.5 rounded bg-emerald-500/10 hover:bg-emerald-600 text-emerald-400 hover:text-white border border-emerald-500/25 text-[11px] font-medium transition inline-flex items-center gap-1 disabled:opacity-50"
+                              title="Download Purchase PDF"
+                            >
+                              {downloadingPurchaseId === purchase.id ? (
+                                <Loader2 className="w-3 h-3 animate-spin" />
+                              ) : (
+                                <FileDown className="w-3 h-3" />
+                              )}
+                              PDF
+                            </button>
+                            {canRecordPurchase && (
+                              <>
+                                <button
+                                  onClick={() => openEditPurchase(purchase)}
+                                  className="px-2.5 py-1.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 text-[11px] font-medium transition inline-flex items-center gap-1"
+                                >
+                                  <Pencil className="w-3 h-3" />
+                                  Edit
+                                </button>
+                                <button
+                                  onClick={() => openReturnPurchaseModal(purchase)}
+                                  disabled={(purchase.items || []).length === 0}
+                                  className="px-2.5 py-1.5 rounded bg-amber-500/10 hover:bg-amber-600 text-amber-400 hover:text-white border border-amber-500/25 text-[11px] font-medium transition inline-flex items-center gap-1 disabled:opacity-40 disabled:cursor-not-allowed"
+                                >
+                                  <RotateCcw className="w-3 h-3" />
+                                  Return
+                                </button>
+                                <button
+                                  onClick={() => openVoidPurchaseModal(purchase)}
+                                  className="px-2.5 py-1.5 rounded bg-rose-500/10 hover:bg-rose-600 text-rose-400 hover:text-white border border-rose-500/20 text-[11px] font-medium transition inline-flex items-center gap-1"
+                                >
+                                  <Ban className="w-3 h-3" />
+                                  Void
+                                </button>
+                              </>
+                            )}
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+
+            {/* Pagination Footer */}
+            {purchases.length > PAGE_SIZE && (
+              <div className="p-3 bg-slate-950/40 border-t border-slate-800/80 space-y-2">
+                <div className="text-[10px] text-slate-500 text-center">
+                  Showing{' '}
+                  <span className="text-slate-300 font-semibold">
+                    {Math.min(visibleCount, purchases.length)}
+                  </span>{' '}
+                  of{' '}
+                  <span className="text-slate-300 font-semibold">{purchases.length}</span>{' '}
+                  purchase orders
+                </div>
+                <div className="flex items-center gap-2">
+                  {visibleCount > PAGE_SIZE && (
+                    <button
+                      onClick={handleSeeLess}
+                      className="flex-1 px-3 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 active:bg-slate-600 text-slate-300 text-[11px] font-semibold transition"
+                    >
+                      Show Less
+                    </button>
+                  )}
+                  {hasMore && (
+                    <button
+                      onClick={handleSeeMore}
+                      disabled={isLoadingMore}
+                      className="flex-1 flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 active:bg-blue-700 text-white text-[11px] font-semibold shadow transition disabled:opacity-60 disabled:cursor-wait"
+                    >
+                      {isLoadingMore ? (
+                        <>
+                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                          <span>Loading...</span>
+                        </>
+                      ) : (
+                        <>
+                          <ChevronDown className="w-3.5 h-3.5" />
+                          <span>See More ({Math.min(PAGE_SIZE, remaining)})</span>
+                        </>
+                      )}
+                    </button>
+                  )}
+                </div>
+              </div>
+            )}
+          </>
+        )}
+      </div>
+
+      {/* Purchase Return Modal */}
+      {returningPurchase && canRecordPurchase && (
+        <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-slate-950/80 backdrop-blur-sm sm:p-4 overflow-y-auto">
+          <div className="bg-slate-900 border border-slate-800 rounded-t-2xl sm:rounded-2xl max-w-xl w-full p-4 sm:p-6 shadow-2xl max-h-[92vh] overflow-y-auto my-auto">
+            <div className="flex items-center justify-between pb-3 border-b border-slate-800 mb-4">
+              <div className="flex items-center gap-2 text-amber-400 min-w-0">
+                <RotateCcw className="w-5 h-5 shrink-0" />
+                <h3 className="text-sm sm:text-base font-bold text-white truncate">
+                  Purchase Return — {returningPurchase.purchaseNumber || returningPurchase.supplierName}
+                </h3>
+              </div>
+              <button
+                type="button"
+                onClick={closeReturnPurchaseModal}
+                className="text-slate-400 hover:text-white p-1 shrink-0"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="p-3 bg-slate-950/80 border border-slate-800 rounded-xl text-xs mb-4 flex items-center justify-between gap-2">
+              <div className="min-w-0">
+                <div className="font-bold text-white truncate">
+                  {returningPurchase.supplierName}
+                </div>
+                <div className="text-[10px] font-mono text-slate-400 mt-0.5">
+                  {formatDateTime(returningPurchase.createdAt)} ·{' '}
+                  <span className="text-blue-400">
+                    {returningPurchase.storeId
+                      ? `Store: ${
+                          returningPurchase.storeName ||
+                          (dbState.stores || []).find(s => s.id === returningPurchase.storeId)
+                            ?.name ||
+                          'Warehouse'
+                        }`
+                      : 'Shop Floor'}
+                  </span>
+                </div>
+              </div>
+              <div className="text-right shrink-0">
+                <div className="text-[10px] text-slate-400">Current Total</div>
+                <div className="font-mono font-bold text-white text-sm">
+                  {formatCurrency(returningPurchase.totalAmount, settings.currencySymbol)}
+                </div>
+              </div>
+            </div>
+
+            {returnError && (
+              <div className="mb-3 p-3 rounded-xl bg-rose-500/15 border border-rose-500/30 text-rose-300 text-xs font-medium">
+                {returnError}
+              </div>
+            )}
+
+            <form onSubmit={handleExecuteReturn} className="space-y-4 text-xs">
+              <div>
+                <label className="block text-slate-300 font-semibold uppercase tracking-wider text-[11px] mb-2">
+                  Enter Quantity to Return
+                </label>
+
+                <div className="space-y-2.5 max-h-60 overflow-y-auto pr-1">
+                  {(returningPurchase.items || []).map(item => {
+                    const rawVal = returnQuantities[item.id] ?? '';
+                    const parsedQty = Math.max(0, parseFloat(rawVal) || 0);
+                    const isOver = parsedQty > item.quantity;
+                    const clampedQty = Math.min(parsedQty, item.quantity);
+                    const remainingQty = Number((item.quantity - clampedQty).toFixed(4));
+                    const lineDeduction = clampedQty * item.unitCost;
+
+                    return (
+                      <div
+                        key={item.id}
+                        className={`p-3 rounded-xl bg-slate-950 border transition space-y-2 ${
+                          isOver
+                            ? 'border-rose-500/60'
+                            : clampedQty > 0
+                            ? 'border-amber-500/50 bg-amber-500/5'
+                            : 'border-slate-800'
+                        }`}
+                      >
+                        <div className="flex items-start justify-between gap-2">
+                          <div className="min-w-0">
+                            <div className="font-semibold text-white text-xs truncate">
+                              {item.productName}
+                            </div>
+                            <div className="text-[10px] font-mono text-slate-400 mt-0.5">
+                              Purchased: <strong className="text-slate-200">{item.quantity}</strong>{' '}
+                              × {formatCurrency(item.unitCost, settings.currencySymbol)} ={' '}
+                              {formatCurrency(item.total, settings.currencySymbol)}
+                            </div>
+                          </div>
+
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setReturnQuantities(prev => ({
+                                ...prev,
+                                [item.id]: item.quantity.toString(),
+                              }))
+                            }
+                            className="px-2 py-1 rounded bg-slate-800 hover:bg-amber-600/30 text-amber-300 text-[10px] font-semibold shrink-0 transition"
+                          >
+                            Max ({item.quantity})
+                          </button>
+                        </div>
+
+                        <div className="flex items-center gap-2.5">
+                          <div className="w-28 shrink-0">
+                            <label className="block text-[10px] text-slate-500 mb-0.5">
+                              Return Qty
+                            </label>
+                            <input
+                              type="number"
+                              inputMode="decimal"
+                              min="0"
+                              max={item.quantity}
+                              step="any"
+                              value={rawVal}
+                              onChange={e =>
+                                setReturnQuantities(prev => ({
+                                  ...prev,
+                                  [item.id]: e.target.value,
+                                }))
+                              }
+                              placeholder="0"
+                              className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-2 text-white font-mono text-xs text-center focus:outline-none focus:ring-1 focus:ring-amber-500"
+                            />
+                          </div>
+
+                          <div className="flex-1 flex items-center justify-between bg-slate-900/70 border border-slate-800 rounded-lg px-2.5 py-2 mt-3.5">
+                            <span className="text-[11px] font-mono text-slate-300">
+                              {item.quantity} →{' '}
+                              <strong
+                                className={
+                                  clampedQty > 0 ? 'text-emerald-400' : 'text-slate-400'
+                                }
+                              >
+                                {remainingQty} left
+                              </strong>
+                            </span>
+                            {clampedQty > 0 && (
+                              <span className="text-[11px] font-mono font-bold text-rose-400">
+                                -{formatCurrency(lineDeduction, settings.currencySymbol)}
+                              </span>
+                            )}
+                          </div>
+                        </div>
+
+                        {isOver && (
+                          <p className="text-[10px] text-rose-400">
+                            Cannot return more than purchased quantity ({item.quantity}).
+                          </p>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* Live Deduction Summary */}
+              <div className="p-3 rounded-xl bg-amber-500/10 border border-amber-500/25 space-y-1.5">
+                <div className="flex items-center justify-between text-xs">
+                  <span className="text-amber-200/90">Units to Return:</span>
+                  <span className="font-mono font-bold text-amber-300">
+                    -{returnPreview.totalReturnUnits}
+                  </span>
+                </div>
+                <div className="flex items-center justify-between text-xs">
+                  <span className="text-amber-200/90">Purchase Price Reduction:</span>
+                  <span className="font-mono font-bold text-rose-300">
+                    -{formatCurrency(returnPreview.totalReturnAmount, settings.currencySymbol)}
+                  </span>
+                </div>
+                <div className="flex items-center justify-between text-xs pt-1.5 border-t border-amber-500/20">
+                  <span className="text-slate-200 font-semibold">Updated Purchase Total:</span>
+                  <span className="font-mono font-bold text-white">
+                    {formatCurrency(returningPurchase.totalAmount, settings.currencySymbol)} →{' '}
+                    <span className="text-emerald-400">
+                      {formatCurrency(
+                        returnPreview.updatedPurchaseTotal,
+                        settings.currencySymbol
+                      )}
+                    </span>
+                  </span>
+                </div>
+              </div>
+
+              {/* Reason */}
+              <div className="space-y-1.5">
+                <label className="block text-slate-300 font-semibold">Return Reason *</label>
+                <textarea
+                  required
+                  rows={3}
+                  value={returnReason}
+                  onChange={e => setReturnReason(e.target.value)}
+                  placeholder="e.g. Damaged items on arrival, wrong item delivered, excess quantity..."
+                  className="w-full bg-slate-950 border border-slate-800 rounded-xl p-2.5 text-white placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-amber-500"
+                />
+              </div>
+
+              <div className="flex justify-end gap-2 pt-3 border-t border-slate-800">
+                <button
+                  type="button"
+                  onClick={closeReturnPurchaseModal}
+                  className="px-4 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold transition"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={isReturning || returnPreview.totalReturnUnits <= 0}
+                  className="px-5 py-2.5 rounded-xl bg-amber-600 hover:bg-amber-500 active:bg-amber-700 text-white text-xs font-bold shadow-lg disabled:opacity-50 disabled:cursor-not-allowed transition inline-flex items-center gap-1.5"
+                >
+                  <RotateCcw className="w-3.5 h-3.5" />
+                  <span>{isReturning ? 'Processing...' : 'Return Now'}</span>
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Void & Delete Purchase Modal */}
+      {voidingPurchase && canRecordPurchase && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 backdrop-blur-sm p-4">
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl max-w-md w-full p-5 sm:p-6 shadow-2xl">
+            <div className="flex items-center justify-between pb-3 border-b border-slate-800 mb-4">
+              <div className="flex items-center gap-2 text-rose-400 min-w-0">
+                <Ban className="w-5 h-5 shrink-0" />
+                <h3 className="text-sm sm:text-base font-bold text-white truncate">
+                  Void Purchase {voidingPurchase.purchaseNumber || ''}
+                </h3>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  setVoidingPurchase(null);
+                  setVoidReason('');
+                }}
+                className="text-slate-400 hover:text-white p-1"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="p-3 bg-slate-950/80 border border-slate-800 rounded-xl text-xs mb-3 flex items-center justify-between gap-2">
+              <div className="min-w-0">
+                <div className="font-bold text-white truncate">
+                  {voidingPurchase.supplierName}
+                </div>
+                <div className="text-[10px] font-mono text-slate-400 mt-0.5">
+                  {formatDateTime(voidingPurchase.createdAt)}
+                </div>
+              </div>
+              <div className="font-mono font-bold text-white text-sm shrink-0">
+                {formatCurrency(voidingPurchase.totalAmount, settings.currencySymbol)}
+              </div>
+            </div>
+
+            <div className="p-3 bg-amber-500/10 border border-amber-500/30 rounded-xl text-amber-200 text-xs mb-4 space-y-2">
+              <div className="flex items-start gap-2">
+                <RotateCcw className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                <div>
+                  <strong>Automatic Stock Reversal &amp; Permanent Delete:</strong> Voiding will
+                  revert{' '}
+                  <strong>
+                    {(voidingPurchase.items || []).reduce((s, i) => s + (i.quantity || 0), 0)} units
+                  </strong>{' '}
+                  from{' '}
+                  <strong>
+                    {voidingPurchase.storeId
+                      ? `Store: ${
+                          voidingPurchase.storeName ||
+                          (dbState.stores || []).find(s => s.id === voidingPurchase.storeId)
+                            ?.name ||
+                          'Warehouse'
+                        }`
+                      : 'Shop Floor'}
+                  </strong>{' '}
+                  back to their previous quantities and permanently delete this purchase record.
+                </div>
+              </div>
+
+              {(voidingPurchase.items || []).length > 0 && (
+                <div className="pt-1.5 border-t border-amber-500/20 max-h-28 overflow-y-auto space-y-1 text-[11px]">
+                  {(voidingPurchase.items || []).map(item => (
+                    <div key={item.id} className="flex items-center justify-between gap-2">
+                      <span className="truncate text-amber-100">{item.productName}</span>
+                      <span className="font-mono font-bold text-rose-300 shrink-0">
+                        -{item.quantity}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            <div className="space-y-2 text-xs mb-5">
+              <label className="block text-slate-300 font-semibold">
+                Void / Deletion Reason *
+              </label>
+              <textarea
+                required
+                rows={3}
+                value={voidReason}
+                onChange={e => setVoidReason(e.target.value)}
+                placeholder="e.g. Wrong purchase entry, duplicate stock-in, cancelled delivery..."
+                className="w-full bg-slate-950 border border-slate-800 rounded-lg p-2.5 text-white placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-rose-500"
+              />
+            </div>
+
+            <div className="flex justify-end gap-2 pt-3 border-t border-slate-800">
+              <button
+                type="button"
+                onClick={() => {
+                  setVoidingPurchase(null);
+                  setVoidReason('');
+                }}
+                className="px-4 py-2.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold transition"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={handleExecuteVoid}
+                disabled={isVoiding}
+                className="px-4 py-2.5 rounded-lg bg-rose-600 hover:bg-rose-500 active:bg-rose-700 text-white text-xs font-bold disabled:opacity-50 transition"
+              >
+                {isVoiding ? 'Processing...' : 'Confirm Void & Delete'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

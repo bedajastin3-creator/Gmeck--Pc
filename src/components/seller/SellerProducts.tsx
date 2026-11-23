@@ -23,7 +23,17 @@ import { ProductImageUpload } from '../common/ProductImageUpload';
 const PAGE_SIZE = 10;
 
 export const SellerProducts: React.FC = () => {
-  const { currentUser, dbState, addToast, sellerColor, selectedShopId, currentShop } = useApp();
+  const {
+    currentUser,
+    dbState,
+    addToast,
+    sellerColor,
+    selectedShopId,
+    currentShop,
+    productsSubTab,
+    setProductsSubTab,
+    productsNavTick,
+  } = useApp();
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedCategory, setSelectedCategory] = useState('ALL');
   const [showAddModal, setShowAddModal] = useState(false);
@@ -74,6 +84,15 @@ export const SellerProducts: React.FC = () => {
   useEffect(() => {
     setVisibleCount(PAGE_SIZE);
   }, [searchQuery, selectedCategory, targetShopId]);
+
+  useEffect(() => {
+    if (productsNavTick === 0) return;
+    if (productsSubTab === 'add_product') {
+      setShowAddModal(true);
+    } else {
+      setShowAddModal(false);
+    }
+  }, [productsNavTick, productsSubTab]);
 
   const visibleProducts = products.slice(0, visibleCount);
   const hasMore = products.length > visibleCount;
@@ -371,7 +390,10 @@ export const SellerProducts: React.FC = () => {
                 <h3 className="text-base font-bold text-white">Add New Product</h3>
               </div>
               <button
-                onClick={() => setShowAddModal(false)}
+                onClick={() => {
+                  setShowAddModal(false);
+                  setProductsSubTab('product_list');
+                }}
                 className="text-slate-400 hover:text-white p-1"
               >
                 <X className="w-5 h-5" />
@@ -520,7 +542,10 @@ export const SellerProducts: React.FC = () => {
               <div className="pt-3 border-t border-slate-800 flex justify-end gap-2">
                 <button
                   type="button"
-                  onClick={() => setShowAddModal(false)}
+                  onClick={() => {
+                    setShowAddModal(false);
+                    setProductsSubTab('product_list');
+                  }}
                   className="px-4 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 font-semibold transition"
                 >
                   Cancel

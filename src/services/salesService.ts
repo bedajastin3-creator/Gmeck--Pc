@@ -1,8 +1,14 @@
 import { db } from '../db/storage';
 import { Sale, SaleItem, PaymentMethod, User, SaleEditRequest } from '../types';
 import { generateUUID } from '../utils/crypto';
-import { generateReceiptNumber } from '../utils/formatters';
+import { generateReceiptNumber, formatDateTime } from '../utils/formatters';
 import { NotificationService } from './notificationService';
+import {
+  getShopAdminShopIds,
+  hasAdminAccess,
+  isPlatformAdmin,
+  isShopAdmin,
+} from '../utils/permissions';
 
 export interface CartItemInput {
   productId: string;
@@ -23,6 +29,8 @@ export class SalesService {
       discount?: number;
       amountReceived: number;
       notes?: string;
+      assistantName?: string;
+      saleDate?: string;
     },
     currentUser: User
   ): { success: boolean; sale?: Sale; error?: string } {
@@ -103,15 +111,34 @@ export class SalesService {
     const taxAmount = 0;
     const finalTotal = Number(discountedSubtotal.toFixed(2));
 
-    if (params.amountReceived < finalTotal && params.paymentMethod === 'CASH') {
-      return {
-        success: false,
-        error: `Tendered amount (${settings.currencySymbol}${params.amountReceived.toFixed(2)}) is less than total balance (${settings.currencySymbol}${finalTotal.toFixed(2)})`,
-      };
-    }
-
-    const change = params.paymentMethod === 'CASH' ? Math.max(0, params.amountReceived - finalTotal) : 0;
+    const safeAmountReceived =
+      Number.isFinite(params.amountReceived) && params.amountReceived >= 0
+        ? params.amountReceived
+        : finalTotal;
+    const change = 0;
     const grossProfit = Number((finalTotal - totalCostOfGoods).toFixed(2));
+
+    const now = new Date();
+    const localTodayYMD = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+    let txDate = now;
+    if (params.saleDate && /^\d{4}-\d{2}-\d{2}$/.test(params.saleDate) && params.saleDate < localTodayYMD) {
+      const [year, month, day] = params.saleDate.split('-').map(Number);
+      const candidate = new Date(
+        year,
+        month - 1,
+        day,
+        now.getHours(),
+        now.getMinutes(),
+        now.getSeconds(),
+        now.getMilliseconds()
+      );
+      txDate =
+        candidate.toISOString().slice(0, 10) === params.saleDate
+          ? candidate
+          : new Date(Date.UTC(year, month - 1, day, 12, 0, 0));
+    }
+    const txTimestamp = txDate.toISOString();
+    const nowTimestamp = now.toISOString();
 
     const saleId = generateUUID();
     const receiptNumber = generateReceiptNumber();
@@ -120,6 +147,8 @@ export class SalesService {
       item.saleId = saleId;
     });
 
+    const trimmedAssistantName = params.assistantName?.trim();
+
     const newSale: Sale = {
       id: saleId,
       receiptNumber,
@@ -127,6 +156,7 @@ export class SalesService {
       shopName: shop.name,
       sellerId: currentUser.id,
       sellerName: currentUser.name,
+      ...(trimmedAssistantName ? { assistantName: trimmedAssistantName } : {}),
       subtotal: Number(subtotal.toFixed(2)),
       discount: Number(overallDiscount.toFixed(2)),
       tax: taxAmount,
@@ -134,11 +164,11 @@ export class SalesService {
       costOfGoods: Number(totalCostOfGoods.toFixed(2)),
       grossProfit,
       paymentMethod: params.paymentMethod,
-      amountReceived: Number(params.amountReceived.toFixed(2)),
-      change: Number(change.toFixed(2)),
+      amountReceived: Number(safeAmountReceived.toFixed(2)),
+      change,
       status: 'COMPLETED',
       notes: params.notes?.trim(),
-      createdAt: new Date().toISOString(),
+      createdAt: txTimestamp,
       items: saleItems,
     };
 
@@ -148,7 +178,7 @@ export class SalesService {
         return {
           ...prod,
           currentStock: prod.currentStock - soldItem.quantity,
-          updatedAt: new Date().toISOString(),
+          updatedAt: nowTimestamp,
         };
       }
       return prod;
@@ -171,7 +201,7 @@ export class SalesService {
         referenceId: saleId,
         userId: currentUser.id,
         userName: currentUser.name,
-        createdAt: new Date().toISOString(),
+        createdAt: txTimestamp,
       };
     });
     db.saveMovements([...newMovements, ...db.getMovements()]);
@@ -217,7 +247,11 @@ export class SalesService {
     voidReason: string,
     currentUser: User
   ): { success: boolean; error?: string } {
-    if (currentUser.role !== 'ADMIN') {
+    const canVoid =
+      isPlatformAdmin(currentUser) ||
+      hasAdminAccess(currentUser) ||
+      Boolean(currentUser.permissions?.canDeleteSales);
+    if (!canVoid) {
       return { success: false, error: 'Permission Denied: Only Admin can void a sale.' };
     }
 
@@ -229,6 +263,18 @@ export class SalesService {
     const targetSale = sales.find(s => s.id === saleId);
     if (!targetSale) {
       return { success: false, error: 'Sale record not found.' };
+    }
+
+    if (!isPlatformAdmin(currentUser)) {
+      const managedIds = getShopAdminShopIds(currentUser);
+      const allowedIds =
+        managedIds.length > 0 ? managedIds : currentUser.assignedShopIds || [];
+      if (!allowedIds.includes(targetSale.shopId)) {
+        return {
+          success: false,
+          error: 'Permission Denied: You can only void sales inside your managed shops.',
+        };
+      }
     }
 
     if (targetSale.status === 'VOIDED') {
@@ -371,7 +417,17 @@ export class SalesService {
     const newTotal = Number((newSubtotal - sale.discount).toFixed(2));
     const newGrossProfit = Number((newTotal - newCostOfGoods).toFixed(2));
 
-    if (currentUser.role === 'ADMIN') {
+    const canApplyDirectly =
+      isPlatformAdmin(currentUser) ||
+      (isShopAdmin(currentUser) &&
+        (getShopAdminShopIds(currentUser).includes(sale.shopId) ||
+          Boolean(
+            currentUser.permissions?.canManageShops &&
+              (currentUser.assignedShopIds || []).includes(sale.shopId)
+          ))) ||
+      Boolean(currentUser.permissions?.canEditSales);
+
+    if (canApplyDirectly) {
       return this.applySaleEdit(sale, {
         items: newSaleItems,
         subtotal: Number(newSubtotal.toFixed(2)),
@@ -528,15 +584,21 @@ export class SalesService {
     currentUser: User,
     reviewNote?: string
   ): { success: boolean; error?: string } {
-    if (currentUser.role !== 'ADMIN') {
-      return { success: false, error: 'Only admin can review sale edits.' };
-    }
-
     const requests = db.getSaleEditRequests?.() || [];
     const request = requests.find(r => r.id === requestId);
 
     if (!request) {
       return { success: false, error: 'Edit request not found.' };
+    }
+
+    const saleForReq = db.getSales().find(s => s.id === request.saleId);
+    const canReviewAsShopAdmin =
+      isShopAdmin(currentUser) &&
+      Boolean(saleForReq?.shopId) &&
+      getShopAdminShopIds(currentUser).includes(saleForReq!.shopId);
+
+    if (!isPlatformAdmin(currentUser) && !canReviewAsShopAdmin) {
+      return { success: false, error: 'Only Platform Admin or designated Shop Admin can review sale edits.' };
     }
 
     if (request.status !== 'PENDING') {
@@ -603,8 +665,25 @@ export class SalesService {
       return [];
     }
 
-    if (currentUser.role === 'ADMIN') {
+    if (isPlatformAdmin(currentUser)) {
       return requests;
+    }
+
+    if (isShopAdmin(currentUser) || currentUser.permissions?.canEditSales) {
+      const managedIds = getShopAdminShopIds(currentUser);
+      const allowedShopIds =
+        managedIds.length > 0 ? managedIds : currentUser.assignedShopIds || [];
+      const salesById = new Map(db.getSales().map(s => [s.id, s]));
+
+      return requests.filter(r => {
+        if (r.requestedByUserId === currentUser.id) return true;
+        const sale = salesById.get(r.saleId);
+        const shopId =
+          sale?.shopId ||
+          r.originalValues?.items?.[0]?.shopId ||
+          r.newValues?.items?.[0]?.shopId;
+        return Boolean(shopId && allowedShopIds.includes(shopId));
+      });
     }
 
     return requests.filter(r => r.requestedByUserId === currentUser.id);
@@ -633,10 +712,26 @@ export class SalesService {
       return [];
     }
 
-    if (currentUser.role === 'SELLER') {
+    const platformAdmin = isPlatformAdmin(currentUser);
+    const shopAdmin = isShopAdmin(currentUser);
+    const canManageTeamSales =
+      platformAdmin ||
+      shopAdmin ||
+      Boolean(currentUser.permissions?.canEditSales) ||
+      Boolean(currentUser.permissions?.canDeleteSales);
+
+    if (!canManageTeamSales) {
       sales = sales.filter(s => s.sellerId === currentUser.id);
-    } else if (options.sellerId && options.sellerId !== 'ALL') {
-      sales = sales.filter(s => s.sellerId === options.sellerId);
+    } else {
+      if (!platformAdmin) {
+        const managedIds = getShopAdminShopIds(currentUser);
+        const allowedShopIds =
+          managedIds.length > 0 ? managedIds : currentUser.assignedShopIds || [];
+        sales = sales.filter(s => allowedShopIds.includes(s.shopId));
+      }
+      if (options.sellerId && options.sellerId !== 'ALL') {
+        sales = sales.filter(s => s.sellerId === options.sellerId);
+      }
     }
 
     if (options.shopId && options.shopId !== 'ALL') {
@@ -651,25 +746,47 @@ export class SalesService {
       sales = sales.filter(s => s.paymentMethod === options.paymentMethod);
     }
 
-    if (options.search) {
+    if (options.search && options.search.trim()) {
       const q = options.search.toLowerCase().trim();
-      sales = sales.filter(
-        s =>
+      sales = sales.filter(s => {
+        const dateStr = formatDateTime(s.createdAt).toLowerCase();
+        const isoDate = (s.createdAt || '').slice(0, 10).toLowerCase();
+        return (
           s.receiptNumber.toLowerCase().includes(q) ||
           s.sellerName.toLowerCase().includes(q) ||
           (s.shopName && s.shopName.toLowerCase().includes(q)) ||
-          s.items.some(i => i.productName.toLowerCase().includes(q) || i.sku.toLowerCase().includes(q))
-      );
+          (s.paymentMethod && s.paymentMethod.toLowerCase().includes(q)) ||
+          (s.status && s.status.toLowerCase().includes(q)) ||
+          String(s.total).includes(q) ||
+          dateStr.includes(q) ||
+          isoDate.includes(q) ||
+          s.items.some(
+            i =>
+              i.productName.toLowerCase().includes(q) ||
+              (i.sku && i.sku.toLowerCase().includes(q))
+          )
+        );
+      });
     }
 
     if (options.startDate) {
-      const start = new Date(options.startDate).getTime();
-      sales = sales.filter(s => new Date(s.createdAt).getTime() >= start);
+      const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(options.startDate.trim());
+      const startMs = m
+        ? new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), 0, 0, 0, 0).getTime()
+        : new Date(options.startDate).getTime();
+      if (!Number.isNaN(startMs)) {
+        sales = sales.filter(s => new Date(s.createdAt).getTime() >= startMs);
+      }
     }
 
     if (options.endDate) {
-      const end = new Date(options.endDate).getTime() + 86400000;
-      sales = sales.filter(s => new Date(s.createdAt).getTime() <= end);
+      const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(options.endDate.trim());
+      const endMs = m
+        ? new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), 23, 59, 59, 999).getTime()
+        : new Date(options.endDate).getTime() + 86400000;
+      if (!Number.isNaN(endMs)) {
+        sales = sales.filter(s => new Date(s.createdAt).getTime() <= endMs);
+      }
     }
 
     return sales;

@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useRef } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import {
   CreditCard,
   Plus,
@@ -22,6 +22,7 @@ import { ExpenseCategory, PaymentMethod, Expense } from '../../types';
 import { formatCurrency, formatDateTime } from '../../utils/formatters';
 import { formatPriceInput, parsePriceInput } from '../../utils/priceInput';
 import { generateUUID } from '../../utils/crypto';
+import { hasAdminAccess } from '../../utils/permissions';
 
 const DEFAULT_EXPENSE_CATEGORIES: { id: string; label: string; isCustom?: boolean }[] = [
   { id: 'RENT', label: 'Store Rent & Lease' },
@@ -46,7 +47,7 @@ interface CustomCategory {
 }
 
 export const AdminExpenses: React.FC = () => {
-  const { currentUser, dbState, addToast } = useApp();
+  const { currentUser, dbState, addToast, expensesSubTab, setExpensesSubTab, expensesNavTick } = useApp();
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [isCategoryModalOpen, setIsCategoryModalOpen] = useState(false);
   const [editingExpense, setEditingExpense] = useState<Expense | null>(null);
@@ -91,14 +92,14 @@ export const AdminExpenses: React.FC = () => {
   // Permission check
   if (!currentUser) return null;
   if (
-    currentUser.role !== 'ADMIN' &&
+    !hasAdminAccess(currentUser) &&
     !currentUser.permissions?.canViewExpenses &&
     !currentUser.permissions?.canRecordExpenses
   )
     return null;
 
   const canRecordExpense =
-    currentUser.role === 'ADMIN' || currentUser.permissions?.canRecordExpenses;
+    hasAdminAccess(currentUser) || currentUser.permissions?.canRecordExpenses;
   const isAdmin = currentUser.role === 'ADMIN';
 
   const settings = dbState.settings;
@@ -204,6 +205,17 @@ export const AdminExpenses: React.FC = () => {
     setIsModalOpen(true);
   };
 
+  useEffect(() => {
+    if (expensesNavTick === 0) return;
+    if (expensesSubTab === 'add' && canRecordExpense) {
+      openAddModal();
+    } else if (expensesSubTab === 'list') {
+      setIsModalOpen(false);
+      setEditingExpense(null);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [expensesNavTick, expensesSubTab]);
+
   const openEditModal = (expense: Expense) => {
     setEditingExpense(expense);
     setTitle(expense.title || expense.description);
@@ -279,6 +291,7 @@ export const AdminExpenses: React.FC = () => {
           )} logged under ${getCategoryLabel(category)}.`,
         });
         setIsModalOpen(false);
+        setExpensesSubTab('list');
       } else {
         setFormError(res.error || 'Failed to record expense.');
       }
@@ -699,6 +712,7 @@ export const AdminExpenses: React.FC = () => {
                 onClick={() => {
                   setIsModalOpen(false);
                   setEditingExpense(null);
+                  setExpensesSubTab('list');
                 }}
                 className="text-slate-400 hover:text-white p-1"
               >
@@ -809,6 +823,7 @@ export const AdminExpenses: React.FC = () => {
                   onClick={() => {
                     setIsModalOpen(false);
                     setEditingExpense(null);
+                    setExpensesSubTab('list');
                   }}
                   className="px-4 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 font-semibold transition"
                 >

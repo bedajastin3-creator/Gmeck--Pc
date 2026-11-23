@@ -111,7 +111,8 @@ export class VoiceSaleService {
    */
   static async parseAudio(
     audioBlob: Blob,
-    shopId: string | null
+    shopId: string | null,
+    authToken?: string
   ): Promise<VoiceSaleResult> {
     if (!audioBlob || audioBlob.size === 0) {
       throw new Error('No audio recorded');
@@ -121,7 +122,7 @@ export class VoiceSaleService {
     fd.append('audio', audioBlob, audioBlob.type.includes('mp4') ? 'sale.mp4' : 'sale.webm');
     if (shopId) fd.append('shopId', shopId);
 
-    const token = CloudflareApi.getToken?.() ?? '';
+    const token = authToken || (CloudflareApi.getToken?.() ?? '');
     const headers: HeadersInit = {};
     if (token) headers['Authorization'] = `Bearer ${token}`;
 

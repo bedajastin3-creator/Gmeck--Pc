@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   Boxes,
   AlertTriangle,
@@ -8,30 +8,107 @@ import {
   History,
   X,
   Search,
-  CheckCircle2,
-  Calendar,
   Printer,
+  Calendar,
   Store,
   ChevronDown,
   ChevronRight,
   Loader2,
+  Layers,
+  ArrowLeft,
+  Warehouse,
+  FileText,
+  FileSpreadsheet,
 } from 'lucide-react';
 import { useApp } from '../../context/AppContext';
 import { InventoryService } from '../../services/inventoryService';
+import { ExcelExportService } from '../../services/excelExportService';
 import { formatCurrency, formatDateTime } from '../../utils/formatters';
+import { printMovementsReportPdf } from '../../utils/movementsPrint';
+import {
+  downloadInventoryReportPdf,
+  downloadLossReportPdf,
+  downloadLowStockReportPdf,
+  InventoryExportMeta,
+  InventoryExportRow,
+  InventoryExportScope,
+} from '../../utils/pdfExport';
 import { Product } from '../../types';
 import { ProductThumbnail } from '../common/ProductThumbnail';
 import { ProductImageViewerModal } from '../common/ProductImageViewerModal';
+import {
+  getAdminManagedShops,
+  hasAdminAccess,
+  isPlatformAdmin,
+  isShopAdmin,
+} from '../../utils/permissions';
 
 const PAGE_SIZE = 10;
 
+type ShopLocationFilter = 'ALL' | 'SHOP' | 'STORE';
+type MovementPeriod = 'DAY' | 'WEEK' | 'MONTH' | 'CUSTOM';
+
+const formatDateYMD = (d: Date): string => {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+};
+
+const computeMovementDateRange = (
+  period: MovementPeriod,
+  now: Date = new Date()
+): { start: string; end: string } | null => {
+  const today = new Date(now);
+  today.setHours(0, 0, 0, 0);
+
+  if (period === 'DAY') {
+    const ymd = formatDateYMD(today);
+    return { start: ymd, end: ymd };
+  }
+  if (period === 'WEEK') {
+    const start = new Date(today);
+    start.setDate(start.getDate() - 6);
+    return { start: formatDateYMD(start), end: formatDateYMD(today) };
+  }
+  if (period === 'MONTH') {
+    const start = new Date(today.getFullYear(), today.getMonth(), 1);
+    return { start: formatDateYMD(start), end: formatDateYMD(today) };
+  }
+  return null;
+};
+
 export const AdminInventory: React.FC = () => {
-  const { currentUser, dbState, addToast, selectedShopId } = useApp();
+  const {
+    currentUser,
+    dbState,
+    addToast,
+    selectedShopId,
+    inventoryFilter,
+    setInventoryFilter,
+    inventoryNavTick,
+  } = useApp();
   const [activeTab, setActiveTabState] = useState<'stock' | 'movements' | 'losses'>('stock');
   const [searchQuery, setSearchQuery] = useState('');
   const [movementTypeFilter, setMovementTypeFilter] = useState('ALL');
   const [viewingProduct, setViewingProduct] = useState<Product | null>(null);
   const [isViewerOpen, setIsViewerOpen] = useState(false);
+  const [exportingKey, setExportingKey] = useState<string | null>(null);
+
+  // Per-shop inventory filter override (defaults to active menu inventoryFilter: ALL / SHOP / STORE)
+  const [shopLocationFilters, setShopLocationFilters] = useState<
+    Record<string, ShopLocationFilter>
+  >({});
+
+  // Full-screen Movements filters (default: Month, expand step: 10)
+  const [movementPeriod, setMovementPeriod] = useState<MovementPeriod>('MONTH');
+  const [movementStartDate, setMovementStartDate] = useState(
+    () => computeMovementDateRange('MONTH')!.start
+  );
+  const [movementEndDate, setMovementEndDate] = useState(
+    () => computeMovementDateRange('MONTH')!.end
+  );
+  const [movementsVisibleCount, setMovementsVisibleCount] = useState(PAGE_SIZE);
 
   // Collapse state per shop
   const [collapsedShops, setCollapsedShops] = useState<Set<string>>(new Set());
@@ -50,35 +127,219 @@ export const AdminInventory: React.FC = () => {
   // Stock Adjustment Modal
   const [isAdjustModalOpen, setIsAdjustModalOpen] = useState(false);
   const [selectedProductId, setSelectedProductId] = useState('');
-  const [adjustmentCategory, setAdjustmentCategory] = useState<'DAMAGED' | 'BROKEN' | 'EXPIRED' | 'LOST' | 'CORRECTION' | 'RESTOCK'>('DAMAGED');
+  const [adjustmentCategory, setAdjustmentCategory] = useState<
+    'DAMAGED' | 'BROKEN' | 'EXPIRED' | 'LOST' | 'CORRECTION' | 'RESTOCK'
+  >('DAMAGED');
   const [adjustmentType, setAdjustmentType] = useState<'IN' | 'OUT' | 'SET'>('OUT');
   const [quantityInput, setQuantityInput] = useState('0');
   const [reasonInput, setReasonInput] = useState('');
   const [modalError, setModalError] = useState('');
 
-  if (!currentUser) return null;
-  if (currentUser.role !== 'ADMIN' && !currentUser.permissions?.canManageInventory) return null;
+  useEffect(() => {
+    if (movementPeriod === 'CUSTOM') return;
+    const range = computeMovementDateRange(movementPeriod);
+    if (range) {
+      setMovementStartDate(range.start);
+      setMovementEndDate(range.end);
+    }
+  }, [movementPeriod]);
 
+  useEffect(() => {
+    setMovementsVisibleCount(PAGE_SIZE);
+  }, [
+    movementPeriod,
+    movementStartDate,
+    movementEndDate,
+    movementTypeFilter,
+    searchQuery,
+    selectedShopId,
+  ]);
+
+  // Reset per-shop overrides and open stock view whenever user selects All / Shop / Store Products from menu
+  useEffect(() => {
+    setShopLocationFilters({});
+    setVisibleCounts({});
+    setActiveTabState('stock');
+  }, [inventoryFilter, inventoryNavTick]);
+
+  if (!currentUser) return null;
+  if (!hasAdminAccess(currentUser) && !currentUser.permissions?.canManageInventory) return null;
+
+  const platformAdmin = isPlatformAdmin(currentUser);
+  const shopAdmin = isShopAdmin(currentUser);
   const settings = dbState.settings;
-  const shops = dbState.shops || [];
-  const valuation = InventoryService.getInventoryValuation(selectedShopId, currentUser);
+  const allShops = dbState.shops || [];
+  const shops = platformAdmin
+    ? allShops
+    : shopAdmin
+      ? getAdminManagedShops(currentUser, allShops)
+      : allShops.filter(s => (currentUser.assignedShopIds || []).includes(s.id));
+  const visibleShopIdSet = new Set(shops.map(s => s.id));
+  const visibleProducts = (dbState.products || []).filter(
+    p => platformAdmin || (!!p.shopId && visibleShopIdSet.has(p.shopId))
+  );
+  const visibleProductIds = new Set(visibleProducts.map(p => p.id));
+
+  const floorStoreIdSet = new Set(
+    (dbState.stores || []).filter(st => st.isShopFloor).map(st => st.id)
+  );
+
+  const getProductStoreQty = (p: Product): number => {
+    if (typeof p.storeStock === 'number' && Number.isFinite(p.storeStock)) {
+      return Math.max(0, p.storeStock);
+    }
+    if (p.storeStocks) {
+      return Object.entries(p.storeStocks).reduce(
+        (sum, [sid, q]) =>
+          floorStoreIdSet.has(sid) ? sum : sum + Math.max(0, Number(q || 0)),
+        0
+      );
+    }
+    return 0;
+  };
+
+  const getShopLocationFilter = (shopId: string): ShopLocationFilter =>
+    shopLocationFilters[shopId] ?? inventoryFilter;
+
+  const handleSetShopLocationFilter = (shopId: string, next: ShopLocationFilter) => {
+    setShopLocationFilters(prev => ({
+      ...prev,
+      [shopId]: next,
+    }));
+    setVisibleCounts(prev => ({
+      ...prev,
+      [shopId]: PAGE_SIZE,
+    }));
+  };
+
+  const handleSetGlobalInventoryScope = (next: ShopLocationFilter) => {
+    setInventoryFilter(next);
+    setShopLocationFilters({});
+    setVisibleCounts({});
+  };
+
+  // Location-aware valuation for top KPI cards (updates dynamically when switching All / Shop / Store)
+  const scopedValuationProducts = visibleProducts.filter(
+    p => selectedShopId === 'ALL' || p.shopId === selectedShopId
+  );
+
+  const activeScopeSet = new Set<ShopLocationFilter>();
+  const valuation = scopedValuationProducts.reduce(
+    (acc, p) => {
+      const hasValidShop = !!p.shopId && visibleShopIdSet.has(p.shopId);
+      const locFilter: ShopLocationFilter = hasValidShop
+        ? getShopLocationFilter(p.shopId)
+        : inventoryFilter;
+      activeScopeSet.add(locFilter);
+
+      const shopQty = Math.max(0, Number(p.currentStock || 0));
+      const storeQty = getProductStoreQty(p);
+      const activeQty =
+        locFilter === 'SHOP'
+          ? shopQty
+          : locFilter === 'STORE'
+            ? storeQty
+            : shopQty + storeQty;
+
+      const matchesLocation =
+        locFilter === 'SHOP'
+          ? shopQty > 0
+          : locFilter === 'STORE'
+            ? storeQty > 0
+            : true;
+
+      if (matchesLocation) {
+        acc.totalProducts += 1;
+      }
+
+      acc.totalUnitsInStock += activeQty;
+      const cost = activeQty * (p.purchasePrice || 0);
+      const retail = activeQty * (p.sellingPrice || 0);
+      acc.totalCostValue += cost;
+      acc.totalRetailValue += retail;
+
+      if (p.status === 'ACTIVE') {
+        if (activeQty <= 0) {
+          acc.outOfStockCount += 1;
+        } else if (activeQty <= p.minStock) {
+          acc.lowStockCount += 1;
+        }
+      }
+
+      return acc;
+    },
+    {
+      totalProducts: 0,
+      totalUnitsInStock: 0,
+      totalCostValue: 0,
+      totalRetailValue: 0,
+      potentialProfit: 0,
+      lowStockCount: 0,
+      outOfStockCount: 0,
+    }
+  );
+  valuation.totalCostValue = Number(valuation.totalCostValue.toFixed(2));
+  valuation.totalRetailValue = Number(valuation.totalRetailValue.toFixed(2));
+  valuation.potentialProfit = Number(
+    (valuation.totalRetailValue - valuation.totalCostValue).toFixed(2)
+  );
+
+  const activeValuationScope: ShopLocationFilter | 'MIXED' =
+    activeScopeSet.size === 1
+      ? Array.from(activeScopeSet)[0]
+      : activeScopeSet.size > 1
+        ? 'MIXED'
+        : inventoryFilter;
+
+  const valuationScopeLabel =
+    activeValuationScope === 'SHOP'
+      ? 'Shop stock only'
+      : activeValuationScope === 'STORE'
+        ? 'Store stock only'
+        : activeValuationScope === 'MIXED'
+          ? 'Filtered (Shop / Store)'
+          : 'All (Shop + Store)';
+
+  const valuationScopeColorClass =
+    activeValuationScope === 'SHOP'
+      ? 'text-emerald-400/90'
+      : activeValuationScope === 'STORE'
+        ? 'text-indigo-400/90'
+        : activeValuationScope === 'MIXED'
+          ? 'text-blue-400/90'
+          : 'text-slate-400';
+
+  // Exclude transfers from Movements — transfers are tracked exclusively in Stores & Transfers -> List
   const allMovements = InventoryService.getMovementHistory(
     {
       shopId: selectedShopId === 'ALL' ? undefined : selectedShopId,
       search: searchQuery,
     },
     currentUser
-  );
+  ).filter(m => m.type !== 'STORE_TRANSFER');
 
-  const movements = allMovements.filter(m => {
+  const movementsInPeriod = allMovements.filter(m => {
+    const parsed = new Date(m.createdAt);
+    if (Number.isNaN(parsed.getTime())) return false;
+    const ymd = formatDateYMD(parsed);
+    if (movementStartDate && ymd < movementStartDate) return false;
+    if (movementEndDate && ymd > movementEndDate) return false;
+    return true;
+  });
+
+  const movements = movementsInPeriod.filter(m => {
     if (movementTypeFilter === 'ALL') return true;
     return m.type === movementTypeFilter;
   });
 
-  const products = dbState.products.filter(p => {
+  const products = visibleProducts.filter(p => {
     const matchesShop = selectedShopId === 'ALL' || p.shopId === selectedShopId;
     const q = searchQuery.toLowerCase().trim();
-    const matchesSearch = !q || p.name.toLowerCase().includes(q) || p.sku.toLowerCase().includes(q);
+    const matchesSearch =
+      !q ||
+      p.name.toLowerCase().includes(q) ||
+      (p.variation || '').toLowerCase().includes(q) ||
+      p.sku.toLowerCase().includes(q);
     const matchesLowFilter = !showLowStockOnly || p.currentStock <= p.minStock;
     return matchesShop && matchesSearch && matchesLowFilter;
   });
@@ -91,12 +352,12 @@ export const AdminInventory: React.FC = () => {
     }))
     .filter(group => group.products.length > 0);
 
-  const productsWithNoShop = products.filter(
-    p => !shops.some(s => s.id === p.shopId)
-  );
+  const productsWithNoShop = platformAdmin
+    ? products.filter(p => !shops.some(s => s.id === p.shopId))
+    : [];
 
-  // Global low stock products (across all shops)
-  const allLowStockProducts = dbState.products.filter(
+  // Low stock products (scoped to visible/managed shops)
+  const allLowStockProducts = visibleProducts.filter(
     p => p.status === 'ACTIVE' && p.currentStock <= p.minStock
   );
 
@@ -138,12 +399,15 @@ export const AdminInventory: React.FC = () => {
     }));
   };
 
-  const selectedProduct = dbState.products.find(p => p.id === selectedProductId);
+  const selectedProduct = visibleProducts.find(p => p.id === selectedProductId);
   const inputQty = parseInt(quantityInput, 10) || 0;
-  const calculatedLossValue = selectedProduct ? (inputQty * (selectedProduct.purchasePrice || 0)) : 0;
+  const calculatedLossValue = selectedProduct ? inputQty * (selectedProduct.purchasePrice || 0) : 0;
 
-  const lossMovements = (dbState.movements || []).filter(m =>
-    ['DAMAGED', 'BROKEN', 'EXPIRED', 'LOST'].includes(m.type)
+  // Loss movements (scoped to visible/managed shops)
+  const lossMovements = (dbState.movements || []).filter(
+    m =>
+      ['DAMAGED', 'BROKEN', 'EXPIRED', 'LOST'].includes(m.type) &&
+      (platformAdmin || (m.shopId ? visibleShopIdSet.has(m.shopId) : visibleProductIds.has(m.productId)))
   );
 
   const filteredLosses = lossMovements.filter(m => {
@@ -170,7 +434,7 @@ export const AdminInventory: React.FC = () => {
     e.preventDefault();
     setModalError('');
 
-    const targetProduct = dbState.products.find(p => p.id === selectedProductId);
+    const targetProduct = visibleProducts.find(p => p.id === selectedProductId);
     if (!targetProduct) {
       setModalError('Please select a valid product.');
       return;
@@ -215,323 +479,427 @@ export const AdminInventory: React.FC = () => {
   };
 
   // ==============================
-  // PRINT LOW STOCK PDF
+  // DOWNLOAD INVENTORY PDF & EXCEL (Respects All / Shop / Store selection)
   // ==============================
-  const handlePrintLowStockReport = () => {
-    const printWindow = window.open('', '_blank', 'width=1200,height=800');
-    if (!printWindow) {
-      addToast({
-        type: 'error',
-        title: 'Popup Blocked',
-        description: 'Please allow popups to print the report.',
+  const buildWarehouseBreakdown = (p: Product): string => {
+    const allStores = dbState.stores || [];
+    const shopStores = allStores.filter(st => st.shopId === p.shopId && !st.isShopFloor);
+    const parts: string[] = [];
+
+    if (p.storeStocks && Object.keys(p.storeStocks).length > 0) {
+      Object.entries(p.storeStocks).forEach(([sid, qty]) => {
+        if (floorStoreIdSet.has(sid)) return;
+        const n = Math.max(0, Number(qty || 0));
+        if (n <= 0) return;
+        const st = allStores.find(s => s.id === sid);
+        parts.push(`${st?.name || 'Store'}: ${n}`);
       });
-      return;
     }
 
-    const lowStockByShop = shops
-      .map(shop => ({
-        shop,
-        products: allLowStockProducts.filter(p => p.shopId === shop.id),
-      }))
-      .filter(g => g.products.length > 0);
+    if (parts.length === 0) {
+      const fallbackQty = getProductStoreQty(p);
+      if (fallbackQty > 0) {
+        const matchedStore =
+          (p.storeId ? shopStores.find(s => s.id === p.storeId) : undefined) || shopStores[0];
+        parts.push(`${matchedStore?.name || 'Main Store'}: ${fallbackQty}`);
+      }
+    }
 
-    const totalUnitsNeeded = allLowStockProducts.reduce(
-      (sum, p) => sum + Math.max(0, p.minStock - p.currentStock),
-      0
-    );
+    return parts.join(', ');
+  };
 
-    const estimatedRestockCost = allLowStockProducts.reduce(
-      (sum, p) => sum + Math.max(0, p.minStock - p.currentStock) * p.purchasePrice,
-      0
-    );
+  const buildInventoryExportPayload = (
+    targetShopId?: string
+  ): { rows: InventoryExportRow[]; meta: InventoryExportMeta } => {
+    const rows: InventoryExportRow[] = [];
+    const scopesUsed = new Set<ShopLocationFilter>();
 
-    const printContent = `
-      <!DOCTYPE html>
-      <html>
-      <head>
-        <title>Low Stock Report - ${settings.businessName}</title>
-        <style>
-          * { margin: 0; padding: 0; box-sizing: border-box; }
-          body { font-family: 'Segoe UI', Tahoma, sans-serif; padding: 30px; color: #1e293b; background: #fff; }
+    const appendProductRow = (p: Product, shopName: string, mode: ShopLocationFilter) => {
+      const shopQty = Math.max(0, Number(p.currentStock || 0));
+      const storeQty = getProductStoreQty(p);
 
-          .header { text-align: center; margin-bottom: 25px; border-bottom: 3px double #f59e0b; padding-bottom: 20px; }
-          .header h1 { font-size: 26px; color: #b45309; margin-bottom: 6px; }
-          .header .company { font-size: 14px; color: #475569; }
-          .header .meta { font-size: 12px; color: #64748b; margin-top: 10px; }
+      if (mode === 'SHOP' && !(shopQty > 0 || (showLowStockOnly && storeQty === 0))) {
+        return;
+      }
+      if (mode === 'STORE' && !(storeQty > 0)) {
+        return;
+      }
 
-          .summary-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 15px; margin-bottom: 25px; }
-          .summary-card { padding: 16px; border-radius: 10px; text-align: center; color: #fff; }
-          .summary-card.count { background: linear-gradient(135deg, #f59e0b, #d97706); }
-          .summary-card.units { background: linear-gradient(135deg, #8b5cf6, #7c3aed); }
-          .summary-card.cost { background: linear-gradient(135deg, #dc2626, #991b1b); }
-          .summary-card .label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; opacity: 0.95; }
-          .summary-card .value { font-size: 22px; font-weight: bold; margin-top: 6px; }
+      const activeQty =
+        mode === 'SHOP' ? shopQty : mode === 'STORE' ? storeQty : shopQty + storeQty;
+      const buyPrice = Number(p.purchasePrice || 0);
+      const sellPrice = Number(p.sellingPrice || 0);
+      const buyValue = Number((activeQty * buyPrice).toFixed(2));
+      const sellValue = Number((activeQty * sellPrice).toFixed(2));
+      const potentialProfit = Number((sellValue - buyValue).toFixed(2));
 
-          .shop-section { margin-bottom: 25px; page-break-inside: avoid; }
-          .shop-header {
-            display: flex; justify-content: space-between; align-items: center;
-            padding: 12px 16px; background: #1e293b; color: #fff;
-            border-radius: 8px 8px 0 0;
-          }
-          .shop-header h2 { font-size: 15px; font-weight: bold; }
-          .shop-header .shop-stats { font-size: 11px; opacity: 0.85; }
+      let status: InventoryExportRow['status'] = 'IN STOCK';
+      if (p.status !== 'ACTIVE') {
+        status = 'INACTIVE';
+      } else if (activeQty <= 0) {
+        status = 'OUT OF STOCK';
+      } else if (activeQty <= Number(p.minStock || 0)) {
+        status = 'LOW STOCK';
+      }
 
-          table { width: 100%; border-collapse: collapse; font-size: 11px; }
-          thead { background: #f1f5f9; color: #334155; }
-          th { padding: 10px 8px; text-align: left; font-weight: 600; border-bottom: 2px solid #cbd5e1; }
-          td { padding: 9px 8px; border-bottom: 1px solid #e2e8f0; }
-          tr:nth-child(even) { background: #f8fafc; }
+      scopesUsed.add(mode);
+      rows.push({
+        shopName,
+        productName: p.name || 'Unnamed Product',
+        variation: p.variation || '',
+        sku: p.sku || '',
+        unit: p.unit || 'pcs',
+        shopQty,
+        storeQty,
+        totalQty: shopQty + storeQty,
+        activeQty,
+        rowScope: mode,
+        minStock: Number(p.minStock || 0),
+        purchasePrice: buyPrice,
+        sellingPrice: sellPrice,
+        buyValue,
+        sellValue,
+        potentialProfit,
+        storeBreakdown: buildWarehouseBreakdown(p),
+        status,
+      });
+    };
 
-          .sku { font-family: 'Courier New', monospace; font-size: 10px; color: #475569; }
-          .stock-current { font-weight: bold; color: #dc2626; font-family: 'Courier New', monospace; }
-          .stock-min { color: #475569; font-family: 'Courier New', monospace; }
-          .stock-needed { font-weight: bold; color: #b45309; font-family: 'Courier New', monospace; }
-          .cost { text-align: right; font-family: 'Courier New', monospace; font-weight: bold; color: #dc2626; }
-          .product-name { font-weight: 600; color: #1e293b; }
+    if (targetShopId) {
+      const targetGroup = groupedByShop.find(g => g.shop.id === targetShopId);
+      const shopObj = targetGroup?.shop || shops.find(s => s.id === targetShopId);
+      const mode = getShopLocationFilter(targetShopId);
+      scopesUsed.add(mode);
 
-          .footer {
-            text-align: center; margin-top: 30px; padding-top: 15px;
-            border-top: 2px solid #e2e8f0; font-size: 11px; color: #94a3b8;
-          }
+      if (targetGroup) {
+        targetGroup.products.forEach(p => appendProductRow(p, targetGroup.shop.name, mode));
+      }
 
-          .badge {
-            display: inline-block; padding: 2px 7px; border-radius: 4px;
-            font-size: 9px; font-weight: bold;
-          }
-          .badge.critical { background: #fee2e2; color: #991b1b; }
-          .badge.warning { background: #fef3c7; color: #92400e; }
+      return {
+        rows,
+        meta: {
+          scope: mode,
+          shopLabel: shopObj?.name || 'Shop',
+          searchQuery,
+          lowStockOnly: showLowStockOnly,
+        },
+      };
+    }
 
-          .empty-state {
-            text-align: center; padding: 40px; color: #64748b;
-            background: #f8fafc; border-radius: 8px;
-          }
-
-          @media print {
-            body { padding: 0; }
-            .shop-section { page-break-inside: avoid; }
-          }
-        </style>
-      </head>
-      <body>
-        <div class="header">
-          <h1>📦 Low Stock & Restock Report</h1>
-          <div class="company">${settings.businessName}</div>
-          <div class="meta">
-            Generated: ${new Date().toLocaleString()}<br>
-            Report covers: <strong>All Shops Combined</strong>
-          </div>
-        </div>
-
-        <div class="summary-grid">
-          <div class="summary-card count">
-            <div class="label">Low Stock Items</div>
-            <div class="value">${allLowStockProducts.length}</div>
-          </div>
-          <div class="summary-card units">
-            <div class="label">Units To Restock</div>
-            <div class="value">${totalUnitsNeeded}</div>
-          </div>
-          <div class="summary-card cost">
-            <div class="label">Estimated Restock Cost</div>
-            <div class="value">${settings.currencySymbol} ${estimatedRestockCost.toLocaleString()}</div>
-          </div>
-        </div>
-
-        ${
-          lowStockByShop.length === 0
-            ? `<div class="empty-state">
-                <h3 style="color:#16a34a; margin-bottom:8px;">✅ All Good!</h3>
-                <p>No low stock items found across any shop.</p>
-              </div>`
-            : lowStockByShop.map(group => `
-              <div class="shop-section">
-                <div class="shop-header">
-                  <h2>🏪 ${group.shop.name}</h2>
-                  <span class="shop-stats">
-                    Code: ${group.shop.code || 'UNIT'} • ${group.products.length} ${group.products.length === 1 ? 'item' : 'items'}
-                  </span>
-                </div>
-                <table>
-                  <thead>
-                    <tr>
-                      <th>Product Name</th>
-                      <th>SKU</th>
-                      <th style="text-align:center;">Current Stock</th>
-                      <th style="text-align:center;">Min Level</th>
-                      <th style="text-align:center;">Units Needed</th>
-                      <th style="text-align:right;">Cost / Unit</th>
-                      <th style="text-align:right;">Restock Cost</th>
-                      <th style="text-align:center;">Status</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    ${group.products.map(p => {
-                      const unitsNeeded = Math.max(0, p.minStock - p.currentStock);
-                      const restockCost = unitsNeeded * p.purchasePrice;
-                      const isCritical = p.currentStock <= 0;
-                      return `
-                        <tr>
-                          <td class="product-name">${p.name}</td>
-                          <td class="sku">${p.sku}</td>
-                          <td style="text-align:center;" class="stock-current">${p.currentStock} ${p.unit}</td>
-                          <td style="text-align:center;" class="stock-min">${p.minStock} ${p.unit}</td>
-                          <td style="text-align:center;" class="stock-needed">${unitsNeeded}</td>
-                          <td class="cost" style="color:#475569;">${settings.currencySymbol} ${p.purchasePrice.toLocaleString()}</td>
-                          <td class="cost">${settings.currencySymbol} ${restockCost.toLocaleString()}</td>
-                          <td style="text-align:center;">
-                            <span class="badge ${isCritical ? 'critical' : 'warning'}">
-                              ${isCritical ? 'OUT' : 'LOW'}
-                            </span>
-                          </td>
-                        </tr>
-                      `;
-                    }).join('')}
-                  </tbody>
-                </table>
-              </div>
-            `).join('')
-        }
-
-        <div class="footer">
-          ${settings.businessName} • ${settings.address || ''}<br>
-          Phone: ${settings.phone || 'N/A'} • This report was auto-generated by the Gmeck Company Limited system
-        </div>
-
-        <script>window.onload = function() { window.print(); }</script>
-      </body>
-      </html>
-    `;
-
-    printWindow.document.write(printContent);
-    printWindow.document.close();
-
-    addToast({
-      type: 'success',
-      title: 'Low Stock Report',
-      description: `Print dialog opened with ${allLowStockProducts.length} low stock items.`,
+    // Global export across all currently visible shops (respecting selectedShopId + per-shop All/Shop/Store)
+    groupedByShop.forEach(({ shop, products: shopProducts }) => {
+      const mode = getShopLocationFilter(shop.id);
+      scopesUsed.add(mode);
+      shopProducts.forEach(p => appendProductRow(p, shop.name, mode));
     });
+
+    if (productsWithNoShop.length > 0) {
+      scopesUsed.add(inventoryFilter);
+      productsWithNoShop.forEach(p => appendProductRow(p, 'Unassigned', inventoryFilter));
+    }
+
+    const resolvedScope: InventoryExportScope =
+      scopesUsed.size === 1
+        ? Array.from(scopesUsed)[0]
+        : scopesUsed.size > 1
+          ? 'MIXED'
+          : activeValuationScope;
+
+    const selectedShopObj =
+      selectedShopId !== 'ALL' ? shops.find(s => s.id === selectedShopId) : undefined;
+    const shopLabel = selectedShopObj
+      ? selectedShopObj.name
+      : shopAdmin && !platformAdmin
+        ? shops.length === 1
+          ? shops[0].name
+          : 'Managed Shops'
+        : 'All Shops';
+
+    return {
+      rows,
+      meta: {
+        scope: resolvedScope,
+        shopLabel,
+        searchQuery,
+        lowStockOnly: showLowStockOnly,
+      },
+    };
   };
 
-  // Print Loss Report
-  const handlePrintLossReport = () => {
-    const printWindow = window.open('', '_blank', 'width=1200,height=800');
-    if (!printWindow) return;
+  const getScopeShortText = (scope: InventoryExportScope): string => {
+    if (scope === 'SHOP') return 'Shop';
+    if (scope === 'STORE') return 'Store';
+    if (scope === 'MIXED') return 'Filtered';
+    return 'All';
+  };
 
-    const printContent = `
-      <!DOCTYPE html>
-      <html>
-      <head>
-        <title>Stock Loss Report</title>
-        <style>
-          * { margin: 0; padding: 0; box-sizing: border-box; }
-          body { font-family: 'Segoe UI', sans-serif; padding: 30px; color: #1e293b; }
-          .header { text-align: center; margin-bottom: 25px; border-bottom: 3px double #dc2626; padding-bottom: 20px; }
-          .header h1 { font-size: 24px; color: #dc2626; }
-          .header .meta { font-size: 12px; color: #64748b; margin-top: 8px; }
-          .summary { display: grid; grid-template-columns: repeat(3, 1fr); gap: 15px; margin-bottom: 20px; }
-          .summary-card { padding: 15px; border-radius: 8px; text-align: center; color: #fff; }
-          .summary-card.total-value { background: linear-gradient(135deg, #dc2626, #991b1b); }
-          .summary-card.total-units { background: linear-gradient(135deg, #f59e0b, #d97706); }
-          .summary-card.count { background: linear-gradient(135deg, #8b5cf6, #7c3aed); }
-          .summary-card .label { font-size: 11px; text-transform: uppercase; }
-          .summary-card .value { font-size: 20px; font-weight: bold; margin-top: 5px; }
-          table { width: 100%; border-collapse: collapse; font-size: 12px; }
-          thead { background: #1e293b; color: #fff; }
-          th { padding: 10px; text-align: left; }
-          td { padding: 8px; border-bottom: 1px solid #e2e8f0; }
-          tr:nth-child(even) { background: #fef2f2; }
-          .loss-type { color: #dc2626; font-weight: bold; }
-          .footer { text-align: center; margin-top: 20px; font-size: 11px; color: #94a3b8; }
-        </style>
-      </head>
-      <body>
-        <div class="header">
-          <h1>📦 Stock Loss Report</h1>
-          <div class="meta">Period: ${lossPeriod.toUpperCase()} | Generated: ${new Date().toLocaleString()}</div>
-        </div>
-        <div class="summary">
-          <div class="summary-card total-value">
-            <div class="label">Total Loss Value</div>
-            <div class="value">${settings.currencySymbol} ${totalLossValue.toLocaleString()}</div>
-          </div>
-          <div class="summary-card total-units">
-            <div class="label">Total Units Lost</div>
-            <div class="value">${totalLossUnits}</div>
-          </div>
-          <div class="summary-card count">
-            <div class="label">Loss Records</div>
-            <div class="value">${filteredLosses.length}</div>
-          </div>
-        </div>
-        <table>
-          <thead>
-            <tr>
-              <th>Date</th>
-              <th>Product</th>
-              <th>Type</th>
-              <th>Qty Lost</th>
-              <th>Loss Value</th>
-              <th>Reason</th>
-              <th>Recorded By</th>
-            </tr>
-          </thead>
-          <tbody>
-            ${filteredLosses.map(m => `
-              <tr>
-                <td>${formatDateTime(m.createdAt)}</td>
-                <td><strong>${m.productName}</strong></td>
-                <td class="loss-type">${m.type}</td>
-                <td>${Math.abs(m.changeQty)}</td>
-                <td>${settings.currencySymbol} ${(m.costValue || 0).toLocaleString()}</td>
-                <td>${m.reason}</td>
-                <td>${m.userName}</td>
-              </tr>
-            `).join('') || '<tr><td colspan="7" style="text-align:center;">No loss records found</td></tr>'}
-          </tbody>
-        </table>
-        <div class="footer">${settings.businessName} - Stock Loss Report</div>
-        <script>window.onload = function() { window.print(); }</script>
-      </body>
-      </html>
-    `;
+  const handleDownloadInventoryPdf = async (targetShopId?: string) => {
+    const key = `pdf:${targetShopId || 'ALL'}`;
+    if (exportingKey) return;
+    setExportingKey(key);
+    try {
+      const { rows, meta } = buildInventoryExportPayload(targetShopId);
+      if (rows.length === 0) {
+        addToast({
+          type: 'warning',
+          title: 'Nothing to Export',
+          description: `No ${getScopeShortText(meta.scope).toLowerCase()} inventory items match your current selection.`,
+        });
+        return;
+      }
 
-    printWindow.document.write(printContent);
-    printWindow.document.close();
+      const ok = await downloadInventoryReportPdf(rows, settings, meta);
+      if (ok) {
+        addToast({
+          type: 'success',
+          title: `${getScopeShortText(meta.scope)} Inventory PDF Downloaded`,
+          description: `Exported ${rows.length} product(s) for ${meta.shopLabel} (${getScopeShortText(meta.scope)}).`,
+        });
+      } else {
+        addToast({
+          type: 'error',
+          title: 'PDF Export Failed',
+          description: 'Could not save inventory PDF report on this device.',
+        });
+      }
+    } finally {
+      setExportingKey(null);
+    }
+  };
+
+  const handleDownloadInventoryExcel = async (targetShopId?: string) => {
+    const key = `excel:${targetShopId || 'ALL'}`;
+    if (exportingKey) return;
+    setExportingKey(key);
+    try {
+      const { rows, meta } = buildInventoryExportPayload(targetShopId);
+      if (rows.length === 0) {
+        addToast({
+          type: 'warning',
+          title: 'Nothing to Export',
+          description: `No ${getScopeShortText(meta.scope).toLowerCase()} inventory items match your current selection.`,
+        });
+        return;
+      }
+
+      const res = await ExcelExportService.exportInventoryReport(rows, settings, meta);
+      if (res.success) {
+        addToast({
+          type: 'success',
+          title: `${getScopeShortText(meta.scope)} Inventory Excel Downloaded`,
+          description: `Saved ${res.fileName} with ${res.rowCount || rows.length} product(s).`,
+        });
+      } else {
+        addToast({
+          type: 'error',
+          title: 'Excel Export Failed',
+          description: res.error || 'Could not save inventory Excel file on this device.',
+        });
+      }
+    } finally {
+      setExportingKey(null);
+    }
   };
 
   // ==============================
-  // SHARED: RENDER PRODUCT TABLE ROW
+  // DOWNLOAD LOW STOCK PDF
   // ==============================
-  const renderStockRow = (p: Product) => {
-    const isLow = p.currentStock <= p.minStock;
-    const isOut = p.currentStock <= 0;
+  const handlePrintLowStockReport = async () => {
+    const scopeLabel =
+      shopAdmin && !platformAdmin
+        ? shops.length === 1
+          ? shops[0].name
+          : 'Managed Shops'
+        : 'All Shops Combined';
+
+    const ok = await downloadLowStockReportPdf(allLowStockProducts, shops, settings, scopeLabel);
+    if (ok) {
+      addToast({
+        type: 'success',
+        title: 'Low Stock PDF Downloaded',
+        description: `Saved PDF with ${allLowStockProducts.length} low stock item(s) to Downloads.`,
+      });
+    } else {
+      addToast({
+        type: 'error',
+        title: 'PDF Export Failed',
+        description: 'Could not save low stock PDF report on this device.',
+      });
+    }
+  };
+
+  // Download Stock Loss Report PDF
+  const handlePrintLossReport = async () => {
+    const ok = await downloadLossReportPdf(filteredLosses, settings, {
+      periodLabel: lossPeriod.toUpperCase(),
+      totalLossValue,
+      totalLossUnits,
+    });
+    if (ok) {
+      addToast({
+        type: 'success',
+        title: 'Loss Report PDF Downloaded',
+        description: `Saved PDF with ${filteredLosses.length} loss record(s) to Downloads.`,
+      });
+    } else {
+      addToast({
+        type: 'error',
+        title: 'PDF Export Failed',
+        description: 'Could not save stock loss PDF report on this device.',
+      });
+    }
+  };
+
+  // Download Full-Screen Movements Report PDF
+  const handlePrintMovementsReport = async () => {
+    const periodLabel =
+      movementPeriod === 'DAY'
+        ? `Day (${movementStartDate})`
+        : movementPeriod === 'WEEK'
+          ? `Week (${movementStartDate} -> ${movementEndDate})`
+          : movementPeriod === 'MONTH'
+            ? `Month (${movementStartDate} -> ${movementEndDate})`
+            : `Custom (${movementStartDate || '...'} -> ${movementEndDate || '...'})`;
+
+    const typeLabel =
+      movementTypeFilter === 'ALL' ? 'All Movement Types (No Transfers)' : movementTypeFilter;
+    const shopObj = selectedShopId !== 'ALL' ? shops.find(s => s.id === selectedShopId) : undefined;
+    const shopLabel = shopObj
+      ? shopObj.name
+      : shopAdmin && !platformAdmin
+        ? shops.length === 1
+          ? shops[0].name
+          : 'Managed Shops'
+        : 'All Shops';
+
+    const ok = await printMovementsReportPdf(movements, settings, {
+      periodLabel,
+      typeLabel,
+      shopLabel,
+    });
+    if (ok) {
+      addToast({
+        type: 'success',
+        title: 'Movements PDF Downloaded',
+        description: `Saved PDF with ${movements.length} movement record(s) to Downloads.`,
+      });
+    } else {
+      addToast({
+        type: 'error',
+        title: 'PDF Export Failed',
+        description: 'Could not save movements PDF report on this device.',
+      });
+    }
+  };
+
+  // ==============================
+  // STOCK ROW (Desktop Table) & CARD (Mobile)
+  // ==============================
+  const renderStockRow = (p: Product, mode: ShopLocationFilter = 'ALL') => {
+    const shopQty = Math.max(0, Number(p.currentStock || 0));
+    const storeQty = getProductStoreQty(p);
+    const displayQty = mode === 'STORE' ? storeQty : mode === 'SHOP' ? shopQty : shopQty + storeQty;
+    const isLow = mode !== 'STORE' && shopQty <= p.minStock;
+    const isOut = displayQty <= 0;
+
+    const unitBuyPrice = Number(p.purchasePrice || 0);
+    const unitSellingPrice = Number(p.sellingPrice || 0);
+    const totalBuyVal = displayQty * unitBuyPrice;
+    const totalSellVal = displayQty * unitSellingPrice;
+
+    const warehouseStoreEntries = p.storeStocks
+      ? Object.entries(p.storeStocks).filter(([sid, q]) => !floorStoreIdSet.has(sid) && Number(q || 0) > 0)
+      : [];
 
     return (
       <tr key={p.id} className="hover:bg-slate-850/60 transition">
-        <td className="py-3 px-4 font-mono text-slate-400">{p.sku}</td>
-        <td className="py-3 px-4 font-semibold text-white">
-          <div className="flex items-center gap-2.5">
-            <ProductThumbnail product={p} size="sm" onClick={() => { setViewingProduct(p); setIsViewerOpen(true); }} />
-            <span className="truncate">{p.name}</span>
+        <td className="py-3 px-4 font-mono text-slate-400 text-[11px]">{p.sku}</td>
+        <td className="py-3 px-4">
+          <div className="flex items-center gap-2.5 min-w-0">
+            <ProductThumbnail
+              product={p}
+              size="sm"
+              onClick={() => {
+                setViewingProduct(p);
+                setIsViewerOpen(true);
+              }}
+            />
+            <div className="min-w-0">
+              <div className="flex items-center gap-1.5 flex-wrap">
+                <span className="font-semibold text-white truncate">{p.name}</span>
+                {p.variation && (
+                  <span className="px-1.5 py-0.5 rounded bg-violet-500/15 text-violet-300 border border-violet-500/25 text-[9px] font-semibold inline-flex items-center gap-0.5">
+                    <Layers className="w-2.5 h-2.5" />
+                    {p.variation}
+                  </span>
+                )}
+              </div>
+              {mode !== 'SHOP' && warehouseStoreEntries.length > 0 && (
+                <div className="flex flex-wrap gap-1 mt-1 text-[9px]">
+                  {warehouseStoreEntries.map(([sid, qty]) => {
+                    const st = (dbState.stores || []).find(s => s.id === sid);
+                    return (
+                      <span
+                        key={sid}
+                        className="px-1.5 py-0.5 rounded bg-slate-950 border border-slate-800 text-slate-300 font-mono"
+                      >
+                        {st?.name || 'Store'}: {qty}
+                      </span>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
           </div>
         </td>
         <td className="py-3 px-4 text-center">
-          <span className={`font-mono font-bold px-2 py-0.5 rounded text-[11px] ${
-            isOut ? 'bg-rose-500/20 text-rose-400 border border-rose-500/30'
-            : isLow ? 'bg-amber-500/20 text-amber-300 border border-amber-500/30'
-            : 'bg-emerald-500/15 text-emerald-300'
-          }`}>
-            {p.currentStock} {p.unit}
-          </span>
+          <div className="inline-flex flex-col items-center gap-0.5">
+            <span
+              className={`font-mono font-bold px-2 py-0.5 rounded text-[11px] ${
+                mode === 'STORE'
+                  ? isOut
+                    ? 'bg-rose-500/20 text-rose-400 border border-rose-500/30'
+                    : 'bg-indigo-500/20 text-indigo-300 border border-indigo-500/30'
+                  : isOut
+                    ? 'bg-rose-500/20 text-rose-400 border border-rose-500/30'
+                    : isLow
+                      ? 'bg-amber-500/20 text-amber-300 border border-amber-500/30'
+                      : 'bg-emerald-500/15 text-emerald-300'
+              }`}
+            >
+              {mode === 'ALL' ? `${shopQty} Shop` : `${displayQty} ${p.unit}`}
+            </span>
+            {mode === 'ALL' && storeQty > 0 && (
+              <span className="font-mono text-[10px] text-indigo-300">
+                + {storeQty} Store
+              </span>
+            )}
+          </div>
         </td>
-        <td className="py-3 px-4 text-center font-mono text-slate-400">{p.minStock} {p.unit}</td>
-        <td className="py-3 px-4 text-right font-mono text-slate-400">{formatCurrency(p.purchasePrice, settings.currencySymbol)}</td>
-        <td className="py-3 px-4 text-right font-mono text-purple-300 font-medium">{formatCurrency(p.currentStock * p.purchasePrice, settings.currencySymbol)}</td>
-        <td className="py-3 px-4 text-right font-mono text-emerald-400 font-bold">{formatCurrency(p.currentStock * p.sellingPrice, settings.currencySymbol)}</td>
+        <td className="py-3 px-4 text-center font-mono text-slate-400">
+          {p.minStock} {p.unit}
+        </td>
+        <td className="py-3 px-4 text-right font-mono text-slate-300">
+          {formatCurrency(unitBuyPrice, settings.currencySymbol)}
+        </td>
+        <td className="py-3 px-4 text-right font-mono text-emerald-300">
+          {formatCurrency(unitSellingPrice, settings.currencySymbol)}
+        </td>
+        <td className="py-3 px-4 text-right font-mono text-purple-300 font-medium">
+          {formatCurrency(totalBuyVal, settings.currencySymbol)}
+        </td>
+        <td className="py-3 px-4 text-right font-mono text-emerald-400 font-bold">
+          {formatCurrency(totalSellVal, settings.currencySymbol)}
+        </td>
         <td className="py-3 px-4 text-right">
           <button
-            onClick={() => { setSelectedProductId(p.id); setQuantityInput('0'); setAdjustmentType('OUT'); setIsAdjustModalOpen(true); }}
-            className="px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 text-[11px] font-medium transition"
+            onClick={() => {
+              setSelectedProductId(p.id);
+              setQuantityInput('0');
+              setAdjustmentType('OUT');
+              setIsAdjustModalOpen(true);
+            }}
+            className="px-2.5 py-1 rounded-lg bg-blue-600/20 hover:bg-blue-600 text-blue-300 hover:text-white border border-blue-500/30 text-[11px] font-semibold transition"
           >
             Adjust
           </button>
@@ -540,25 +908,241 @@ export const AdminInventory: React.FC = () => {
     );
   };
 
-  return (
-    <div id="admin-inventory-view" className="flex-1 p-6 bg-slate-950 text-slate-100 overflow-y-auto">
-      {/* Header */}
-      <div className="flex flex-wrap items-center justify-between gap-4 mb-6 pb-4 border-b border-slate-800">
-        <div>
-          <h2 className="text-xl font-bold text-white tracking-tight">Inventory & Stock Control</h2>
-          <p className="text-xs text-slate-400 mt-0.5">
-            Monitor real-time warehouse stock, track losses, and perform stock adjustments
-          </p>
+  const renderStockCard = (p: Product, mode: ShopLocationFilter = 'ALL') => {
+    const shopQty = Math.max(0, Number(p.currentStock || 0));
+    const storeQty = getProductStoreQty(p);
+    const displayQty = mode === 'STORE' ? storeQty : shopQty;
+    const isLow = mode !== 'STORE' && shopQty <= p.minStock;
+    const isOut = displayQty <= 0;
+
+    const unitBuyPrice = Number(p.purchasePrice || 0);
+    const unitSellingPrice = Number(p.sellingPrice || 0);
+
+    const warehouseStoreEntries = p.storeStocks
+      ? Object.entries(p.storeStocks).filter(([sid]) => !floorStoreIdSet.has(sid))
+      : [];
+
+    const stockLabel =
+      mode === 'SHOP'
+        ? 'Shop'
+        : mode === 'STORE'
+          ? 'Store'
+          : storeQty > 0
+            ? 'Shop / Store'
+            : 'Shop';
+
+    return (
+      <div key={p.id} className="p-3.5 space-y-2.5">
+        <div className="flex items-start justify-between gap-2">
+          <div className="flex items-center gap-2.5 min-w-0 flex-1">
+            <ProductThumbnail
+              product={p}
+              size="sm"
+              onClick={() => {
+                setViewingProduct(p);
+                setIsViewerOpen(true);
+              }}
+            />
+            <div className="min-w-0">
+              <div className="flex items-center gap-1.5 flex-wrap">
+                <h4 className="font-bold text-xs text-white truncate">{p.name}</h4>
+                {p.variation && (
+                  <span className="px-1.5 py-0.5 rounded bg-violet-500/15 text-violet-300 border border-violet-500/25 text-[9px] font-semibold inline-flex items-center gap-0.5">
+                    <Layers className="w-2.5 h-2.5" />
+                    {p.variation}
+                  </span>
+                )}
+              </div>
+              <p className="text-[10px] font-mono text-slate-400 mt-0.5">SKU: {p.sku}</p>
+            </div>
+          </div>
+
+          <button
+            onClick={() => {
+              setSelectedProductId(p.id);
+              setQuantityInput('0');
+              setAdjustmentType('OUT');
+              setIsAdjustModalOpen(true);
+            }}
+            className="px-2.5 py-1.5 rounded-lg bg-blue-600/20 hover:bg-blue-600 active:bg-blue-700 text-blue-300 hover:text-white border border-blue-500/30 text-xs font-semibold shrink-0 transition"
+          >
+            Adjust
+          </button>
         </div>
 
-        <div className="flex items-center gap-2">
+        <div className="grid grid-cols-3 gap-2 text-center text-xs">
+          <div className="bg-slate-950/60 p-2 rounded-lg border border-slate-800">
+            <div className="text-[9px] text-slate-400">{stockLabel}</div>
+            <div
+              className={`font-mono text-[11px] font-bold ${
+                mode === 'STORE'
+                  ? isOut
+                    ? 'text-rose-400'
+                    : 'text-blue-400'
+                  : isOut
+                    ? 'text-rose-400'
+                    : isLow
+                      ? 'text-amber-300'
+                      : 'text-emerald-400'
+              }`}
+            >
+              {displayQty} {p.unit}
+            </div>
+            {mode === 'ALL' && storeQty > 0 && (
+              <div className="font-mono text-[10px] text-blue-400 mt-0.5">
+                Store: {storeQty} {p.unit}
+              </div>
+            )}
+          </div>
+          <div className="bg-slate-950/60 p-2 rounded-lg border border-slate-800">
+            <div className="text-[9px] text-slate-400">Buy Price</div>
+            <div className="font-mono text-[11px] text-purple-300 font-medium truncate">
+              {formatCurrency(unitBuyPrice, settings.currencySymbol)}
+            </div>
+          </div>
+          <div className="bg-slate-950/60 p-2 rounded-lg border border-slate-800">
+            <div className="text-[9px] text-slate-400">Selling Price</div>
+            <div className="font-mono text-[11px] text-emerald-400 font-bold truncate">
+              {formatCurrency(unitSellingPrice, settings.currencySymbol)}
+            </div>
+          </div>
+        </div>
+
+        {mode !== 'SHOP' && warehouseStoreEntries.length > 0 && (
+          <div className="flex flex-wrap gap-1 text-[10px]">
+            {warehouseStoreEntries.map(([sid, qty]) => {
+              const st = (dbState.stores || []).find(s => s.id === sid);
+              return (
+                <span
+                  key={sid}
+                  className="px-1.5 py-0.5 rounded bg-slate-950 border border-slate-800 text-slate-300 font-mono"
+                >
+                  {st?.name || 'Store'}: {qty}
+                </span>
+              );
+            })}
+          </div>
+        )}
+
+        {((p.historicalUnitsSold || 0) > 0 ||
+          (p.historicalUnitsTransferred || 0) > 0 ||
+          (p.historicalUnitsAdjusted || 0) > 0) && (
+          <div className="flex items-center justify-between gap-2 px-2 py-1 rounded bg-amber-950/20 border border-amber-500/20 text-[10px] text-amber-200/90">
+            <span className="inline-flex items-center gap-1">
+              <History className="w-3 h-3 text-amber-400" />
+              {p.historicalNote || 'Historical date unavailable'}
+            </span>
+            <span className="font-mono">
+              Sold: {p.historicalUnitsSold || 0} · Trf: {p.historicalUnitsTransferred || 0} · Adj:{' '}
+              {p.historicalUnitsAdjusted || 0}
+            </span>
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  return (
+    <div
+      id="admin-inventory-view"
+      className="flex-1 p-3.5 sm:p-6 bg-slate-950 text-slate-100 overflow-y-auto pb-24 sm:pb-6"
+    >
+      {/* Header */}
+      <div className="flex flex-col gap-3 mb-5 pb-4 border-b border-slate-800">
+        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2.5">
+          <div>
+            <h2 className="text-lg sm:text-xl font-bold text-white tracking-tight">
+              {activeValuationScope === 'SHOP'
+                ? 'Shop Inventory'
+                : activeValuationScope === 'STORE'
+                  ? 'Store Inventory'
+                  : 'All Inventories'}
+            </h2>
+            <p className="text-xs text-slate-400 mt-0.5">
+              Monitor real-time stock levels, buying &amp; selling prices, losses, and adjustments
+            </p>
+          </div>
+
+          {/* Global Scope Selector: All / Shop / Store */}
+          <div className="grid grid-cols-3 gap-1 bg-slate-900 border border-slate-800 rounded-xl p-1 text-xs font-semibold shrink-0">
+            <button
+              type="button"
+              onClick={() => handleSetGlobalInventoryScope('ALL')}
+              className={`px-3 py-1.5 rounded-lg transition ${
+                activeValuationScope === 'ALL'
+                  ? 'bg-blue-600 text-white shadow-sm'
+                  : 'text-slate-400 hover:text-white'
+              }`}
+            >
+              All
+            </button>
+            <button
+              type="button"
+              onClick={() => handleSetGlobalInventoryScope('SHOP')}
+              className={`flex items-center justify-center gap-1 px-3 py-1.5 rounded-lg transition ${
+                activeValuationScope === 'SHOP'
+                  ? 'bg-emerald-600 text-white shadow-sm'
+                  : 'text-slate-400 hover:text-white'
+              }`}
+            >
+              <Store className="w-3.5 h-3.5" />
+              <span>Shop</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => handleSetGlobalInventoryScope('STORE')}
+              className={`flex items-center justify-center gap-1 px-3 py-1.5 rounded-lg transition ${
+                activeValuationScope === 'STORE'
+                  ? 'bg-indigo-600 text-white shadow-sm'
+                  : 'text-slate-400 hover:text-white'
+              }`}
+            >
+              <Warehouse className="w-3.5 h-3.5" />
+              <span>Store</span>
+            </button>
+          </div>
+        </div>
+
+        {/* Action Toolbar: PDF / Excel / Low Stock PDF / Manual Stock Adjustment */}
+        <div className="grid grid-cols-2 lg:grid-cols-4 gap-2">
+          <button
+            type="button"
+            disabled={exportingKey !== null}
+            onClick={() => handleDownloadInventoryPdf()}
+            className="flex items-center justify-center gap-2 px-3.5 py-2.5 rounded-xl bg-rose-600 hover:bg-rose-500 active:bg-rose-700 disabled:opacity-60 text-white font-semibold text-xs shadow-lg transition"
+          >
+            {exportingKey === 'pdf:ALL' ? (
+              <Loader2 className="w-4 h-4 animate-spin" />
+            ) : (
+              <FileText className="w-4 h-4 shrink-0" />
+            )}
+            <span className="truncate">
+              Download PDF ({getScopeShortText(activeValuationScope)})
+            </span>
+          </button>
+
+          <button
+            type="button"
+            disabled={exportingKey !== null}
+            onClick={() => handleDownloadInventoryExcel()}
+            className="flex items-center justify-center gap-2 px-3.5 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 active:bg-emerald-700 disabled:opacity-60 text-white font-semibold text-xs shadow-lg transition"
+          >
+            {exportingKey === 'excel:ALL' ? (
+              <Loader2 className="w-4 h-4 animate-spin" />
+            ) : (
+              <FileSpreadsheet className="w-4 h-4 shrink-0" />
+            )}
+            <span className="truncate">
+              Download Excel ({getScopeShortText(activeValuationScope)})
+            </span>
+          </button>
+
           <button
             onClick={handlePrintLowStockReport}
-            className="flex items-center gap-2 px-4 py-2.5 rounded-xl bg-amber-600 hover:bg-amber-500 text-white font-semibold text-xs shadow-lg transition"
-            title="Download PDF list of all low-stock products across every shop"
+            className="flex items-center justify-center gap-2 px-3.5 py-2.5 rounded-xl bg-amber-600 hover:bg-amber-500 active:bg-amber-700 text-white font-semibold text-xs shadow-lg transition"
           >
-            <Printer className="w-4 h-4" />
-            <span>Low Stock Report (PDF)</span>
+            <Printer className="w-4 h-4 shrink-0" />
+            <span className="truncate">Low Stock Report (PDF)</span>
             {allLowStockProducts.length > 0 && (
               <span className="px-1.5 py-0.5 rounded-full bg-white/20 text-[10px] font-bold">
                 {allLowStockProducts.length}
@@ -567,108 +1151,137 @@ export const AdminInventory: React.FC = () => {
           </button>
 
           <button
+            id="stock-adjust-btn"
             onClick={() => {
-              setSelectedProductId(dbState.products[0]?.id || '');
+              setSelectedProductId(visibleProducts[0]?.id || '');
               setQuantityInput('0');
               setAdjustmentType('OUT');
               setAdjustmentCategory('DAMAGED');
               setIsAdjustModalOpen(true);
             }}
-            className="flex items-center gap-2 px-4 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-500 text-white font-semibold text-xs shadow-lg transition"
+            className="flex items-center justify-center gap-2 px-3.5 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-500 active:bg-blue-700 text-white font-semibold text-xs shadow-lg transition"
           >
-            <ArrowUpDown className="w-4 h-4" />
-            <span>Manual Stock Adjustment</span>
+            <ArrowUpDown className="w-4 h-4 shrink-0" />
+            <span className="truncate">Manual Stock Adjustment</span>
           </button>
         </div>
       </div>
 
       {/* Valuation & Stock Metrics */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
-        <div className="p-4 bg-slate-900 border border-slate-800 rounded-xl">
-          <div className="flex items-center justify-between text-slate-400 mb-2">
-            <span className="text-xs font-semibold uppercase tracking-wider">Total SKUs</span>
-            <Boxes className="w-4 h-4 text-blue-400" />
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-2.5 sm:gap-4 mb-5">
+        <div className="p-3 sm:p-4 bg-slate-900 border border-slate-800 rounded-xl">
+          <div className="flex items-center justify-between text-slate-400 mb-1.5">
+            <span className="text-[10px] sm:text-xs font-semibold uppercase tracking-wider">
+              Total SKUs
+            </span>
+            <Boxes className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-blue-400" />
           </div>
-          <div className="text-2xl font-bold text-white font-mono">{valuation.totalProducts}</div>
-          <p className="text-[11px] text-slate-400 mt-1">{valuation.totalUnitsInStock} total units in stock</p>
+          <div className="text-lg sm:text-2xl font-bold text-white font-mono">
+            {valuation.totalProducts}
+          </div>
+          <p className="text-[10px] sm:text-[11px] text-slate-400 mt-0.5 truncate">
+            {valuation.totalUnitsInStock.toLocaleString()} total units
+          </p>
         </div>
 
-        <div className="p-4 bg-slate-900 border border-slate-800 rounded-xl">
-          <div className="flex items-center justify-between text-slate-400 mb-2">
-            <span className="text-xs font-semibold uppercase tracking-wider">Low / Out of Stock</span>
-            <AlertTriangle className="w-4 h-4 text-amber-400" />
+        <div className="p-3 sm:p-4 bg-slate-900 border border-slate-800 rounded-xl">
+          <div className="flex items-center justify-between text-slate-400 mb-1.5">
+            <span className="text-[10px] sm:text-xs font-semibold uppercase tracking-wider">
+              Low / Out
+            </span>
+            <AlertTriangle className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-amber-400" />
           </div>
-          <div className="text-2xl font-bold text-amber-300 font-mono">
+          <div className="text-lg sm:text-2xl font-bold text-amber-300 font-mono">
             {valuation.lowStockCount}{' '}
-            <span className="text-sm font-normal text-rose-400">({valuation.outOfStockCount} zero)</span>
+            <span className="text-[10px] sm:text-sm font-normal text-rose-400">
+              ({valuation.outOfStockCount} zero)
+            </span>
           </div>
-          <p className="text-[11px] text-slate-400 mt-1">Requires procurement restock</p>
+          <p className="text-[10px] sm:text-[11px] text-slate-400 mt-0.5 truncate">
+            {activeValuationScope === 'SHOP'
+              ? 'Shop stock status'
+              : activeValuationScope === 'STORE'
+                ? 'Store stock status'
+                : 'Needs restock'}
+          </p>
         </div>
 
-        <div className="p-4 bg-slate-900 border border-slate-800 rounded-xl">
-          <div className="flex items-center justify-between text-slate-400 mb-2">
-            <span className="text-xs font-semibold uppercase tracking-wider">Stock Valuation (Cost)</span>
-            <DollarSign className="w-4 h-4 text-purple-400" />
+        <div className="p-3 sm:p-4 bg-slate-900 border border-slate-800 rounded-xl">
+          <div className="flex items-center justify-between text-slate-400 mb-1.5">
+            <span className="text-[10px] sm:text-xs font-semibold uppercase tracking-wider">
+              Buy Price Total
+            </span>
+            <DollarSign className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-purple-400" />
           </div>
-          <div className="text-2xl font-bold text-purple-300 font-mono">
+          <div className="text-sm sm:text-xl font-bold text-purple-300 font-mono truncate">
             {formatCurrency(valuation.totalCostValue, settings.currencySymbol)}
           </div>
-          <p className="text-[11px] text-slate-400 mt-1">Total invested capital at purchase</p>
+          <p className={`text-[10px] sm:text-[11px] mt-0.5 truncate font-medium ${valuationScopeColorClass}`}>
+            {valuationScopeLabel}
+          </p>
         </div>
 
-        <div className="p-4 bg-slate-900 border border-slate-800 rounded-xl">
-          <div className="flex items-center justify-between text-slate-400 mb-2">
-            <span className="text-xs font-semibold uppercase tracking-wider">Retail Valuation</span>
-            <DollarSign className="w-4 h-4 text-emerald-400" />
+        <div className="p-3 sm:p-4 bg-slate-900 border border-slate-800 rounded-xl">
+          <div className="flex items-center justify-between text-slate-400 mb-1.5">
+            <span className="text-[10px] sm:text-xs font-semibold uppercase tracking-wider">
+              Selling Price Total
+            </span>
+            <DollarSign className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-emerald-400" />
           </div>
-          <div className="text-2xl font-bold text-emerald-400 font-mono">
+          <div className="text-sm sm:text-xl font-bold text-emerald-400 font-mono truncate">
             {formatCurrency(valuation.totalRetailValue, settings.currencySymbol)}
           </div>
-          <p className="text-[11px] text-emerald-400/80 mt-1">
-            Potential margin: +{formatCurrency(valuation.potentialProfit, settings.currencySymbol)}
+          <p className="text-[10px] sm:text-[11px] text-emerald-400/80 mt-0.5 truncate">
+            +{formatCurrency(valuation.potentialProfit, settings.currencySymbol)}
           </p>
         </div>
       </div>
 
-      {/* Sub-view Switcher Tabs */}
-      <div className="flex items-center gap-2 mb-5 border-b border-slate-800 pb-2">
+      {/* Tabs */}
+      <div className="flex items-center gap-1.5 sm:gap-2 mb-4 border-b border-slate-800 pb-2 overflow-x-auto">
         <button
           onClick={() => setActiveTabState('stock')}
-          className={`flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-semibold transition ${
-            activeTab === 'stock' ? 'bg-blue-600 text-white shadow-sm' : 'text-slate-400 hover:text-slate-200'
+          className={`flex items-center gap-1.5 px-3 sm:px-4 py-2 rounded-lg text-xs font-semibold transition whitespace-nowrap ${
+            activeTab === 'stock'
+              ? 'bg-blue-600 text-white shadow-sm'
+              : 'text-slate-400 hover:text-slate-200 active:bg-slate-800'
           }`}
         >
-          <Boxes className="w-4 h-4" />
-          <span>Live Stock Table</span>
+          <Boxes className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
+          <span>Stock</span>
         </button>
 
         <button
           onClick={() => setActiveTabState('movements')}
-          className={`flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-semibold transition ${
-            activeTab === 'movements' ? 'bg-blue-600 text-white shadow-sm' : 'text-slate-400 hover:text-slate-200'
+          className={`flex items-center gap-1.5 px-3 sm:px-4 py-2 rounded-lg text-xs font-semibold transition whitespace-nowrap ${
+            activeTab === 'movements'
+              ? 'bg-blue-600 text-white shadow-sm'
+              : 'text-slate-400 hover:text-slate-200 active:bg-slate-800'
           }`}
         >
-          <History className="w-4 h-4" />
-          <span>Movement Log ({movements.length})</span>
+          <History className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
+          <span>Movements ({movements.length})</span>
         </button>
 
         <button
           onClick={() => setActiveTabState('losses')}
-          className={`flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-semibold transition ${
-            activeTab === 'losses' ? 'bg-blue-600 text-white shadow-sm' : 'text-slate-400 hover:text-slate-200'
+          className={`flex items-center gap-1.5 px-3 sm:px-4 py-2 rounded-lg text-xs font-semibold transition whitespace-nowrap ${
+            activeTab === 'losses'
+              ? 'bg-blue-600 text-white shadow-sm'
+              : 'text-slate-400 hover:text-slate-200 active:bg-slate-800'
           }`}
         >
-          <PackageX className="w-4 h-4" />
-          <span>Loss Report ({lossMovements.length})</span>
+          <PackageX className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
+          <span>Losses ({lossMovements.length})</span>
         </button>
       </div>
 
-      {/* Tab 1: Live Stock Table (Grouped by Shop) */}
+      {/* TAB 1: Live Stock (Grouped by Shop) */}
       {activeTab === 'stock' && (
         <div className="space-y-4">
-          {/* Filter Bar */}
-          <div className="flex flex-wrap items-center gap-3">
-            <div className="relative flex-1 min-w-[200px] max-w-md">
+          {/* Search + Low Stock filter */}
+          <div className="flex flex-col sm:flex-row sm:items-center gap-2.5">
+            <div className="relative flex-1 max-w-md">
               <Search className="w-4 h-4 text-slate-400 absolute left-3 top-2.5" />
               <input
                 type="text"
@@ -681,7 +1294,7 @@ export const AdminInventory: React.FC = () => {
 
             <button
               onClick={() => setShowLowStockOnly(!showLowStockOnly)}
-              className={`flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-semibold border transition ${
+              className={`flex items-center justify-center gap-1.5 px-3.5 py-2 rounded-lg text-xs font-semibold border transition ${
                 showLowStockOnly
                   ? 'bg-amber-600 text-white border-amber-500'
                   : 'bg-slate-900 text-slate-300 border-slate-800 hover:bg-slate-800'
@@ -690,9 +1303,11 @@ export const AdminInventory: React.FC = () => {
               <AlertTriangle className="w-3.5 h-3.5" />
               <span>Low Stock Only</span>
               {allLowStockProducts.length > 0 && (
-                <span className={`px-1.5 py-0.5 rounded-full text-[10px] font-bold ${
-                  showLowStockOnly ? 'bg-white/20' : 'bg-amber-500/20 text-amber-300'
-                }`}>
+                <span
+                  className={`px-1.5 py-0.5 rounded-full text-[10px] font-bold ${
+                    showLowStockOnly ? 'bg-white/20' : 'bg-amber-500/20 text-amber-300'
+                  }`}
+                >
                   {allLowStockProducts.length}
                 </span>
               )}
@@ -701,31 +1316,90 @@ export const AdminInventory: React.FC = () => {
 
           {/* Grouped by Shop */}
           {products.length === 0 ? (
-            <div className="bg-slate-900 border border-slate-800 rounded-xl py-16 text-center text-slate-500">
-              <Boxes className="w-10 h-10 mx-auto mb-2 opacity-40" />
-              <p className="text-sm">
+            <div className="bg-slate-900 border border-slate-800 rounded-2xl py-12 text-center text-slate-500">
+              <Boxes className="w-8 h-8 mx-auto mb-2 opacity-40" />
+              <p className="text-xs sm:text-sm">
                 {showLowStockOnly
                   ? 'No low stock items match your search.'
                   : 'No products match your search.'}
               </p>
             </div>
           ) : (
-            <div className="space-y-5">
+            <div className="space-y-4">
               {groupedByShop.map(({ shop, products: shopProducts }) => {
                 const isCollapsed = collapsedShops.has(shop.id);
-                const shopLowStock = shopProducts.filter(
-                  p => p.status === 'ACTIVE' && p.currentStock <= p.minStock
-                ).length;
-                const shopValue = shopProducts.reduce(
-                  (sum, p) => sum + p.currentStock * p.purchasePrice,
-                  0
-                );
+                const locationFilter = getShopLocationFilter(shop.id);
+
+                // Filter per shop: ALL (default), SHOP (shop inventory only), STORE (store inventory only)
+                const filteredShopProducts = shopProducts.filter(p => {
+                  const shopQty = Math.max(0, Number(p.currentStock || 0));
+                  const storeQty = getProductStoreQty(p);
+                  if (locationFilter === 'SHOP') {
+                    return shopQty > 0 || (showLowStockOnly && storeQty === 0);
+                  }
+                  if (locationFilter === 'STORE') {
+                    return storeQty > 0;
+                  }
+                  return true;
+                });
+
+                const shopLowStock = filteredShopProducts.filter(p => {
+                  if (p.status !== 'ACTIVE') return false;
+                  const shopQty = Math.max(0, Number(p.currentStock || 0));
+                  const storeQty = getProductStoreQty(p);
+                  const qty =
+                    locationFilter === 'SHOP'
+                      ? shopQty
+                      : locationFilter === 'STORE'
+                        ? storeQty
+                        : shopQty + storeQty;
+                  return qty <= p.minStock;
+                }).length;
+
+                // Total Cost & Total Retail Value across all items matching the shop filter
+                const totalShopCost = filteredShopProducts.reduce((sum, p) => {
+                  const shopQty = Math.max(0, Number(p.currentStock || 0));
+                  const storeQty = getProductStoreQty(p);
+                  const qty =
+                    locationFilter === 'SHOP'
+                      ? shopQty
+                      : locationFilter === 'STORE'
+                        ? storeQty
+                        : shopQty + storeQty;
+                  return sum + qty * (p.purchasePrice || 0);
+                }, 0);
+
+                const totalShopRetail = filteredShopProducts.reduce((sum, p) => {
+                  const shopQty = Math.max(0, Number(p.currentStock || 0));
+                  const storeQty = getProductStoreQty(p);
+                  const qty =
+                    locationFilter === 'SHOP'
+                      ? shopQty
+                      : locationFilter === 'STORE'
+                        ? storeQty
+                        : shopQty + storeQty;
+                  return sum + qty * (p.sellingPrice || 0);
+                }, 0);
+
+                const totalShopUnits = filteredShopProducts.reduce((sum, p) => {
+                  const shopQty = Math.max(0, Number(p.currentStock || 0));
+                  const storeQty = getProductStoreQty(p);
+                  const qty =
+                    locationFilter === 'SHOP'
+                      ? shopQty
+                      : locationFilter === 'STORE'
+                        ? storeQty
+                        : shopQty + storeQty;
+                  return sum + qty;
+                }, 0);
+
+                const headerStockValue = totalShopCost;
 
                 // Pagination
                 const visibleCount = getVisibleCount(shop.id);
-                const visibleProducts = shopProducts.slice(0, visibleCount);
-                const hasMore = shopProducts.length > visibleCount;
-                const remaining = shopProducts.length - visibleCount;
+                const visibleShopProducts = filteredShopProducts.slice(0, visibleCount);
+                const hasMore = filteredShopProducts.length > visibleCount;
+                const remaining = filteredShopProducts.length - visibleCount;
                 const isLoading = loadingShops.has(shop.id);
 
                 return (
@@ -735,39 +1409,40 @@ export const AdminInventory: React.FC = () => {
                   >
                     {/* Shop Header */}
                     <button
+                      type="button"
                       onClick={() => toggleShopCollapse(shop.id)}
-                      className="w-full flex items-center justify-between gap-3 px-5 py-4 bg-slate-900/80 hover:bg-slate-800/60 active:bg-slate-800 transition border-b border-slate-800"
+                      className="w-full flex items-center justify-between gap-3 p-3.5 sm:px-5 sm:py-4 bg-slate-900/80 hover:bg-slate-800/60 active:bg-slate-800 transition border-b border-slate-800"
                     >
-                      <div className="flex items-center gap-3 min-w-0 flex-1">
-                        <div className="w-10 h-10 rounded-xl bg-blue-500/10 border border-blue-500/20 text-blue-400 flex items-center justify-center shrink-0">
-                          <Store className="w-5 h-5" />
+                      <div className="flex items-center gap-2.5 sm:gap-3 min-w-0 flex-1">
+                        <div className="w-9 h-9 sm:w-10 sm:h-10 rounded-xl bg-blue-500/10 border border-blue-500/20 text-blue-400 flex items-center justify-center shrink-0">
+                          <Store className="w-4 h-4 sm:w-5 sm:h-5" />
                         </div>
                         <div className="min-w-0 text-left">
-                          <div className="flex items-center gap-2 flex-wrap">
-                            <h3 className="text-base font-bold text-white truncate">
+                          <div className="flex items-center gap-1.5 flex-wrap">
+                            <h3 className="text-sm sm:text-base font-bold text-white truncate">
                               {shop.name}
                             </h3>
-                            <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-slate-800 text-slate-300 border border-slate-700">
+                            <span className="px-1.5 py-0.5 rounded-full text-[9px] sm:text-[10px] font-bold bg-slate-800 text-slate-300 border border-slate-700">
                               {shop.code || 'UNIT'}
                             </span>
                           </div>
-                          <p className="text-xs text-slate-400 mt-0.5">
-                            {shopProducts.length}{' '}
-                            {shopProducts.length === 1 ? 'SKU' : 'SKUs'} •{' '}
-                            Stock Value: {formatCurrency(shopValue, settings.currencySymbol)}
+                          <p className="text-[11px] sm:text-xs text-slate-400 mt-0.5">
+                            {filteredShopProducts.length}{' '}
+                            {filteredShopProducts.length === 1 ? 'SKU' : 'SKUs'} • Stock:{' '}
+                            {formatCurrency(headerStockValue, settings.currencySymbol)}
                             {shopLowStock > 0 && (
                               <span className="text-amber-400 ml-1">
-                                • {shopLowStock} low stock
+                                • {shopLowStock} low
                               </span>
                             )}
                           </p>
                         </div>
                       </div>
 
-                      <div className="flex items-center gap-2 shrink-0">
+                      <div className="flex items-center gap-1.5 shrink-0">
                         {shopLowStock > 0 && (
-                          <span className="px-2 py-0.5 rounded-full bg-amber-500/15 text-amber-400 text-[10px] font-bold border border-amber-500/30">
-                            ⚠ {shopLowStock} Low
+                          <span className="px-1.5 py-0.5 rounded-full bg-amber-500/15 text-amber-400 text-[9px] sm:text-[10px] font-bold border border-amber-500/30">
+                            ⚠ {shopLowStock}
                           </span>
                         )}
                         {isCollapsed ? (
@@ -778,57 +1453,196 @@ export const AdminInventory: React.FC = () => {
                       </div>
                     </button>
 
-                    {/* Stock Table */}
                     {!isCollapsed && (
-                      <div>
-                        <div className="overflow-x-auto">
-                          <table className="w-full text-left text-xs">
-                            <thead>
-                              <tr className="border-b border-slate-800 bg-slate-950/60 text-slate-400">
-                                <th className="py-3 px-4 font-semibold">SKU</th>
-                                <th className="py-3 px-4 font-semibold">Product Name</th>
-                                <th className="py-3 px-4 text-center font-semibold">Current Stock</th>
-                                <th className="py-3 px-4 text-center font-semibold">Min Threshold</th>
-                                <th className="py-3 px-4 text-right font-semibold">Cost / Unit</th>
-                                <th className="py-3 px-4 text-right font-semibold">Total Cost Value</th>
-                                <th className="py-3 px-4 text-right font-semibold">Retail Value</th>
-                                <th className="py-3 px-4 text-right font-semibold">Action</th>
-                              </tr>
-                            </thead>
-                            <tbody className="divide-y divide-slate-800/60">
-                              {visibleProducts.map(renderStockRow)}
-                            </tbody>
-                          </table>
+                      <>
+                        {/* Per-Shop Location Filter (All / Shop / Store) + Per-Shop PDF & Excel Downloads */}
+                        <div className="px-3.5 sm:px-5 py-2.5 bg-slate-950/60 border-b border-slate-800 flex items-center justify-between gap-2 flex-wrap">
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <span className="text-[10px] font-semibold uppercase tracking-wider text-slate-400">
+                              Inventory View
+                            </span>
+                            <div className="grid grid-cols-3 gap-1 bg-slate-900 border border-slate-800 rounded-xl p-1 text-[11px] font-semibold">
+                              <button
+                                type="button"
+                                onClick={() => handleSetShopLocationFilter(shop.id, 'ALL')}
+                                className={`px-2.5 py-1.5 rounded-lg transition ${
+                                  locationFilter === 'ALL'
+                                    ? 'bg-blue-600 text-white shadow-sm'
+                                    : 'text-slate-400 hover:text-white'
+                                }`}
+                              >
+                                All
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => handleSetShopLocationFilter(shop.id, 'SHOP')}
+                                className={`flex items-center justify-center gap-1 px-2.5 py-1.5 rounded-lg transition ${
+                                  locationFilter === 'SHOP'
+                                    ? 'bg-emerald-600 text-white shadow-sm'
+                                    : 'text-slate-400 hover:text-white'
+                                }`}
+                              >
+                                <Store className="w-3 h-3" />
+                                <span>Shop</span>
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => handleSetShopLocationFilter(shop.id, 'STORE')}
+                                className={`flex items-center justify-center gap-1 px-2.5 py-1.5 rounded-lg transition ${
+                                  locationFilter === 'STORE'
+                                    ? 'bg-indigo-600 text-white shadow-sm'
+                                    : 'text-slate-400 hover:text-white'
+                                }`}
+                              >
+                                <Warehouse className="w-3 h-3" />
+                                <span>Store</span>
+                              </button>
+                            </div>
+                          </div>
+
+                          <div className="flex items-center gap-1.5">
+                            <button
+                              type="button"
+                              disabled={exportingKey !== null || filteredShopProducts.length === 0}
+                              onClick={() => handleDownloadInventoryPdf(shop.id)}
+                              title={`Download ${shop.name} (${getScopeShortText(locationFilter)}) PDF`}
+                              className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-rose-500/15 hover:bg-rose-500/25 border border-rose-500/30 text-rose-300 disabled:opacity-40 text-[11px] font-semibold transition"
+                            >
+                              {exportingKey === `pdf:${shop.id}` ? (
+                                <Loader2 className="w-3 h-3 animate-spin" />
+                              ) : (
+                                <FileText className="w-3 h-3" />
+                              )}
+                              <span>PDF</span>
+                            </button>
+                            <button
+                              type="button"
+                              disabled={exportingKey !== null || filteredShopProducts.length === 0}
+                              onClick={() => handleDownloadInventoryExcel(shop.id)}
+                              title={`Download ${shop.name} (${getScopeShortText(locationFilter)}) Excel`}
+                              className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-emerald-500/15 hover:bg-emerald-500/25 border border-emerald-500/30 text-emerald-300 disabled:opacity-40 text-[11px] font-semibold transition"
+                            >
+                              {exportingKey === `excel:${shop.id}` ? (
+                                <Loader2 className="w-3 h-3 animate-spin" />
+                              ) : (
+                                <FileSpreadsheet className="w-3 h-3" />
+                              )}
+                              <span>Excel</span>
+                            </button>
+                          </div>
+                        </div>
+
+                        {filteredShopProducts.length === 0 ? (
+                          <div className="py-8 px-4 text-center text-xs text-slate-500">
+                            No{' '}
+                            {locationFilter === 'SHOP'
+                              ? 'shop'
+                              : locationFilter === 'STORE'
+                                ? 'store'
+                                : ''}{' '}
+                            inventory items found in {shop.name}.
+                          </div>
+                        ) : (
+                          <>
+                            {/* Desktop Table */}
+                            <div className="hidden md:block overflow-x-auto">
+                              <table className="w-full text-left text-xs">
+                                <thead>
+                                  <tr className="border-b border-slate-800 bg-slate-950/60 text-slate-400">
+                                    <th className="py-3 px-4 font-semibold">SKU</th>
+                                    <th className="py-3 px-4 font-semibold">Product Name</th>
+                                    <th className="py-3 px-4 text-center font-semibold">
+                                      {locationFilter === 'STORE'
+                                        ? 'Store Stock'
+                                        : locationFilter === 'SHOP'
+                                          ? 'Shop Stock'
+                                          : 'Stock'}
+                                    </th>
+                                    <th className="py-3 px-4 text-center font-semibold">Min Level</th>
+                                    <th className="py-3 px-4 text-right font-semibold">Buy / Unit</th>
+                                    <th className="py-3 px-4 text-right font-semibold">Sell / Unit</th>
+                                    <th className="py-3 px-4 text-right font-semibold">Buy Total</th>
+                                    <th className="py-3 px-4 text-right font-semibold">Sell Total</th>
+                                    <th className="py-3 px-4 text-right font-semibold">Action</th>
+                                  </tr>
+                                </thead>
+                                <tbody className="divide-y divide-slate-800/60">
+                                  {visibleShopProducts.map(p => renderStockRow(p, locationFilter))}
+                                </tbody>
+                              </table>
+                            </div>
+
+                            {/* Mobile Cards */}
+                            <div className="md:hidden divide-y divide-slate-800/80">
+                              {visibleShopProducts.map(p => renderStockCard(p, locationFilter))}
+                            </div>
+                          </>
+                        )}
+
+                        {/* Shop Total Cost & Retail Value */}
+                        <div className="px-3.5 sm:px-5 py-3 bg-slate-950/75 border-t border-slate-800/90 space-y-1.5">
+                          <div className="flex items-center justify-between text-[10px] text-slate-400">
+                            <span className="font-semibold uppercase tracking-wider">
+                              {locationFilter === 'SHOP'
+                                ? 'Shop Total Valuation'
+                                : locationFilter === 'STORE'
+                                  ? 'Store Total Valuation'
+                                  : 'Total Valuation (Shop + Store)'}
+                            </span>
+                            <span className="font-mono tabular-nums text-slate-300">
+                              {totalShopUnits.toLocaleString()} units
+                            </span>
+                          </div>
+                          <div className="grid grid-cols-2 gap-2">
+                            <div className="bg-slate-900 border border-slate-800 rounded-lg px-2.5 sm:px-3.5 py-2">
+                              <div className="text-[9px] text-slate-400 uppercase font-semibold">
+                                Total Buy Price
+                              </div>
+                              <div className="text-xs sm:text-sm font-bold font-mono tabular-nums text-purple-300 mt-0.5 truncate">
+                                {formatCurrency(totalShopCost, settings.currencySymbol)}
+                              </div>
+                            </div>
+                            <div className="bg-slate-900 border border-slate-800 rounded-lg px-2.5 sm:px-3.5 py-2 text-right">
+                              <div className="text-[9px] text-slate-400 uppercase font-semibold">
+                                Total Selling Price
+                              </div>
+                              <div className="text-xs sm:text-sm font-bold font-mono tabular-nums text-emerald-400 mt-0.5 truncate">
+                                {formatCurrency(totalShopRetail, settings.currencySymbol)}
+                              </div>
+                            </div>
+                          </div>
                         </div>
 
                         {/* Pagination Footer */}
-                        {shopProducts.length > PAGE_SIZE && (
-                          <div className="px-5 py-3 border-t border-slate-800/60 bg-slate-950/30 flex items-center justify-between gap-3">
-                            <div className="text-[11px] text-slate-500">
+                        {filteredShopProducts.length > PAGE_SIZE && (
+                          <div className="p-3 sm:px-5 bg-slate-950/40 border-t border-slate-800/80 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
+                            <div className="text-[10px] sm:text-[11px] text-slate-500 text-center sm:text-left">
                               Showing{' '}
                               <span className="text-slate-300 font-semibold">
-                                {Math.min(visibleCount, shopProducts.length)}
+                                {Math.min(visibleCount, filteredShopProducts.length)}
                               </span>{' '}
                               of{' '}
                               <span className="text-slate-300 font-semibold">
-                                {shopProducts.length}
+                                {filteredShopProducts.length}
                               </span>{' '}
                               products
                             </div>
                             <div className="flex items-center gap-2">
                               {visibleCount > PAGE_SIZE && (
                                 <button
+                                  type="button"
                                   onClick={() => handleSeeLess(shop.id)}
-                                  className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold transition"
+                                  className="flex-1 sm:flex-none px-3 py-2 sm:py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 active:bg-slate-600 text-slate-300 text-[11px] font-semibold transition"
                                 >
                                   Show Less
                                 </button>
                               )}
                               {hasMore && (
                                 <button
+                                  type="button"
                                   onClick={() => handleSeeMore(shop.id)}
                                   disabled={isLoading}
-                                  className="flex items-center gap-1.5 px-4 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 active:bg-blue-700 text-white text-xs font-semibold shadow transition disabled:opacity-60 disabled:cursor-wait"
+                                  className="flex-1 sm:flex-none flex items-center justify-center gap-1.5 px-3 sm:px-4 py-2 sm:py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 active:bg-blue-700 text-white text-[11px] font-semibold shadow transition disabled:opacity-60 disabled:cursor-wait"
                                 >
                                   {isLoading ? (
                                     <>
@@ -839,7 +1653,7 @@ export const AdminInventory: React.FC = () => {
                                     <>
                                       <ChevronDown className="w-3.5 h-3.5" />
                                       <span>
-                                        See More ({Math.min(PAGE_SIZE, remaining)} of {remaining})
+                                        See More ({Math.min(PAGE_SIZE, remaining)})
                                       </span>
                                     </>
                                   )}
@@ -848,7 +1662,7 @@ export const AdminInventory: React.FC = () => {
                             </div>
                           </div>
                         )}
-                      </div>
+                      </>
                     )}
                   </div>
                 );
@@ -857,33 +1671,39 @@ export const AdminInventory: React.FC = () => {
               {/* Unassigned Products */}
               {productsWithNoShop.length > 0 && (
                 <div className="bg-slate-900 border border-amber-800/40 rounded-2xl overflow-hidden shadow-lg">
-                  <div className="flex items-center gap-3 px-5 py-4 bg-amber-950/20 border-b border-amber-800/40">
-                    <AlertTriangle className="w-5 h-5 text-amber-400" />
+                  <div className="flex items-center gap-2.5 p-3.5 sm:px-5 sm:py-4 bg-amber-950/20 border-b border-amber-800/40">
+                    <AlertTriangle className="w-5 h-5 text-amber-400 shrink-0" />
                     <div>
-                      <h3 className="text-base font-bold text-white">Unassigned Products</h3>
-                      <p className="text-xs text-slate-400 mt-0.5">
+                      <h3 className="text-sm sm:text-base font-bold text-white">
+                        Unassigned Products
+                      </h3>
+                      <p className="text-[11px] sm:text-xs text-slate-400 mt-0.5">
                         {productsWithNoShop.length} products have an invalid shop
                       </p>
                     </div>
                   </div>
-                  <div className="overflow-x-auto">
+                  <div className="hidden md:block overflow-x-auto">
                     <table className="w-full text-left text-xs">
                       <thead>
                         <tr className="border-b border-slate-800 bg-slate-950/60 text-slate-400">
                           <th className="py-3 px-4 font-semibold">SKU</th>
                           <th className="py-3 px-4 font-semibold">Product Name</th>
-                          <th className="py-3 px-4 text-center font-semibold">Current Stock</th>
-                          <th className="py-3 px-4 text-center font-semibold">Min Threshold</th>
-                          <th className="py-3 px-4 text-right font-semibold">Cost / Unit</th>
-                          <th className="py-3 px-4 text-right font-semibold">Total Cost Value</th>
-                          <th className="py-3 px-4 text-right font-semibold">Retail Value</th>
+                          <th className="py-3 px-4 text-center font-semibold">Stock</th>
+                          <th className="py-3 px-4 text-center font-semibold">Min Level</th>
+                          <th className="py-3 px-4 text-right font-semibold">Buy / Unit</th>
+                          <th className="py-3 px-4 text-right font-semibold">Sell / Unit</th>
+                          <th className="py-3 px-4 text-right font-semibold">Buy Total</th>
+                          <th className="py-3 px-4 text-right font-semibold">Sell Total</th>
                           <th className="py-3 px-4 text-right font-semibold">Action</th>
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-slate-800/60">
-                        {productsWithNoShop.map(renderStockRow)}
+                        {productsWithNoShop.map(p => renderStockRow(p, 'ALL'))}
                       </tbody>
                     </table>
+                  </div>
+                  <div className="md:hidden divide-y divide-slate-800/80">
+                    {productsWithNoShop.map(p => renderStockCard(p, 'ALL'))}
                   </div>
                 </div>
               )}
@@ -892,101 +1712,434 @@ export const AdminInventory: React.FC = () => {
         </div>
       )}
 
-      {/* Tab 2: Movement Log */}
-      {activeTab === 'movements' && (
-        <div className="space-y-4">
-          <div className="flex items-center gap-3">
-            <select
-              value={movementTypeFilter}
-              onChange={e => setMovementTypeFilter(e.target.value)}
-              className="bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-xs text-white focus:outline-none focus:ring-1 focus:ring-blue-500"
-            >
-              <option value="ALL">All Movement Types</option>
-              <option value="DAMAGED">💥 Damaged Stock</option>
-              <option value="BROKEN">🔨 Broken Stock</option>
-              <option value="EXPIRED">⏳ Expired Items</option>
-              <option value="LOST">🔍 Lost / Missing</option>
-              <option value="CORRECTION">⚖️ Count Corrections</option>
-              <option value="RESTOCK">📦 Restock Adjustments</option>
-              <option value="SALE">🛒 Sales (Decrements)</option>
-              <option value="PURCHASE">🚚 Purchases / Stock In</option>
-              <option value="RETURN">↩️ Returns / Restocks</option>
-            </select>
+      {/* TAB 2: FULL-SCREEN MOVEMENTS PAGE (Transfers excluded, Day/Week/Month/Custom default Month, Print PDF, 10-item expand) */}
+      {activeTab === 'movements' && (() => {
+        const visibleMovements = movements.slice(0, movementsVisibleCount);
+        const remainingMovements = Math.max(0, movements.length - movementsVisibleCount);
+        const totalInUnits = movements.reduce(
+          (sum, m) => (m.changeQty > 0 ? sum + m.changeQty : sum),
+          0
+        );
+        const totalOutUnits = movements.reduce(
+          (sum, m) => (m.changeQty < 0 ? sum + Math.abs(m.changeQty) : sum),
+          0
+        );
+        const totalCostImpact = movements.reduce(
+          (sum, m) => sum + Number(m.costValue || 0),
+          0
+        );
+
+        return (
+          <div className="fixed inset-0 z-40 bg-slate-950 text-slate-100 flex flex-col overflow-hidden">
+            {/* Full-Screen Sticky Top Bar */}
+            <div className="px-4 sm:px-6 py-3.5 bg-slate-900 border-b border-slate-800 flex flex-wrap items-center justify-between gap-3 shrink-0">
+              <div className="flex items-center gap-3 min-w-0">
+                <button
+                  type="button"
+                  onClick={() => setActiveTabState('stock')}
+                  aria-label="Back to Inventory"
+                  className="p-2 rounded-xl bg-slate-950 hover:bg-slate-800 border border-slate-800 text-slate-300 hover:text-white transition shrink-0"
+                >
+                  <ArrowLeft className="w-4 h-4" />
+                </button>
+                <div className="min-w-0">
+                  <h2 className="text-base sm:text-lg font-bold text-white tracking-tight truncate">
+                    Stock Movements
+                  </h2>
+                  <p className="text-[11px] text-slate-400 truncate">
+                    Damaged, broken, expired, lost, sales, purchases &amp; adjustments (transfers excluded)
+                  </p>
+                </div>
+              </div>
+
+              <button
+                type="button"
+                onClick={handlePrintMovementsReport}
+                className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl bg-blue-600 hover:bg-blue-500 active:bg-blue-700 text-white text-xs font-semibold shadow-lg transition shrink-0"
+              >
+                <Printer className="w-4 h-4" />
+                <span>Print PDF</span>
+              </button>
+            </div>
+
+            {/* Full-Screen Scrollable Content */}
+            <div className="flex-1 overflow-y-auto p-3.5 sm:p-6 pb-20 space-y-4">
+              {/* Period Filter: Day / Week / Month (Default) / Custom + Type + Search */}
+              <div className="bg-slate-900 border border-slate-800 rounded-2xl p-3.5 space-y-3 text-xs">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <Calendar className="w-4 h-4 text-blue-400" />
+                    <span className="font-bold text-white uppercase tracking-wider text-[11px]">
+                      Period Filter
+                    </span>
+                  </div>
+                  <span className="text-[11px] font-mono text-slate-400">
+                    {movementStartDate === movementEndDate
+                      ? movementStartDate
+                      : `${movementStartDate || '...'} → ${movementEndDate || '...'}`}{' '}
+                    · <strong className="text-white">{movements.length.toLocaleString()}</strong>{' '}
+                    record{movements.length === 1 ? '' : 's'}
+                  </span>
+                </div>
+
+                <div className="grid grid-cols-4 gap-1.5">
+                  {(
+                    [
+                      {
+                        id: 'DAY',
+                        label: 'Day',
+                        activeClass:
+                          'bg-blue-600 border-blue-500 text-white shadow-md shadow-blue-500/30',
+                        idleClass:
+                          'bg-blue-500/10 border-blue-500/30 text-blue-300 hover:bg-blue-500/20',
+                      },
+                      {
+                        id: 'WEEK',
+                        label: 'Week',
+                        activeClass:
+                          'bg-emerald-600 border-emerald-500 text-white shadow-md shadow-emerald-500/30',
+                        idleClass:
+                          'bg-emerald-500/10 border-emerald-500/30 text-emerald-300 hover:bg-emerald-500/20',
+                      },
+                      {
+                        id: 'MONTH',
+                        label: 'Month',
+                        activeClass:
+                          'bg-violet-600 border-violet-500 text-white shadow-md shadow-violet-500/30',
+                        idleClass:
+                          'bg-violet-500/10 border-violet-500/30 text-violet-300 hover:bg-violet-500/20',
+                      },
+                      {
+                        id: 'CUSTOM',
+                        label: 'Custom',
+                        activeClass:
+                          'bg-amber-500 border-amber-400 text-white shadow-md shadow-amber-500/30',
+                        idleClass:
+                          'bg-amber-500/10 border-amber-500/30 text-amber-300 hover:bg-amber-500/20',
+                      },
+                    ] as const
+                  ).map(preset => {
+                    const isActive = movementPeriod === preset.id;
+                    return (
+                      <button
+                        key={preset.id}
+                        type="button"
+                        onClick={() => setMovementPeriod(preset.id)}
+                        className={`py-2 rounded-lg border text-[11px] font-semibold transition active:scale-95 ${
+                          isActive ? preset.activeClass : preset.idleClass
+                        }`}
+                      >
+                        {preset.label}
+                      </button>
+                    );
+                  })}
+                </div>
+
+                {movementPeriod === 'CUSTOM' && (
+                  <div className="grid grid-cols-2 gap-2 pt-1">
+                    <div>
+                      <label className="text-[10px] text-slate-500 block mb-1">From</label>
+                      <input
+                        type="date"
+                        value={movementStartDate}
+                        onChange={e => setMovementStartDate(e.target.value)}
+                        className="bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-2 text-xs text-white w-full focus:outline-none focus:ring-1 focus:ring-amber-500"
+                      />
+                    </div>
+                    <div>
+                      <label className="text-[10px] text-slate-500 block mb-1">To</label>
+                      <input
+                        type="date"
+                        value={movementEndDate}
+                        onChange={e => setMovementEndDate(e.target.value)}
+                        className="bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-2 text-xs text-white w-full focus:outline-none focus:ring-1 focus:ring-amber-500"
+                      />
+                    </div>
+                  </div>
+                )}
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 pt-2 border-t border-slate-800/80">
+                  <div className="relative">
+                    <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-2.5" />
+                    <input
+                      type="text"
+                      value={searchQuery}
+                      onChange={e => setSearchQuery(e.target.value)}
+                      placeholder="Search product, reason, user, or shop..."
+                      className="w-full bg-slate-950 border border-slate-800 rounded-lg pl-8 pr-3 py-2 text-xs text-white placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
+                    />
+                  </div>
+
+                  <select
+                    value={movementTypeFilter}
+                    onChange={e => setMovementTypeFilter(e.target.value)}
+                    className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-xs text-white focus:outline-none focus:ring-1 focus:ring-blue-500"
+                  >
+                    <option value="ALL">All Movement Types</option>
+                    <option value="DAMAGED">💥 Damaged Stock</option>
+                    <option value="BROKEN">🔨 Broken Stock</option>
+                    <option value="EXPIRED">⏳ Expired Items</option>
+                    <option value="LOST">🔍 Lost / Missing</option>
+                    <option value="CORRECTION">⚖️ Count Corrections</option>
+                    <option value="RESTOCK">📦 Restock Adjustments</option>
+                    <option value="ADJUSTMENT">🔧 Manual Adjustments</option>
+                    <option value="SALE">🛒 Sales (Decrements)</option>
+                    <option value="PURCHASE">🚚 Purchases / Stock In</option>
+                    <option value="RETURN">↩️ Returns / Restocks</option>
+                  </select>
+                </div>
+              </div>
+
+              {/* KPI Strip */}
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
+                <div className="bg-slate-900 border border-slate-800 rounded-xl p-3">
+                  <div className="text-[10px] text-slate-400 font-semibold uppercase">Records</div>
+                  <div className="text-base font-bold text-white font-mono tabular-nums mt-0.5">
+                    {movements.length.toLocaleString()}
+                  </div>
+                </div>
+                <div className="bg-slate-900 border border-slate-800 rounded-xl p-3">
+                  <div className="text-[10px] text-slate-400 font-semibold uppercase">Added (+)</div>
+                  <div className="text-base font-bold text-emerald-400 font-mono tabular-nums mt-0.5">
+                    +{totalInUnits.toLocaleString()}
+                  </div>
+                </div>
+                <div className="bg-slate-900 border border-slate-800 rounded-xl p-3">
+                  <div className="text-[10px] text-slate-400 font-semibold uppercase">
+                    Deducted (-)
+                  </div>
+                  <div className="text-base font-bold text-rose-400 font-mono tabular-nums mt-0.5">
+                    -{totalOutUnits.toLocaleString()}
+                  </div>
+                </div>
+                <div className="bg-slate-900 border border-slate-800 rounded-xl p-3">
+                  <div className="text-[10px] text-slate-400 font-semibold uppercase">
+                    Cost Impact
+                  </div>
+                  <div className="text-sm font-bold text-purple-300 font-mono tabular-nums mt-0.5 truncate">
+                    {formatCurrency(totalCostImpact, settings.currencySymbol)}
+                  </div>
+                </div>
+              </div>
+
+              {/* Movements List (Capped at 10 initially + See More / Expand by 10) */}
+              <div className="bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden shadow-xl">
+                {movements.length === 0 ? (
+                  <div className="py-12 text-center text-slate-500">
+                    <History className="w-8 h-8 mx-auto mb-2 opacity-40" />
+                    <p className="text-xs">No movements found for this period and filter.</p>
+                  </div>
+                ) : (
+                  <>
+                    {/* Desktop Movements Table */}
+                    <div className="hidden md:block overflow-x-auto">
+                      <table className="w-full text-left text-xs">
+                        <thead>
+                          <tr className="border-b border-slate-800 bg-slate-950/60 text-slate-400">
+                            <th className="py-3 px-4 font-semibold">Timestamp</th>
+                            <th className="py-3 px-4 font-semibold">Product</th>
+                            <th className="py-3 px-4 font-semibold">Shop</th>
+                            <th className="py-3 px-4 font-semibold">Type</th>
+                            <th className="py-3 px-4 text-center font-semibold">Delta</th>
+                            <th className="py-3 px-4 text-center font-semibold">Before</th>
+                            <th className="py-3 px-4 text-center font-semibold">After</th>
+                            <th className="py-3 px-4 text-right font-semibold">Cost Impact</th>
+                            <th className="py-3 px-4 font-semibold">Reason</th>
+                            <th className="py-3 px-4 font-semibold">User</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-800/60">
+                          {visibleMovements.map(m => {
+                            const isPositive = m.changeQty > 0;
+                            const isLossType = ['DAMAGED', 'BROKEN', 'EXPIRED', 'LOST'].includes(
+                              m.type
+                            );
+                            return (
+                              <tr key={m.id} className="hover:bg-slate-850/60 transition">
+                                <td className="py-3 px-4 text-slate-400 font-mono text-[11px] whitespace-nowrap">
+                                  {formatDateTime(m.createdAt)}
+                                </td>
+                                <td className="py-3 px-4 font-medium text-white">
+                                  {m.productName}
+                                </td>
+                                <td className="py-3 px-4 text-slate-400 text-[11px]">
+                                  {m.shopName || 'Shop'}
+                                </td>
+                                <td className="py-3 px-4">
+                                  <span
+                                    className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                                      isLossType
+                                        ? 'bg-rose-500/20 text-rose-300 border border-rose-500/30'
+                                        : 'bg-slate-800 text-slate-300'
+                                    }`}
+                                  >
+                                    {m.type}
+                                  </span>
+                                </td>
+                                <td className="py-3 px-4 text-center font-mono font-bold">
+                                  <span
+                                    className={isPositive ? 'text-emerald-400' : 'text-rose-400'}
+                                  >
+                                    {isPositive ? `+${m.changeQty}` : m.changeQty}
+                                  </span>
+                                </td>
+                                <td className="py-3 px-4 text-center font-mono text-slate-400">
+                                  {m.previousQty}
+                                </td>
+                                <td className="py-3 px-4 text-center font-mono text-white font-semibold">
+                                  {m.newQty}
+                                </td>
+                                <td
+                                  className={`py-3 px-4 text-right font-mono font-semibold ${
+                                    isLossType ? 'text-rose-400' : 'text-slate-300'
+                                  }`}
+                                >
+                                  {m.costValue !== undefined
+                                    ? formatCurrency(m.costValue, settings.currencySymbol)
+                                    : '-'}
+                                </td>
+                                <td className="py-3 px-4 text-slate-400 max-w-xs truncate">
+                                  {m.reason || '-'}
+                                </td>
+                                <td className="py-3 px-4 text-slate-400 whitespace-nowrap">
+                                  {m.userName}
+                                </td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+
+                    {/* Mobile Movements Cards */}
+                    <div className="md:hidden divide-y divide-slate-800/80">
+                      {visibleMovements.map(m => {
+                        const isPositive = m.changeQty > 0;
+                        const isLossType = ['DAMAGED', 'BROKEN', 'EXPIRED', 'LOST'].includes(
+                          m.type
+                        );
+
+                        return (
+                          <div key={m.id} className="p-3.5 space-y-2">
+                            <div className="flex items-start justify-between gap-2">
+                              <div className="min-w-0 flex-1">
+                                <h4 className="font-bold text-xs text-white truncate">
+                                  {m.productName}
+                                </h4>
+                                <p className="text-[10px] font-mono text-slate-400">
+                                  {formatDateTime(m.createdAt)}
+                                  {m.shopName ? ` · ${m.shopName}` : ''}
+                                </p>
+                              </div>
+                              <span
+                                className={`px-2 py-0.5 rounded text-[10px] font-bold shrink-0 ${
+                                  isLossType
+                                    ? 'bg-rose-500/20 text-rose-300 border border-rose-500/30'
+                                    : 'bg-slate-800 text-slate-300'
+                                }`}
+                              >
+                                {m.type}
+                              </span>
+                            </div>
+
+                            <div className="flex items-center justify-between text-xs py-1">
+                              <div className="text-slate-400 text-[11px]">
+                                Qty:{' '}
+                                <strong
+                                  className={isPositive ? 'text-emerald-400' : 'text-rose-400'}
+                                >
+                                  {isPositive ? `+${m.changeQty}` : m.changeQty}
+                                </strong>{' '}
+                                ({m.previousQty} → {m.newQty})
+                              </div>
+                              {m.costValue !== undefined && (
+                                <div
+                                  className={`font-mono text-[11px] font-semibold ${
+                                    isLossType ? 'text-rose-400' : 'text-slate-300'
+                                  }`}
+                                >
+                                  {formatCurrency(m.costValue, settings.currencySymbol)}
+                                </div>
+                              )}
+                            </div>
+
+                            {m.reason && (
+                              <p className="text-[11px] text-slate-400 bg-slate-950/60 p-2 rounded-lg border border-slate-800">
+                                {m.reason}
+                              </p>
+                            )}
+                            <div className="text-[10px] text-slate-500 text-right">
+                              By {m.userName}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+
+                    {/* Expand / Pagination Footer (10 items per page) */}
+                    {movements.length > PAGE_SIZE && (
+                      <div className="p-3 sm:px-5 bg-slate-950/50 border-t border-slate-800/80 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
+                        <div className="text-[10px] sm:text-[11px] text-slate-500 text-center sm:text-left">
+                          Showing{' '}
+                          <span className="text-slate-300 font-semibold">
+                            {Math.min(movementsVisibleCount, movements.length)}
+                          </span>{' '}
+                          of{' '}
+                          <span className="text-slate-300 font-semibold">{movements.length}</span>{' '}
+                          movements
+                        </div>
+                        <div className="flex items-center gap-2">
+                          {movementsVisibleCount > PAGE_SIZE && (
+                            <button
+                              type="button"
+                              onClick={() => setMovementsVisibleCount(PAGE_SIZE)}
+                              className="flex-1 sm:flex-none px-3 py-2 sm:py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-[11px] font-semibold transition"
+                            >
+                              Show Less
+                            </button>
+                          )}
+                          {remainingMovements > 0 && (
+                            <button
+                              type="button"
+                              onClick={() => setMovementsVisibleCount(v => v + PAGE_SIZE)}
+                              className="flex-1 sm:flex-none flex items-center justify-center gap-1.5 px-3 sm:px-4 py-2 sm:py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-[11px] font-semibold shadow transition"
+                            >
+                              <ChevronDown className="w-3.5 h-3.5" />
+                              <span>See More ({Math.min(PAGE_SIZE, remainingMovements)})</span>
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    )}
+                  </>
+                )}
+              </div>
+            </div>
           </div>
+        );
+      })()}
 
-          <div className="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden shadow-xl">
-            <table className="w-full text-left text-xs">
-              <thead>
-                <tr className="border-b border-slate-800 bg-slate-950/60 text-slate-400">
-                  <th className="py-3 px-4 font-semibold">Timestamp</th>
-                  <th className="py-3 px-4 font-semibold">Product</th>
-                  <th className="py-3 px-4 font-semibold">Type</th>
-                  <th className="py-3 px-4 text-center font-semibold">Delta</th>
-                  <th className="py-3 px-4 text-center font-semibold">Before</th>
-                  <th className="py-3 px-4 text-center font-semibold">After</th>
-                  <th className="py-3 px-4 text-right font-semibold">Loss Value</th>
-                  <th className="py-3 px-4 font-semibold">Reason</th>
-                  <th className="py-3 px-4 font-semibold">User</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-800/60">
-                {movements.map(m => {
-                  const isPositive = m.changeQty > 0;
-                  const isLossType = ['DAMAGED', 'BROKEN', 'EXPIRED', 'LOST'].includes(m.type);
-
-                  return (
-                    <tr key={m.id} className="hover:bg-slate-850/60 transition">
-                      <td className="py-3 px-4 text-slate-400 font-mono">{formatDateTime(m.createdAt)}</td>
-                      <td className="py-3 px-4 font-medium text-white">{m.productName}</td>
-                      <td className="py-3 px-4">
-                        <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${isLossType ? 'bg-rose-500/20 text-rose-300 border border-rose-500/30' : 'bg-slate-800 text-slate-300'}`}>
-                          {m.type}
-                        </span>
-                      </td>
-                      <td className="py-3 px-4 text-center font-mono font-bold">
-                        <span className={isPositive ? 'text-emerald-400' : 'text-rose-400'}>
-                          {isPositive ? `+${m.changeQty}` : m.changeQty}
-                        </span>
-                      </td>
-                      <td className="py-3 px-4 text-center font-mono text-slate-400">{m.previousQty}</td>
-                      <td className="py-3 px-4 text-center font-mono text-white font-semibold">{m.newQty}</td>
-                      <td className="py-3 px-4 text-right font-mono font-medium">
-                        {m.costValue !== undefined ? (
-                          <span className={isLossType ? 'text-rose-400 font-bold' : 'text-slate-300'}>
-                            {formatCurrency(m.costValue, settings.currencySymbol)}
-                          </span>
-                        ) : <span className="text-slate-600">-</span>}
-                      </td>
-                      <td className="py-3 px-4 text-slate-300 max-w-[200px] truncate">{m.reason}</td>
-                      <td className="py-3 px-4 text-slate-400">{m.userName}</td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
-        </div>
-      )}
-
-      {/* Tab 3: Loss Report */}
+      {/* TAB 3: Loss Report */}
       {activeTab === 'losses' && (
-        <div className="space-y-6">
-          <div className="bg-slate-900 border border-slate-800 rounded-xl p-4 flex flex-wrap items-center justify-between gap-3">
+        <div className="space-y-4">
+          <div className="bg-slate-900 border border-slate-800 rounded-xl p-3.5 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2.5">
             <div className="flex items-center gap-2">
-              <Calendar className="w-4 h-4 text-slate-400" />
-              <span className="text-xs text-slate-400">Period:</span>
-              <div className="flex gap-1">
+              <Calendar className="w-4 h-4 text-slate-400 shrink-0" />
+              <span className="text-xs text-slate-400 shrink-0">Period:</span>
+              <div className="flex gap-1 overflow-x-auto flex-1">
                 {[
                   { id: 'today', label: 'Today' },
-                  { id: 'week', label: 'This Week' },
-                  { id: 'month', label: 'This Month' },
-                  { id: 'all', label: 'All Time' },
+                  { id: 'week', label: 'Week' },
+                  { id: 'month', label: 'Month' },
+                  { id: 'all', label: 'All' },
                 ].map(p => (
                   <button
                     key={p.id}
                     onClick={() => setLossPeriod(p.id as any)}
-                    className={`px-3 py-1.5 rounded-lg text-xs font-medium transition ${
-                      lossPeriod === p.id ? 'bg-rose-600 text-white' : 'bg-slate-800 text-slate-400'
+                    className={`px-3 py-1.5 rounded-lg text-xs font-medium transition whitespace-nowrap ${
+                      lossPeriod === p.id
+                        ? 'bg-rose-600 text-white'
+                        : 'bg-slate-800 text-slate-400 hover:text-white active:bg-slate-700'
                     }`}
                   >
                     {p.label}
@@ -999,7 +2152,7 @@ export const AdminInventory: React.FC = () => {
               <select
                 value={lossTypeFilter}
                 onChange={e => setLossTypeFilter(e.target.value)}
-                className="bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-xs text-white"
+                className="flex-1 sm:flex-none bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-xs text-white"
               >
                 <option value="ALL">All Loss Types</option>
                 <option value="DAMAGED">💥 Damaged</option>
@@ -1010,86 +2163,151 @@ export const AdminInventory: React.FC = () => {
 
               <button
                 onClick={handlePrintLossReport}
-                className="flex items-center gap-1.5 px-3 py-2 rounded-lg bg-rose-600 hover:bg-rose-500 text-white text-xs font-semibold transition"
+                className="flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-rose-600 hover:bg-rose-500 active:bg-rose-700 text-white text-xs font-semibold transition shrink-0"
               >
                 <Printer className="w-3.5 h-3.5" />
-                <span>Print Report</span>
+                <span>Print PDF</span>
               </button>
             </div>
           </div>
 
-          <div className="grid grid-cols-3 gap-4">
-            <div className="p-4 bg-slate-900 border border-slate-800 rounded-xl text-center">
-              <span className="text-[10px] text-slate-400 uppercase block mb-1">Total Loss Value</span>
-              <span className="text-xl font-bold text-rose-400 font-mono">{formatCurrency(totalLossValue, settings.currencySymbol)}</span>
+          <div className="grid grid-cols-3 gap-2.5 sm:gap-4">
+            <div className="p-3 sm:p-4 bg-slate-900 border border-slate-800 rounded-xl text-center">
+              <span className="text-[10px] sm:text-xs text-slate-400 uppercase block mb-1">
+                Loss Value
+              </span>
+              <span className="text-sm sm:text-xl font-bold text-rose-400 font-mono truncate block">
+                {formatCurrency(totalLossValue, settings.currencySymbol)}
+              </span>
             </div>
-            <div className="p-4 bg-slate-900 border border-slate-800 rounded-xl text-center">
-              <span className="text-[10px] text-slate-400 uppercase block mb-1">Units Lost</span>
-              <span className="text-xl font-bold text-amber-400 font-mono">{totalLossUnits}</span>
+            <div className="p-3 sm:p-4 bg-slate-900 border border-slate-800 rounded-xl text-center">
+              <span className="text-[10px] sm:text-xs text-slate-400 uppercase block mb-1">
+                Units
+              </span>
+              <span className="text-sm sm:text-xl font-bold text-amber-400 font-mono">
+                {totalLossUnits}
+              </span>
             </div>
-            <div className="p-4 bg-slate-900 border border-slate-800 rounded-xl text-center">
-              <span className="text-[10px] text-slate-400 uppercase block mb-1">Loss Records</span>
-              <span className="text-xl font-bold text-purple-400 font-mono">{filteredLosses.length}</span>
+            <div className="p-3 sm:p-4 bg-slate-900 border border-slate-800 rounded-xl text-center">
+              <span className="text-[10px] sm:text-xs text-slate-400 uppercase block mb-1">
+                Records
+              </span>
+              <span className="text-sm sm:text-xl font-bold text-purple-400 font-mono">
+                {filteredLosses.length}
+              </span>
             </div>
           </div>
 
-          <div className="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden">
-            <table className="w-full text-left text-xs">
-              <thead>
-                <tr className="border-b border-slate-800 bg-slate-950/60 text-slate-400">
-                  <th className="py-3 px-4">Date</th>
-                  <th className="py-3 px-4">Product</th>
-                  <th className="py-3 px-4">Type</th>
-                  <th className="py-3 px-4 text-center">Qty Lost</th>
-                  <th className="py-3 px-4 text-right">Loss Value</th>
-                  <th className="py-3 px-4">Reason</th>
-                  <th className="py-3 px-4">Recorded By</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-800/60">
-                {filteredLosses.length === 0 ? (
-                  <tr>
-                    <td colSpan={7} className="py-8 text-center text-slate-500">No loss records for this period.</td>
-                  </tr>
-                ) : (
-                  filteredLosses.map(m => (
-                    <tr key={m.id} className="hover:bg-slate-850/60">
-                      <td className="py-3 px-4 text-slate-400 font-mono">{formatDateTime(m.createdAt)}</td>
-                      <td className="py-3 px-4 font-semibold text-white">{m.productName}</td>
-                      <td className="py-3 px-4">
-                        <span className="px-2 py-0.5 rounded bg-rose-500/15 text-rose-400 border border-rose-500/30 text-[10px] font-bold">
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden">
+            {filteredLosses.length === 0 ? (
+              <div className="py-12 text-center text-slate-500">
+                <PackageX className="w-8 h-8 mx-auto mb-2 opacity-40" />
+                <p className="text-xs sm:text-sm">No loss records for this period.</p>
+              </div>
+            ) : (
+              <>
+                <div className="hidden md:block overflow-x-auto">
+                  <table className="w-full text-left text-xs">
+                    <thead>
+                      <tr className="border-b border-slate-800 bg-slate-950/60 text-slate-400">
+                        <th className="py-3 px-4 font-semibold">Date</th>
+                        <th className="py-3 px-4 font-semibold">Product</th>
+                        <th className="py-3 px-4 font-semibold">Type</th>
+                        <th className="py-3 px-4 text-center font-semibold">Qty Lost</th>
+                        <th className="py-3 px-4 text-right font-semibold">Loss Value</th>
+                        <th className="py-3 px-4 font-semibold">Reason</th>
+                        <th className="py-3 px-4 font-semibold">Recorded By</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-800/60">
+                      {filteredLosses.map(m => (
+                        <tr key={m.id} className="hover:bg-slate-850/60 transition">
+                          <td className="py-3 px-4 font-mono text-slate-400 text-[11px] whitespace-nowrap">
+                            {formatDateTime(m.createdAt)}
+                          </td>
+                          <td className="py-3 px-4 font-semibold text-white">{m.productName}</td>
+                          <td className="py-3 px-4">
+                            <span className="px-2 py-0.5 rounded bg-rose-500/15 text-rose-400 border border-rose-500/30 text-[10px] font-bold">
+                              {m.type}
+                            </span>
+                          </td>
+                          <td className="py-3 px-4 text-center font-mono font-bold text-rose-400">
+                            {Math.abs(m.changeQty)}
+                          </td>
+                          <td className="py-3 px-4 text-right font-mono font-bold text-rose-400">
+                            {formatCurrency(m.costValue || 0, settings.currencySymbol)}
+                          </td>
+                          <td className="py-3 px-4 text-slate-400 max-w-xs truncate">
+                            {m.reason || '-'}
+                          </td>
+                          <td className="py-3 px-4 text-slate-400">{m.userName}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+
+                <div className="md:hidden divide-y divide-slate-800/80">
+                  {filteredLosses.map(m => (
+                    <div key={m.id} className="p-3.5 space-y-2">
+                      <div className="flex items-start justify-between gap-2">
+                        <div className="min-w-0 flex-1">
+                          <h4 className="font-bold text-xs text-white truncate">{m.productName}</h4>
+                          <p className="text-[10px] font-mono text-slate-400">
+                            {formatDateTime(m.createdAt)}
+                          </p>
+                        </div>
+                        <span className="px-2 py-0.5 rounded bg-rose-500/15 text-rose-400 border border-rose-500/30 text-[10px] font-bold shrink-0">
                           {m.type}
                         </span>
-                      </td>
-                      <td className="py-3 px-4 text-center font-mono font-bold text-rose-400">{Math.abs(m.changeQty)}</td>
-                      <td className="py-3 px-4 text-right font-mono font-bold text-rose-400">{formatCurrency(m.costValue || 0, settings.currencySymbol)}</td>
-                      <td className="py-3 px-4 text-slate-300 max-w-[200px] truncate">{m.reason}</td>
-                      <td className="py-3 px-4 text-slate-400">{m.userName}</td>
-                    </tr>
-                  ))
-                )}
-              </tbody>
-            </table>
+                      </div>
+                      <div className="flex items-center justify-between text-xs pt-1">
+                        <span className="text-slate-400 text-[11px]">
+                          Qty Lost:{' '}
+                          <strong className="text-rose-400 font-mono">
+                            {Math.abs(m.changeQty)}
+                          </strong>
+                        </span>
+                        <span className="font-mono font-bold text-rose-400 text-xs">
+                          {formatCurrency(m.costValue || 0, settings.currencySymbol)}
+                        </span>
+                      </div>
+                      {m.reason && (
+                        <p className="text-[11px] text-slate-400 bg-slate-950/60 p-2 rounded-lg border border-slate-800">
+                          {m.reason}
+                        </p>
+                      )}
+                      <div className="text-[10px] text-slate-500 text-right">By {m.userName}</div>
+                    </div>
+                  ))}
+                </div>
+              </>
+            )}
           </div>
         </div>
       )}
 
       {/* Manual Stock Adjustment Modal */}
       {isAdjustModalOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 backdrop-blur-sm p-4">
-          <div className="bg-slate-900 border border-slate-800 rounded-2xl max-w-md w-full p-6 shadow-2xl animate-in fade-in zoom-in-95">
+        <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-slate-950/80 backdrop-blur-sm sm:p-4">
+          <div className="bg-slate-900 border border-slate-800 rounded-t-2xl sm:rounded-2xl max-w-md w-full p-4 sm:p-6 shadow-2xl max-h-[92vh] overflow-y-auto">
             <div className="flex items-center justify-between pb-3 border-b border-slate-800 mb-4">
               <div className="flex items-center gap-2">
                 <ArrowUpDown className="w-5 h-5 text-blue-400" />
-                <h3 className="text-base font-bold text-white">Stock Adjustment & Loss Tracking</h3>
+                <h3 className="text-base font-bold text-white">Stock Adjustment</h3>
               </div>
-              <button onClick={() => setIsAdjustModalOpen(false)} className="text-slate-400 hover:text-white p-1">
+              <button
+                onClick={() => setIsAdjustModalOpen(false)}
+                className="text-slate-400 hover:text-white p-1"
+              >
                 <X className="w-5 h-5" />
               </button>
             </div>
 
             {modalError && (
-              <div className="mb-4 p-3 rounded-lg bg-rose-500/15 border border-rose-500/30 text-rose-300 text-xs">{modalError}</div>
+              <div className="mb-4 p-3 rounded-lg bg-rose-500/15 border border-rose-500/30 text-rose-300 text-xs">
+                {modalError}
+              </div>
             )}
 
             <form onSubmit={handleAdjustStock} className="space-y-4 text-xs">
@@ -1098,10 +2316,10 @@ export const AdminInventory: React.FC = () => {
                 <select
                   value={selectedProductId}
                   onChange={e => setSelectedProductId(e.target.value)}
-                  className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white focus:outline-none focus:ring-1 focus:ring-blue-500"
+                  className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2.5 text-white focus:outline-none focus:ring-1 focus:ring-blue-500"
                 >
                   <option value="">-- Choose Product --</option>
-                  {dbState.products.map(p => (
+                  {visibleProducts.map(p => (
                     <option key={p.id} value={p.id}>
                       {p.name} (Current: {p.currentStock} {p.unit})
                     </option>
@@ -1110,7 +2328,9 @@ export const AdminInventory: React.FC = () => {
               </div>
 
               <div>
-                <label className="block text-slate-300 font-medium mb-1">Adjustment Reason Category *</label>
+                <label className="block text-slate-300 font-medium mb-1">
+                  Adjustment Reason Category *
+                </label>
                 <select
                   value={adjustmentCategory}
                   onChange={e => {
@@ -1122,7 +2342,7 @@ export const AdminInventory: React.FC = () => {
                       setAdjustmentType('IN');
                     }
                   }}
-                  className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white focus:outline-none focus:ring-1 focus:ring-blue-500"
+                  className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2.5 text-white focus:outline-none focus:ring-1 focus:ring-blue-500"
                 >
                   <option value="DAMAGED">💥 Damaged Goods</option>
                   <option value="BROKEN">🔨 Broken Items</option>
@@ -1136,16 +2356,37 @@ export const AdminInventory: React.FC = () => {
               <div>
                 <label className="block text-slate-300 font-medium mb-1">Adjustment Action</label>
                 <div className="grid grid-cols-3 gap-2">
-                  <button type="button" onClick={() => setAdjustmentType('IN')}
-                    className={`py-2 rounded-lg font-semibold transition ${adjustmentType === 'IN' ? 'bg-emerald-600 text-white' : 'bg-slate-950 text-slate-400 border border-slate-800'}`}>
-                    + Add Stock
+                  <button
+                    type="button"
+                    onClick={() => setAdjustmentType('IN')}
+                    className={`py-2.5 rounded-lg font-semibold transition text-[11px] ${
+                      adjustmentType === 'IN'
+                        ? 'bg-emerald-600 text-white'
+                        : 'bg-slate-950 text-slate-400 border border-slate-800 active:bg-slate-800'
+                    }`}
+                  >
+                    + Add
                   </button>
-                  <button type="button" onClick={() => setAdjustmentType('OUT')}
-                    className={`py-2 rounded-lg font-semibold transition ${adjustmentType === 'OUT' ? 'bg-rose-600 text-white' : 'bg-slate-950 text-slate-400 border border-slate-800'}`}>
-                    - Deduct Stock
+                  <button
+                    type="button"
+                    onClick={() => setAdjustmentType('OUT')}
+                    className={`py-2.5 rounded-lg font-semibold transition text-[11px] ${
+                      adjustmentType === 'OUT'
+                        ? 'bg-rose-600 text-white'
+                        : 'bg-slate-950 text-slate-400 border border-slate-800 active:bg-slate-800'
+                    }`}
+                  >
+                    − Deduct
                   </button>
-                  <button type="button" onClick={() => setAdjustmentType('SET')}
-                    className={`py-2 rounded-lg font-semibold transition ${adjustmentType === 'SET' ? 'bg-blue-600 text-white' : 'bg-slate-950 text-slate-400 border border-slate-800'}`}>
+                  <button
+                    type="button"
+                    onClick={() => setAdjustmentType('SET')}
+                    className={`py-2.5 rounded-lg font-semibold transition text-[11px] ${
+                      adjustmentType === 'SET'
+                        ? 'bg-blue-600 text-white'
+                        : 'bg-slate-950 text-slate-400 border border-slate-800 active:bg-slate-800'
+                    }`}
+                  >
                     = Set Exact
                   </button>
                 </div>
@@ -1157,11 +2398,12 @@ export const AdminInventory: React.FC = () => {
                 </label>
                 <input
                   type="number"
+                  inputMode="numeric"
                   min="0"
                   required
                   value={quantityInput}
                   onChange={e => setQuantityInput(e.target.value)}
-                  className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white font-mono focus:outline-none focus:ring-1 focus:ring-blue-500"
+                  className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2.5 text-white font-mono focus:outline-none focus:ring-1 focus:ring-blue-500"
                 />
               </div>
 
@@ -1169,8 +2411,14 @@ export const AdminInventory: React.FC = () => {
                 <div className="p-3 rounded-lg bg-rose-500/10 border border-rose-500/20 text-xs space-y-1">
                   <div className="flex justify-between text-rose-300 font-medium">
                     <span>Estimated Loss:</span>
-                    <span className="font-bold font-mono">{formatCurrency(calculatedLossValue, settings.currencySymbol)}</span>
+                    <span className="font-bold font-mono">
+                      {formatCurrency(calculatedLossValue, settings.currencySymbol)}
+                    </span>
                   </div>
+                  <p className="text-[10px] text-slate-400">
+                    At cost {formatCurrency(selectedProduct.purchasePrice, settings.currencySymbol)}
+                    /unit
+                  </p>
                 </div>
               )}
 
@@ -1181,15 +2429,24 @@ export const AdminInventory: React.FC = () => {
                   value={reasonInput}
                   onChange={e => setReasonInput(e.target.value)}
                   placeholder="e.g. Broken in shipment..."
-                  className="w-full bg-slate-950 border border-slate-800 rounded-lg p-2.5 text-white"
+                  className="w-full bg-slate-950 border border-slate-800 rounded-lg p-2.5 text-white placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
                 />
               </div>
 
               <div className="pt-3 border-t border-slate-800 flex justify-end gap-2">
-                <button type="button" onClick={() => setIsAdjustModalOpen(false)}
-                  className="px-4 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 font-semibold transition">Cancel</button>
-                <button type="submit"
-                  className="px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 text-white font-semibold shadow transition">Apply Adjustment</button>
+                <button
+                  type="button"
+                  onClick={() => setIsAdjustModalOpen(false)}
+                  className="px-4 py-2.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 font-semibold transition"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  className="px-4 py-2.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-white font-semibold shadow transition"
+                >
+                  Apply Adjustment
+                </button>
               </div>
             </form>
           </div>
