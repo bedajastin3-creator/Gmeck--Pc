@@ -1,6 +1,7 @@
 import { db } from '../db/storage';
 import { BusinessSettings, Sale, SaleEditRequest } from '../types';
 import { formatCurrency, formatDateTime } from './formatters';
+import { downloadPdfBlob, PdfPrintResult, printPdfBlob } from './pdfExport';
 
 export interface SaleEditChangeItem {
   kind: 'added' | 'removed' | 'modified' | 'total';
@@ -133,7 +134,7 @@ function truncate(str: string, maxLen: number): string {
   return `${s.slice(0, Math.max(1, maxLen - 3))}...`;
 }
 
-export async function printSaleEditsReportPdf(
+function buildSaleEditsReportBlob(
   requests: SaleEditRequest[],
   salesById: Map<string, Sale>,
   settings: BusinessSettings,
@@ -142,8 +143,7 @@ export async function printSaleEditsReportPdf(
     statusLabel: string;
     shopLabel: string;
   }
-): Promise<boolean> {
-  try {
+): { blob: Blob; fileName: string } {
     const pageWidth = 595.28;
     const pageHeight = 841.89;
     const marginLeft = 36;
@@ -386,18 +386,46 @@ export async function printSaleEditsReportPdf(
 
     const fileName = `sale_edits_history_${new Date().toISOString().slice(0, 10)}.pdf`;
     const blob = new Blob([bytes], { type: 'application/pdf' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = fileName;
-    link.style.display = 'none';
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-    window.setTimeout(() => URL.revokeObjectURL(url), 1500);
-    return true;
+    return { blob, fileName };
+}
+
+export async function downloadSaleEditsReportPdf(
+  requests: SaleEditRequest[],
+  salesById: Map<string, Sale>,
+  settings: BusinessSettings,
+  meta: {
+    periodLabel: string;
+    statusLabel: string;
+    shopLabel: string;
+  }
+): Promise<boolean> {
+  try {
+    const { blob, fileName } = buildSaleEditsReportBlob(requests, salesById, settings, meta);
+    return downloadPdfBlob(blob, fileName);
   } catch (err) {
-    console.error('[saleEditsPrint] printSaleEditsReportPdf failed:', err);
+    console.error('[saleEditsPrint] downloadSaleEditsReportPdf failed:', err);
     return false;
+  }
+}
+
+export async function printSaleEditsReportPdf(
+  requests: SaleEditRequest[],
+  salesById: Map<string, Sale>,
+  settings: BusinessSettings,
+  meta: {
+    periodLabel: string;
+    statusLabel: string;
+    shopLabel: string;
+  }
+): Promise<PdfPrintResult> {
+  try {
+    const { blob, fileName } = buildSaleEditsReportBlob(requests, salesById, settings, meta);
+    return printPdfBlob(blob, fileName);
+  } catch (err: any) {
+    console.error('[saleEditsPrint] printSaleEditsReportPdf failed:', err);
+    return {
+      ok: false,
+      error: err?.message || 'Could not print sale edits PDF.',
+    };
   }
 }

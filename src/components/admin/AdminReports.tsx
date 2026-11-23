@@ -20,6 +20,7 @@ import {
   ArrowLeft,
   Trophy,
   Award,
+  Loader2,
 } from 'lucide-react';
 import { useApp } from '../../context/AppContext';
 import {
@@ -31,6 +32,9 @@ import {
   downloadFinancialReportPdf,
   downloadPriceDeviationsPdf,
   downloadShopProfitLossPdf,
+  printFinancialReportPdf,
+  printPriceDeviationsPdf,
+  printShopProfitLossPdf,
 } from '../../utils/pdfExport';
 import { saveTextFileCrossPlatform } from '../../utils/nativeDownload';
 import {
@@ -269,6 +273,11 @@ export const AdminReports: React.FC = () => {
   const [sellerSearch, setSellerSearch] = useState('');
   const [assistantSearch, setAssistantSearch] = useState('');
   const [isPrinting, setIsPrinting] = useState(false);
+  const [isDownloadingPdf, setIsDownloadingPdf] = useState(false);
+  const [isPrintingPnl, setIsPrintingPnl] = useState(false);
+  const [isDownloadingPnl, setIsDownloadingPnl] = useState(false);
+  const [isPrintingDeviations, setIsPrintingDeviations] = useState(false);
+  const [isDownloadingDeviations, setIsDownloadingDeviations] = useState(false);
   const [deviationDirection, setDeviationDirection] = useState<DeviationDirection>('ALL');
 
   // Full-page Assistant Rankings state
@@ -850,10 +859,9 @@ export const AdminReports: React.FC = () => {
   const hiddenDeviationCount = Math.max(0, deviations.length - DEVIATION_DISPLAY_CAP);
 
   // ─────────────────────────────────────────────────────────────
-  // Print Main Report
+  // Print & Download Main Report
   // ─────────────────────────────────────────────────────────────
-  const handlePrintReport = async () => {
-    setIsPrinting(true);
+  const buildFinancialReportMeta = () => {
     const periodLabelMap: Record<ReportPeriod, { key: string; label: string }> = {
       today: { key: 'day', label: 'Day (Today)' },
       week: { key: 'week', label: 'Week (Last 7 Days)' },
@@ -862,32 +870,111 @@ export const AdminReports: React.FC = () => {
       custom: { key: 'custom', label: 'Custom Range' },
     };
     const pMeta = periodLabelMap[incomePeriod];
-    const ok = await downloadFinancialReportPdf(incomeSummary, settings, {
-      shopLabel: selectedShopName,
-      from: incomeRange.from || undefined,
-      to: incomeRange.to || undefined,
-      periodKey: pMeta.key,
-      periodLabel: pMeta.label,
-    });
-    if (ok) {
-      addToast({
-        type: 'success',
-        title: `Financial PDF Downloaded (${pMeta.label})`,
-        description: `Saved ${pMeta.label} financial report for ${selectedShopName} to Downloads.`,
-      });
-    } else {
-      addToast({
-        type: 'error',
-        title: 'PDF Export Failed',
-        description: 'Could not save financial PDF report on this device.',
-      });
+    return {
+      pMeta,
+      meta: {
+        shopLabel: selectedShopName,
+        from: incomeRange.from || undefined,
+        to: incomeRange.to || undefined,
+        periodKey: pMeta.key,
+        periodLabel: pMeta.label,
+      },
+    };
+  };
+
+  const handleDownloadReportPdf = async () => {
+    if (isDownloadingPdf) return;
+    setIsDownloadingPdf(true);
+    try {
+      const { pMeta, meta } = buildFinancialReportMeta();
+      const ok = await downloadFinancialReportPdf(incomeSummary, settings, meta);
+      if (ok) {
+        addToast({
+          type: 'success',
+          title: `Financial PDF Downloaded (${pMeta.label})`,
+          description: `Saved ${pMeta.label} financial report for ${selectedShopName} to Downloads.`,
+        });
+      } else {
+        addToast({
+          type: 'error',
+          title: 'PDF Export Failed',
+          description: 'Could not save financial PDF report on this device.',
+        });
+      }
+    } finally {
+      setIsDownloadingPdf(false);
     }
-    setIsPrinting(false);
+  };
+
+  const handlePrintReport = async () => {
+    if (isPrinting) return;
+    setIsPrinting(true);
+    try {
+      const { pMeta, meta } = buildFinancialReportMeta();
+      const res = await printFinancialReportPdf(incomeSummary, settings, meta);
+      if (res.ok) {
+        addToast({
+          type: 'success',
+          title:
+            res.mode === 'fallback_download'
+              ? `Opened Financial PDF (${pMeta.label})`
+              : 'Print Dialog Opened',
+          description:
+            res.mode === 'fallback_download'
+              ? 'Use the printer option in your PDF viewer to print.'
+              : `Ready to print ${pMeta.label} financial report for ${selectedShopName}.`,
+        });
+      } else {
+        addToast({
+          type: 'error',
+          title: 'Print Failed',
+          description: res.error || 'Could not open print dialog on this device.',
+        });
+      }
+    } finally {
+      setIsPrinting(false);
+    }
   };
 
   // ─────────────────────────────────────────────────────────────
-  // Download Deviations PDF
+  // Print & Download Deviations PDF
   // ─────────────────────────────────────────────────────────────
+  const handleDownloadDeviationsPdf = async () => {
+    if (deviations.length === 0) {
+      addToast({
+        type: 'info',
+        title: 'No Deviations',
+        description: 'There are no price deviations in the current filter.',
+      });
+      return;
+    }
+    if (isDownloadingDeviations) return;
+    setIsDownloadingDeviations(true);
+    try {
+      const ok = await downloadPriceDeviationsPdf(deviations, deviationStats, settings, {
+        shopLabel: selectedShopName,
+        from: deviationRange.from || undefined,
+        to: deviationRange.to || undefined,
+        direction: deviationDirection,
+      });
+      if (ok) {
+        addToast({
+          type: 'success',
+          title: 'Deviations PDF Downloaded',
+          description: `Saved PDF with ${deviations.length} price deviation(s) to Downloads.`,
+        });
+      } else {
+        addToast({
+          type: 'error',
+          title: 'PDF Export Failed',
+          description: 'Could not save price deviations PDF on this device.',
+        });
+      }
+    } finally {
+      setIsDownloadingDeviations(false);
+    }
+  };
+
   const handlePrintDeviations = async () => {
     if (deviations.length === 0) {
       addToast({
@@ -897,25 +984,36 @@ export const AdminReports: React.FC = () => {
       });
       return;
     }
-
-    const ok = await downloadPriceDeviationsPdf(deviations, deviationStats, settings, {
-      shopLabel: selectedShopName,
-      from: deviationRange.from || undefined,
-      to: deviationRange.to || undefined,
-      direction: deviationDirection,
-    });
-    if (ok) {
-      addToast({
-        type: 'success',
-        title: 'Deviations PDF Downloaded',
-        description: `Saved PDF with ${deviations.length} price deviation(s) to Downloads.`,
+    if (isPrintingDeviations) return;
+    setIsPrintingDeviations(true);
+    try {
+      const res = await printPriceDeviationsPdf(deviations, deviationStats, settings, {
+        shopLabel: selectedShopName,
+        from: deviationRange.from || undefined,
+        to: deviationRange.to || undefined,
+        direction: deviationDirection,
       });
-    } else {
-      addToast({
-        type: 'error',
-        title: 'PDF Export Failed',
-        description: 'Could not save price deviations PDF on this device.',
-      });
+      if (res.ok) {
+        addToast({
+          type: 'success',
+          title:
+            res.mode === 'fallback_download'
+              ? 'Opened Deviations PDF'
+              : 'Print Dialog Opened',
+          description:
+            res.mode === 'fallback_download'
+              ? 'Use the printer option in your PDF viewer to print.'
+              : `Ready to print ${deviations.length} price deviation(s).`,
+        });
+      } else {
+        addToast({
+          type: 'error',
+          title: 'Print Failed',
+          description: res.error || 'Could not open print dialog on this device.',
+        });
+      }
+    } finally {
+      setIsPrintingDeviations(false);
     }
   };
 
@@ -1027,7 +1125,7 @@ export const AdminReports: React.FC = () => {
     }
   };
 
-  const handlePrintShopProfitLoss = async () => {
+  const handleDownloadShopProfitLossPdf = async () => {
     const rows = visiblePnlShops;
     if (rows.length === 0) {
       addToast({
@@ -1037,30 +1135,80 @@ export const AdminReports: React.FC = () => {
       });
       return;
     }
-
-    const ok = await downloadShopProfitLossPdf(
-      rows,
-      shopProfitLoss.totals,
-      shopProfitLoss.generalCompanyExpenses,
-      settings,
-      {
-        from: pnlRange.from || undefined,
-        to: pnlRange.to || undefined,
-        periodLabel: pnlPeriod,
+    if (isDownloadingPnl) return;
+    setIsDownloadingPnl(true);
+    try {
+      const ok = await downloadShopProfitLossPdf(
+        rows,
+        shopProfitLoss.totals,
+        shopProfitLoss.generalCompanyExpenses,
+        settings,
+        {
+          from: pnlRange.from || undefined,
+          to: pnlRange.to || undefined,
+          periodLabel: pnlPeriod,
+        }
+      );
+      if (ok) {
+        addToast({
+          type: 'success',
+          title: 'P&L PDF Downloaded',
+          description: `Saved Shop Profit & Loss PDF (${rows.length} shop(s)) to Downloads.`,
+        });
+      } else {
+        addToast({
+          type: 'error',
+          title: 'PDF Export Failed',
+          description: 'Could not save Shop Profit & Loss PDF on this device.',
+        });
       }
-    );
-    if (ok) {
+    } finally {
+      setIsDownloadingPnl(false);
+    }
+  };
+
+  const handlePrintShopProfitLoss = async () => {
+    const rows = visiblePnlShops;
+    if (rows.length === 0) {
       addToast({
-        type: 'success',
-        title: 'P&L PDF Downloaded',
-        description: `Saved Shop Profit & Loss PDF (${rows.length} shop(s)) to Downloads.`,
+        type: 'info',
+        title: 'Nothing to Print',
+        description: 'No shop profit & loss data available.',
       });
-    } else {
-      addToast({
-        type: 'error',
-        title: 'PDF Export Failed',
-        description: 'Could not save Shop Profit & Loss PDF on this device.',
-      });
+      return;
+    }
+    if (isPrintingPnl) return;
+    setIsPrintingPnl(true);
+    try {
+      const res = await printShopProfitLossPdf(
+        rows,
+        shopProfitLoss.totals,
+        shopProfitLoss.generalCompanyExpenses,
+        settings,
+        {
+          from: pnlRange.from || undefined,
+          to: pnlRange.to || undefined,
+          periodLabel: pnlPeriod,
+        }
+      );
+      if (res.ok) {
+        addToast({
+          type: 'success',
+          title: res.mode === 'fallback_download' ? 'Opened P&L PDF' : 'Print Dialog Opened',
+          description:
+            res.mode === 'fallback_download'
+              ? 'Use the printer option in your PDF viewer to print.'
+              : `Ready to print Shop Profit & Loss (${rows.length} shop(s)).`,
+        });
+      } else {
+        addToast({
+          type: 'error',
+          title: 'Print Failed',
+          description: res.error || 'Could not open print dialog on this device.',
+        });
+      }
+    } finally {
+      setIsPrintingPnl(false);
     }
   };
 
@@ -1611,10 +1759,27 @@ export const AdminReports: React.FC = () => {
           <button
             onClick={handlePrintReport}
             disabled={isPrinting}
+            className="flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-indigo-600/20 hover:bg-indigo-600 text-indigo-300 hover:text-white border border-indigo-500/35 text-xs font-semibold shadow transition disabled:opacity-50 active:scale-95"
+          >
+            {isPrinting ? (
+              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+            ) : (
+              <Printer className="w-3.5 h-3.5" />
+            )}
+            <span>{isPrinting ? 'Printing...' : 'Print'}</span>
+          </button>
+
+          <button
+            onClick={handleDownloadReportPdf}
+            disabled={isDownloadingPdf}
             className="flex items-center gap-1.5 px-4 py-2 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold shadow transition disabled:opacity-50 active:scale-95"
           >
-            <Printer className="w-3.5 h-3.5" />
-            <span>{isPrinting ? 'Generating...' : 'Download PDF'}</span>
+            {isDownloadingPdf ? (
+              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+            ) : (
+              <Download className="w-3.5 h-3.5" />
+            )}
+            <span>{isDownloadingPdf ? 'Generating...' : 'Download PDF'}</span>
           </button>
         </div>
       </div>
@@ -1721,7 +1886,7 @@ export const AdminReports: React.FC = () => {
               </span>
             </button>
 
-            <div className="flex items-center gap-1.5 shrink-0">
+            <div className="flex items-center flex-wrap gap-1.5 shrink-0">
               <button
                 type="button"
                 onClick={handleExportShopProfitLossCSV}
@@ -1733,9 +1898,27 @@ export const AdminReports: React.FC = () => {
               <button
                 type="button"
                 onClick={handlePrintShopProfitLoss}
-                className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-[11px] font-semibold shadow transition"
+                disabled={isPrintingPnl}
+                className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-indigo-600/20 hover:bg-indigo-600 text-indigo-300 hover:text-white border border-indigo-500/35 text-[11px] font-semibold shadow transition disabled:opacity-50"
               >
-                <Printer className="w-3.5 h-3.5" />
+                {isPrintingPnl ? (
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                ) : (
+                  <Printer className="w-3.5 h-3.5" />
+                )}
+                <span>Print P&amp;L</span>
+              </button>
+              <button
+                type="button"
+                onClick={handleDownloadShopProfitLossPdf}
+                disabled={isDownloadingPnl}
+                className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-[11px] font-semibold shadow transition disabled:opacity-50"
+              >
+                {isDownloadingPnl ? (
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                ) : (
+                  <Download className="w-3.5 h-3.5" />
+                )}
                 <span>Download P&amp;L PDF</span>
               </button>
             </div>
@@ -2309,7 +2492,7 @@ export const AdminReports: React.FC = () => {
           accent="rose"
           actions={
             allDeviations.length > 0 ? (
-              <div className="flex items-center gap-1.5">
+              <div className="flex items-center flex-wrap gap-1.5">
                 <button
                   onClick={handleExportDeviationsCSV}
                   className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 text-[10px] font-semibold transition"
@@ -2319,9 +2502,26 @@ export const AdminReports: React.FC = () => {
                 </button>
                 <button
                   onClick={handlePrintDeviations}
-                  className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-rose-600 hover:bg-rose-500 text-white text-[10px] font-semibold shadow transition"
+                  disabled={isPrintingDeviations}
+                  className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-indigo-600/20 hover:bg-indigo-600 text-indigo-300 hover:text-white border border-indigo-500/35 text-[10px] font-semibold shadow transition disabled:opacity-50"
                 >
-                  <Printer className="w-3 h-3" />
+                  {isPrintingDeviations ? (
+                    <Loader2 className="w-3 h-3 animate-spin" />
+                  ) : (
+                    <Printer className="w-3 h-3" />
+                  )}
+                  <span>Print</span>
+                </button>
+                <button
+                  onClick={handleDownloadDeviationsPdf}
+                  disabled={isDownloadingDeviations}
+                  className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-rose-600 hover:bg-rose-500 text-white text-[10px] font-semibold shadow transition disabled:opacity-50"
+                >
+                  {isDownloadingDeviations ? (
+                    <Loader2 className="w-3 h-3 animate-spin" />
+                  ) : (
+                    <Download className="w-3 h-3" />
+                  )}
                   <span>PDF</span>
                 </button>
               </div>

@@ -19,16 +19,23 @@ import {
   Warehouse,
   FileText,
   FileSpreadsheet,
+  Download,
 } from 'lucide-react';
 import { useApp } from '../../context/AppContext';
 import { InventoryService } from '../../services/inventoryService';
 import { ExcelExportService } from '../../services/excelExportService';
 import { formatCurrency, formatDateTime } from '../../utils/formatters';
-import { printMovementsReportPdf } from '../../utils/movementsPrint';
+import {
+  downloadMovementsReportPdf,
+  printMovementsReportPdf,
+} from '../../utils/movementsPrint';
 import {
   downloadInventoryReportPdf,
   downloadLossReportPdf,
   downloadLowStockReportPdf,
+  printInventoryReportPdf,
+  printLossReportPdf,
+  printLowStockReportPdf,
   InventoryExportMeta,
   InventoryExportRow,
   InventoryExportScope,
@@ -633,6 +640,46 @@ export const AdminInventory: React.FC = () => {
     return 'All';
   };
 
+  const handlePrintInventoryPdf = async (targetShopId?: string) => {
+    const key = `print:${targetShopId || 'ALL'}`;
+    if (exportingKey) return;
+    setExportingKey(key);
+    try {
+      const { rows, meta } = buildInventoryExportPayload(targetShopId);
+      if (rows.length === 0) {
+        addToast({
+          type: 'warning',
+          title: 'Nothing to Print',
+          description: `No ${getScopeShortText(meta.scope).toLowerCase()} inventory items match your current selection.`,
+        });
+        return;
+      }
+
+      const res = await printInventoryReportPdf(rows, settings, meta);
+      if (res.ok) {
+        addToast({
+          type: 'success',
+          title:
+            res.mode === 'fallback_download'
+              ? `Opened ${getScopeShortText(meta.scope)} Inventory PDF`
+              : 'Print Dialog Opened',
+          description:
+            res.mode === 'fallback_download'
+              ? 'Use the printer option in your PDF viewer to print.'
+              : `Ready to print ${rows.length} product(s) for ${meta.shopLabel} (${getScopeShortText(meta.scope)}).`,
+        });
+      } else {
+        addToast({
+          type: 'error',
+          title: 'Print Failed',
+          description: res.error || 'Could not open print dialog on this device.',
+        });
+      }
+    } finally {
+      setExportingKey(null);
+    }
+  };
+
   const handleDownloadInventoryPdf = async (targetShopId?: string) => {
     const key = `pdf:${targetShopId || 'ALL'}`;
     if (exportingKey) return;
@@ -702,56 +749,140 @@ export const AdminInventory: React.FC = () => {
   };
 
   // ==============================
-  // DOWNLOAD LOW STOCK PDF
+  // PRINT & DOWNLOAD LOW STOCK PDF
   // ==============================
+  const getLowStockScopeLabel = () =>
+    shopAdmin && !platformAdmin
+      ? shops.length === 1
+        ? shops[0].name
+        : 'Managed Shops'
+      : 'All Shops Combined';
+
+  const handleDownloadLowStockReport = async () => {
+    if (exportingKey) return;
+    setExportingKey('lowstock:pdf');
+    try {
+      const ok = await downloadLowStockReportPdf(
+        allLowStockProducts,
+        shops,
+        settings,
+        getLowStockScopeLabel()
+      );
+      if (ok) {
+        addToast({
+          type: 'success',
+          title: 'Low Stock PDF Downloaded',
+          description: `Saved PDF with ${allLowStockProducts.length} low stock item(s) to Downloads.`,
+        });
+      } else {
+        addToast({
+          type: 'error',
+          title: 'PDF Export Failed',
+          description: 'Could not save low stock PDF report on this device.',
+        });
+      }
+    } finally {
+      setExportingKey(null);
+    }
+  };
+
   const handlePrintLowStockReport = async () => {
-    const scopeLabel =
-      shopAdmin && !platformAdmin
-        ? shops.length === 1
-          ? shops[0].name
-          : 'Managed Shops'
-        : 'All Shops Combined';
-
-    const ok = await downloadLowStockReportPdf(allLowStockProducts, shops, settings, scopeLabel);
-    if (ok) {
-      addToast({
-        type: 'success',
-        title: 'Low Stock PDF Downloaded',
-        description: `Saved PDF with ${allLowStockProducts.length} low stock item(s) to Downloads.`,
-      });
-    } else {
-      addToast({
-        type: 'error',
-        title: 'PDF Export Failed',
-        description: 'Could not save low stock PDF report on this device.',
-      });
+    if (exportingKey) return;
+    setExportingKey('lowstock:print');
+    try {
+      const res = await printLowStockReportPdf(
+        allLowStockProducts,
+        shops,
+        settings,
+        getLowStockScopeLabel()
+      );
+      if (res.ok) {
+        addToast({
+          type: 'success',
+          title:
+            res.mode === 'fallback_download'
+              ? 'Opened Low Stock PDF'
+              : 'Print Dialog Opened',
+          description:
+            res.mode === 'fallback_download'
+              ? 'Use the printer option in your PDF viewer to print.'
+              : `Ready to print ${allLowStockProducts.length} low stock item(s).`,
+        });
+      } else {
+        addToast({
+          type: 'error',
+          title: 'Print Failed',
+          description: res.error || 'Could not open print dialog on this device.',
+        });
+      }
+    } finally {
+      setExportingKey(null);
     }
   };
 
-  // Download Stock Loss Report PDF
+  // Print & Download Stock Loss Report PDF
+  const handleDownloadLossReport = async () => {
+    if (exportingKey) return;
+    setExportingKey('loss:pdf');
+    try {
+      const ok = await downloadLossReportPdf(filteredLosses, settings, {
+        periodLabel: lossPeriod.toUpperCase(),
+        totalLossValue,
+        totalLossUnits,
+      });
+      if (ok) {
+        addToast({
+          type: 'success',
+          title: 'Loss Report PDF Downloaded',
+          description: `Saved PDF with ${filteredLosses.length} loss record(s) to Downloads.`,
+        });
+      } else {
+        addToast({
+          type: 'error',
+          title: 'PDF Export Failed',
+          description: 'Could not save stock loss PDF report on this device.',
+        });
+      }
+    } finally {
+      setExportingKey(null);
+    }
+  };
+
   const handlePrintLossReport = async () => {
-    const ok = await downloadLossReportPdf(filteredLosses, settings, {
-      periodLabel: lossPeriod.toUpperCase(),
-      totalLossValue,
-      totalLossUnits,
-    });
-    if (ok) {
-      addToast({
-        type: 'success',
-        title: 'Loss Report PDF Downloaded',
-        description: `Saved PDF with ${filteredLosses.length} loss record(s) to Downloads.`,
+    if (exportingKey) return;
+    setExportingKey('loss:print');
+    try {
+      const res = await printLossReportPdf(filteredLosses, settings, {
+        periodLabel: lossPeriod.toUpperCase(),
+        totalLossValue,
+        totalLossUnits,
       });
-    } else {
-      addToast({
-        type: 'error',
-        title: 'PDF Export Failed',
-        description: 'Could not save stock loss PDF report on this device.',
-      });
+      if (res.ok) {
+        addToast({
+          type: 'success',
+          title:
+            res.mode === 'fallback_download'
+              ? 'Opened Loss Report PDF'
+              : 'Print Dialog Opened',
+          description:
+            res.mode === 'fallback_download'
+              ? 'Use the printer option in your PDF viewer to print.'
+              : `Ready to print ${filteredLosses.length} loss record(s).`,
+        });
+      } else {
+        addToast({
+          type: 'error',
+          title: 'Print Failed',
+          description: res.error || 'Could not open print dialog on this device.',
+        });
+      }
+    } finally {
+      setExportingKey(null);
     }
   };
 
-  // Download Full-Screen Movements Report PDF
-  const handlePrintMovementsReport = async () => {
+  // Print & Download Full-Screen Movements Report PDF
+  const buildMovementsPdfMeta = () => {
     const periodLabel =
       movementPeriod === 'DAY'
         ? `Day (${movementStartDate})`
@@ -772,23 +903,66 @@ export const AdminInventory: React.FC = () => {
           : 'Managed Shops'
         : 'All Shops';
 
-    const ok = await printMovementsReportPdf(movements, settings, {
-      periodLabel,
-      typeLabel,
-      shopLabel,
-    });
-    if (ok) {
-      addToast({
-        type: 'success',
-        title: 'Movements PDF Downloaded',
-        description: `Saved PDF with ${movements.length} movement record(s) to Downloads.`,
-      });
-    } else {
-      addToast({
-        type: 'error',
-        title: 'PDF Export Failed',
-        description: 'Could not save movements PDF report on this device.',
-      });
+    return { periodLabel, typeLabel, shopLabel };
+  };
+
+  const handleDownloadMovementsReport = async () => {
+    if (exportingKey) return;
+    setExportingKey('movements:pdf');
+    try {
+      const ok = await downloadMovementsReportPdf(
+        movements,
+        settings,
+        buildMovementsPdfMeta()
+      );
+      if (ok) {
+        addToast({
+          type: 'success',
+          title: 'Movements PDF Downloaded',
+          description: `Saved PDF with ${movements.length} movement record(s) to Downloads.`,
+        });
+      } else {
+        addToast({
+          type: 'error',
+          title: 'PDF Export Failed',
+          description: 'Could not save movements PDF report on this device.',
+        });
+      }
+    } finally {
+      setExportingKey(null);
+    }
+  };
+
+  const handlePrintMovementsReport = async () => {
+    if (exportingKey) return;
+    setExportingKey('movements:print');
+    try {
+      const res = await printMovementsReportPdf(
+        movements,
+        settings,
+        buildMovementsPdfMeta()
+      );
+      if (res.ok) {
+        addToast({
+          type: 'success',
+          title:
+            res.mode === 'fallback_download'
+              ? 'Opened Movements PDF'
+              : 'Print Dialog Opened',
+          description:
+            res.mode === 'fallback_download'
+              ? 'Use the printer option in your PDF viewer to print.'
+              : `Ready to print ${movements.length} movement record(s).`,
+        });
+      } else {
+        addToast({
+          type: 'error',
+          title: 'Print Failed',
+          description: res.error || 'Could not open print dialog on this device.',
+        });
+      }
+    } finally {
+      setExportingKey(null);
     }
   };
 
@@ -1103,18 +1277,34 @@ export const AdminInventory: React.FC = () => {
           </div>
         </div>
 
-        {/* Action Toolbar: PDF / Excel / Low Stock PDF / Manual Stock Adjustment */}
-        <div className="grid grid-cols-2 lg:grid-cols-4 gap-2">
+        {/* Action Toolbar: Print / PDF / Excel / Low Stock / Manual Stock Adjustment */}
+        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2">
+          <button
+            type="button"
+            disabled={exportingKey !== null}
+            onClick={() => handlePrintInventoryPdf()}
+            className="flex items-center justify-center gap-1.5 px-3 py-2.5 rounded-xl bg-indigo-600/20 hover:bg-indigo-600 border border-indigo-500/35 text-indigo-300 hover:text-white disabled:opacity-60 font-semibold text-xs shadow transition"
+          >
+            {exportingKey === 'print:ALL' ? (
+              <Loader2 className="w-4 h-4 animate-spin shrink-0" />
+            ) : (
+              <Printer className="w-4 h-4 shrink-0" />
+            )}
+            <span className="truncate">
+              Print ({getScopeShortText(activeValuationScope)})
+            </span>
+          </button>
+
           <button
             type="button"
             disabled={exportingKey !== null}
             onClick={() => handleDownloadInventoryPdf()}
-            className="flex items-center justify-center gap-2 px-3.5 py-2.5 rounded-xl bg-rose-600 hover:bg-rose-500 active:bg-rose-700 disabled:opacity-60 text-white font-semibold text-xs shadow-lg transition"
+            className="flex items-center justify-center gap-1.5 px-3 py-2.5 rounded-xl bg-rose-600 hover:bg-rose-500 active:bg-rose-700 disabled:opacity-60 text-white font-semibold text-xs shadow-lg transition"
           >
             {exportingKey === 'pdf:ALL' ? (
-              <Loader2 className="w-4 h-4 animate-spin" />
+              <Loader2 className="w-4 h-4 animate-spin shrink-0" />
             ) : (
-              <FileText className="w-4 h-4 shrink-0" />
+              <Download className="w-4 h-4 shrink-0" />
             )}
             <span className="truncate">
               Download PDF ({getScopeShortText(activeValuationScope)})
@@ -1125,24 +1315,44 @@ export const AdminInventory: React.FC = () => {
             type="button"
             disabled={exportingKey !== null}
             onClick={() => handleDownloadInventoryExcel()}
-            className="flex items-center justify-center gap-2 px-3.5 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 active:bg-emerald-700 disabled:opacity-60 text-white font-semibold text-xs shadow-lg transition"
+            className="flex items-center justify-center gap-1.5 px-3 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 active:bg-emerald-700 disabled:opacity-60 text-white font-semibold text-xs shadow-lg transition"
           >
             {exportingKey === 'excel:ALL' ? (
-              <Loader2 className="w-4 h-4 animate-spin" />
+              <Loader2 className="w-4 h-4 animate-spin shrink-0" />
             ) : (
               <FileSpreadsheet className="w-4 h-4 shrink-0" />
             )}
             <span className="truncate">
-              Download Excel ({getScopeShortText(activeValuationScope)})
+              Excel ({getScopeShortText(activeValuationScope)})
             </span>
           </button>
 
           <button
+            type="button"
+            disabled={exportingKey !== null}
             onClick={handlePrintLowStockReport}
-            className="flex items-center justify-center gap-2 px-3.5 py-2.5 rounded-xl bg-amber-600 hover:bg-amber-500 active:bg-amber-700 text-white font-semibold text-xs shadow-lg transition"
+            className="flex items-center justify-center gap-1.5 px-3 py-2.5 rounded-xl bg-amber-600/20 hover:bg-amber-600 border border-amber-500/35 text-amber-300 hover:text-white disabled:opacity-60 font-semibold text-xs shadow transition"
           >
-            <Printer className="w-4 h-4 shrink-0" />
-            <span className="truncate">Low Stock Report (PDF)</span>
+            {exportingKey === 'lowstock:print' ? (
+              <Loader2 className="w-4 h-4 animate-spin shrink-0" />
+            ) : (
+              <Printer className="w-4 h-4 shrink-0" />
+            )}
+            <span className="truncate">Print Low Stock</span>
+          </button>
+
+          <button
+            type="button"
+            disabled={exportingKey !== null}
+            onClick={handleDownloadLowStockReport}
+            className="flex items-center justify-center gap-1.5 px-3 py-2.5 rounded-xl bg-amber-600 hover:bg-amber-500 active:bg-amber-700 disabled:opacity-60 text-white font-semibold text-xs shadow-lg transition"
+          >
+            {exportingKey === 'lowstock:pdf' ? (
+              <Loader2 className="w-4 h-4 animate-spin shrink-0" />
+            ) : (
+              <Download className="w-4 h-4 shrink-0" />
+            )}
+            <span className="truncate">Low Stock PDF</span>
             {allLowStockProducts.length > 0 && (
               <span className="px-1.5 py-0.5 rounded-full bg-white/20 text-[10px] font-bold">
                 {allLowStockProducts.length}
@@ -1159,10 +1369,10 @@ export const AdminInventory: React.FC = () => {
               setAdjustmentCategory('DAMAGED');
               setIsAdjustModalOpen(true);
             }}
-            className="flex items-center justify-center gap-2 px-3.5 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-500 active:bg-blue-700 text-white font-semibold text-xs shadow-lg transition"
+            className="flex items-center justify-center gap-1.5 px-3 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-500 active:bg-blue-700 text-white font-semibold text-xs shadow-lg transition"
           >
             <ArrowUpDown className="w-4 h-4 shrink-0" />
-            <span className="truncate">Manual Stock Adjustment</span>
+            <span className="truncate">Manual Adjust</span>
           </button>
         </div>
       </div>
@@ -1504,6 +1714,20 @@ export const AdminInventory: React.FC = () => {
                             <button
                               type="button"
                               disabled={exportingKey !== null || filteredShopProducts.length === 0}
+                              onClick={() => handlePrintInventoryPdf(shop.id)}
+                              title={`Print ${shop.name} (${getScopeShortText(locationFilter)}) PDF`}
+                              className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-indigo-500/15 hover:bg-indigo-500/25 border border-indigo-500/30 text-indigo-300 disabled:opacity-40 text-[11px] font-semibold transition"
+                            >
+                              {exportingKey === `print:${shop.id}` ? (
+                                <Loader2 className="w-3 h-3 animate-spin" />
+                              ) : (
+                                <Printer className="w-3 h-3" />
+                              )}
+                              <span>Print</span>
+                            </button>
+                            <button
+                              type="button"
+                              disabled={exportingKey !== null || filteredShopProducts.length === 0}
                               onClick={() => handleDownloadInventoryPdf(shop.id)}
                               title={`Download ${shop.name} (${getScopeShortText(locationFilter)}) PDF`}
                               className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-rose-500/15 hover:bg-rose-500/25 border border-rose-500/30 text-rose-300 disabled:opacity-40 text-[11px] font-semibold transition"
@@ -1511,7 +1735,7 @@ export const AdminInventory: React.FC = () => {
                               {exportingKey === `pdf:${shop.id}` ? (
                                 <Loader2 className="w-3 h-3 animate-spin" />
                               ) : (
-                                <FileText className="w-3 h-3" />
+                                <Download className="w-3 h-3" />
                               )}
                               <span>PDF</span>
                             </button>
@@ -1752,14 +1976,34 @@ export const AdminInventory: React.FC = () => {
                 </div>
               </div>
 
-              <button
-                type="button"
-                onClick={handlePrintMovementsReport}
-                className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl bg-blue-600 hover:bg-blue-500 active:bg-blue-700 text-white text-xs font-semibold shadow-lg transition shrink-0"
-              >
-                <Printer className="w-4 h-4" />
-                <span>Print PDF</span>
-              </button>
+              <div className="flex items-center gap-2 shrink-0">
+                <button
+                  type="button"
+                  disabled={exportingKey !== null}
+                  onClick={handlePrintMovementsReport}
+                  className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-indigo-600/20 hover:bg-indigo-600 border border-indigo-500/35 text-indigo-300 hover:text-white disabled:opacity-50 text-xs font-semibold shadow transition shrink-0"
+                >
+                  {exportingKey === 'movements:print' ? (
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                  ) : (
+                    <Printer className="w-4 h-4" />
+                  )}
+                  <span>Print</span>
+                </button>
+                <button
+                  type="button"
+                  disabled={exportingKey !== null}
+                  onClick={handleDownloadMovementsReport}
+                  className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl bg-blue-600 hover:bg-blue-500 active:bg-blue-700 disabled:opacity-50 text-white text-xs font-semibold shadow-lg transition shrink-0"
+                >
+                  {exportingKey === 'movements:pdf' ? (
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                  ) : (
+                    <Download className="w-4 h-4" />
+                  )}
+                  <span>Download PDF</span>
+                </button>
+              </div>
             </div>
 
             {/* Full-Screen Scrollable Content */}
@@ -2148,7 +2392,7 @@ export const AdminInventory: React.FC = () => {
               </div>
             </div>
 
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2">
               <select
                 value={lossTypeFilter}
                 onChange={e => setLossTypeFilter(e.target.value)}
@@ -2162,11 +2406,31 @@ export const AdminInventory: React.FC = () => {
               </select>
 
               <button
+                type="button"
+                disabled={exportingKey !== null}
                 onClick={handlePrintLossReport}
-                className="flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-rose-600 hover:bg-rose-500 active:bg-rose-700 text-white text-xs font-semibold transition shrink-0"
+                className="flex items-center gap-1.5 px-3 py-2 rounded-lg bg-indigo-600/20 hover:bg-indigo-600 border border-indigo-500/35 text-indigo-300 hover:text-white disabled:opacity-50 text-xs font-semibold transition shrink-0"
               >
-                <Printer className="w-3.5 h-3.5" />
-                <span>Print PDF</span>
+                {exportingKey === 'loss:print' ? (
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                ) : (
+                  <Printer className="w-3.5 h-3.5" />
+                )}
+                <span>Print</span>
+              </button>
+
+              <button
+                type="button"
+                disabled={exportingKey !== null}
+                onClick={handleDownloadLossReport}
+                className="flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-rose-600 hover:bg-rose-500 active:bg-rose-700 disabled:opacity-50 text-white text-xs font-semibold transition shrink-0"
+              >
+                {exportingKey === 'loss:pdf' ? (
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                ) : (
+                  <Download className="w-3.5 h-3.5" />
+                )}
+                <span>Download PDF</span>
               </button>
             </div>
           </div>

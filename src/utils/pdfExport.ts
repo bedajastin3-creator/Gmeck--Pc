@@ -19,6 +19,112 @@ function truncate(str: string, maxLen: number): string {
   return `${s.slice(0, Math.max(1, maxLen - 3))}...`;
 }
 
+export interface PdfPrintResult {
+  ok: boolean;
+  mode?: 'print' | 'fallback_download';
+  error?: string;
+}
+
+export function downloadPdfBlob(blob: Blob, fileName: string): boolean {
+  const cleanName = (fileName || 'report.pdf').replace(/[\\/:*?"<>|]+/g, '_');
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = cleanName;
+  link.style.display = 'none';
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  window.setTimeout(() => URL.revokeObjectURL(url), 1500);
+  return true;
+}
+
+export async function printPdfBlob(
+  blob: Blob,
+  fallbackFileName: string
+): Promise<PdfPrintResult> {
+  try {
+    const url = URL.createObjectURL(blob);
+
+    return await new Promise(resolve => {
+      const iframe = document.createElement('iframe');
+      iframe.style.position = 'fixed';
+      iframe.style.left = '-9999px';
+      iframe.style.top = '0';
+      iframe.style.width = '1px';
+      iframe.style.height = '1px';
+      iframe.style.opacity = '0';
+      iframe.style.border = '0';
+      iframe.style.pointerEvents = 'none';
+      iframe.setAttribute('aria-hidden', 'true');
+      iframe.src = url;
+
+      let settled = false;
+      let cleanedUp = false;
+
+      const cleanup = (delayMs: number = 60000) => {
+        if (cleanedUp) return;
+        cleanedUp = true;
+        window.setTimeout(() => {
+          if (iframe.parentNode) {
+            iframe.parentNode.removeChild(iframe);
+          }
+          URL.revokeObjectURL(url);
+        }, delayMs);
+      };
+
+      const fallbackDownload = () => {
+        if (settled) return;
+        settled = true;
+        downloadPdfBlob(blob, fallbackFileName);
+        cleanup(2000);
+        resolve({ ok: true, mode: 'fallback_download' });
+      };
+
+      const timer = window.setTimeout(fallbackDownload, 3500);
+
+      iframe.onload = () => {
+        if (settled) return;
+        window.clearTimeout(timer);
+        window.setTimeout(() => {
+          if (settled) return;
+          try {
+            const win = iframe.contentWindow;
+            if (!win) {
+              fallbackDownload();
+              return;
+            }
+            const handleAfterPrint = () => {
+              win.removeEventListener('afterprint', handleAfterPrint);
+              cleanup(1000);
+            };
+            win.addEventListener('afterprint', handleAfterPrint);
+            win.focus();
+            win.print();
+            settled = true;
+            cleanup(60000);
+            resolve({ ok: true, mode: 'print' });
+          } catch {
+            fallbackDownload();
+          }
+        }, 250);
+      };
+
+      iframe.onerror = () => {
+        window.clearTimeout(timer);
+        fallbackDownload();
+      };
+
+      document.body.appendChild(iframe);
+    });
+  } catch (err: any) {
+    return {
+      ok: false,
+      error: err?.message || 'Could not initiate PDF print.',
+    };
+  }
+}
+
 function createPdfBuilder() {
   const pageWidth = 595.28; // A4 width pt
   const pageHeight = 841.89; // A4 height pt
@@ -213,93 +319,12 @@ function createPdfBuilder() {
     return new Blob([bytes], { type: 'application/pdf' });
   };
 
-  const downloadBlob = (blob: Blob, fileName: string): boolean => {
-    const cleanName = (fileName || 'report.pdf').replace(/[\\/:*?"<>|]+/g, '_');
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = cleanName;
-    link.style.display = 'none';
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-    window.setTimeout(() => URL.revokeObjectURL(url), 1500);
-    return true;
-  };
-
   const download = (fileName: string): boolean => {
-    return downloadBlob(buildBlob(), fileName);
+    return downloadPdfBlob(buildBlob(), fileName);
   };
 
-  const print = async (
-    fallbackFileName: string
-  ): Promise<{ ok: boolean; mode?: 'print' | 'fallback_download'; error?: string }> => {
-    try {
-      const blob = buildBlob();
-      const url = URL.createObjectURL(blob);
-
-      return await new Promise(resolve => {
-        const iframe = document.createElement('iframe');
-        iframe.style.position = 'fixed';
-        iframe.style.right = '0';
-        iframe.style.bottom = '0';
-        iframe.style.width = '0';
-        iframe.style.height = '0';
-        iframe.style.border = '0';
-        iframe.src = url;
-
-        let settled = false;
-        const cleanup = () => {
-          window.setTimeout(() => {
-            if (iframe.parentNode) {
-              iframe.parentNode.removeChild(iframe);
-            }
-            URL.revokeObjectURL(url);
-          }, 2000);
-        };
-
-        const timer = window.setTimeout(() => {
-          if (settled) return;
-          settled = true;
-          downloadBlob(blob, fallbackFileName);
-          cleanup();
-          resolve({ ok: true, mode: 'fallback_download' });
-        }, 2500);
-
-        iframe.onload = () => {
-          if (settled) return;
-          window.clearTimeout(timer);
-          try {
-            iframe.contentWindow?.focus();
-            iframe.contentWindow?.print();
-            settled = true;
-            cleanup();
-            resolve({ ok: true, mode: 'print' });
-          } catch {
-            settled = true;
-            downloadBlob(blob, fallbackFileName);
-            cleanup();
-            resolve({ ok: true, mode: 'fallback_download' });
-          }
-        };
-
-        iframe.onerror = () => {
-          if (settled) return;
-          window.clearTimeout(timer);
-          settled = true;
-          downloadBlob(blob, fallbackFileName);
-          cleanup();
-          resolve({ ok: true, mode: 'fallback_download' });
-        };
-
-        document.body.appendChild(iframe);
-      });
-    } catch (err: any) {
-      return {
-        ok: false,
-        error: err?.message || 'Could not initiate PDF print.',
-      };
-    }
+  const print = async (fallbackFileName: string): Promise<PdfPrintResult> => {
+    return printPdfBlob(buildBlob(), fallbackFileName);
   };
 
   return {
@@ -334,7 +359,7 @@ function formatDateRangeLabel(from?: string, to?: string): string {
   return 'All Time';
 }
 
-export async function downloadFinancialReportPdf(
+function buildFinancialReportDoc(
   summary: any,
   settings: BusinessSettings,
   meta: {
@@ -344,9 +369,8 @@ export async function downloadFinancialReportPdf(
     periodKey: string;
     periodLabel: string;
   }
-): Promise<boolean> {
-  try {
-    const doc = createPdfBuilder();
+) {
+  const doc = createPdfBuilder();
     const cur = settings.currencySymbol || 'TSh';
     const dateRangeStr = formatDateRangeLabel(meta.from, meta.to);
 
@@ -517,7 +541,23 @@ export async function downloadFinancialReportPdf(
       });
     }
 
-    const fileName = `financial_report_${meta.periodKey}_${new Date().toISOString().slice(0, 10)}.pdf`;
+  const fileName = `financial_report_${meta.periodKey}_${new Date().toISOString().slice(0, 10)}.pdf`;
+  return { doc, fileName };
+}
+
+export async function downloadFinancialReportPdf(
+  summary: any,
+  settings: BusinessSettings,
+  meta: {
+    shopLabel: string;
+    from?: string;
+    to?: string;
+    periodKey: string;
+    periodLabel: string;
+  }
+): Promise<boolean> {
+  try {
+    const { doc, fileName } = buildFinancialReportDoc(summary, settings, meta);
     return doc.download(fileName);
   } catch (err) {
     console.error('[pdfExport] downloadFinancialReportPdf failed:', err);
@@ -525,7 +565,27 @@ export async function downloadFinancialReportPdf(
   }
 }
 
-export async function downloadPriceDeviationsPdf(
+export async function printFinancialReportPdf(
+  summary: any,
+  settings: BusinessSettings,
+  meta: {
+    shopLabel: string;
+    from?: string;
+    to?: string;
+    periodKey: string;
+    periodLabel: string;
+  }
+): Promise<PdfPrintResult> {
+  try {
+    const { doc, fileName } = buildFinancialReportDoc(summary, settings, meta);
+    return await doc.print(fileName);
+  } catch (err: any) {
+    console.error('[pdfExport] printFinancialReportPdf failed:', err);
+    return { ok: false, error: err?.message || 'Failed to prepare financial report for printing.' };
+  }
+}
+
+function buildPriceDeviationsDoc(
   deviations: Array<{
     receiptNumber: string;
     createdAt: string;
@@ -559,9 +619,8 @@ export async function downloadPriceDeviationsPdf(
     to?: string;
     direction: string;
   }
-): Promise<boolean> {
-  try {
-    const doc = createPdfBuilder();
+) {
+  const doc = createPdfBuilder();
     const cur = settings.currencySymbol || 'TSh';
     const dateRangeStr = formatDateRangeLabel(meta.from, meta.to);
 
@@ -672,7 +731,18 @@ export async function downloadPriceDeviationsPdf(
       doc.advanceY(5);
     });
 
-    const fileName = `price_deviations_${meta.direction.toLowerCase()}_${new Date().toISOString().slice(0, 10)}.pdf`;
+  const fileName = `price_deviations_${meta.direction.toLowerCase()}_${new Date().toISOString().slice(0, 10)}.pdf`;
+  return { doc, fileName };
+}
+
+export async function downloadPriceDeviationsPdf(
+  deviations: Parameters<typeof buildPriceDeviationsDoc>[0],
+  deviationStats: Parameters<typeof buildPriceDeviationsDoc>[1],
+  settings: BusinessSettings,
+  meta: Parameters<typeof buildPriceDeviationsDoc>[3]
+): Promise<boolean> {
+  try {
+    const { doc, fileName } = buildPriceDeviationsDoc(deviations, deviationStats, settings, meta);
     return doc.download(fileName);
   } catch (err) {
     console.error('[pdfExport] downloadPriceDeviationsPdf failed:', err);
@@ -680,7 +750,22 @@ export async function downloadPriceDeviationsPdf(
   }
 }
 
-export async function downloadShopProfitLossPdf(
+export async function printPriceDeviationsPdf(
+  deviations: Parameters<typeof buildPriceDeviationsDoc>[0],
+  deviationStats: Parameters<typeof buildPriceDeviationsDoc>[1],
+  settings: BusinessSettings,
+  meta: Parameters<typeof buildPriceDeviationsDoc>[3]
+): Promise<PdfPrintResult> {
+  try {
+    const { doc, fileName } = buildPriceDeviationsDoc(deviations, deviationStats, settings, meta);
+    return await doc.print(fileName);
+  } catch (err: any) {
+    console.error('[pdfExport] printPriceDeviationsPdf failed:', err);
+    return { ok: false, error: err?.message || 'Failed to prepare price deviations for printing.' };
+  }
+}
+
+function buildShopProfitLossDoc(
   rows: ShopProfitLossRow[],
   totals: ShopProfitLossSummary['totals'],
   generalCompanyExpenses: number,
@@ -690,9 +775,8 @@ export async function downloadShopProfitLossPdf(
     to?: string;
     periodLabel: string;
   }
-): Promise<boolean> {
-  try {
-    const doc = createPdfBuilder();
+) {
+  const doc = createPdfBuilder();
     const cur = settings.currencySymbol || 'TSh';
     const dateRangeStr = formatDateRangeLabel(meta.from, meta.to);
 
@@ -824,7 +908,29 @@ export async function downloadShopProfitLossPdf(
       );
     }
 
-    const fileName = `shop_profit_and_loss_${meta.periodLabel}_${new Date().toISOString().slice(0, 10)}.pdf`;
+  const fileName = `shop_profit_and_loss_${meta.periodLabel}_${new Date().toISOString().slice(0, 10)}.pdf`;
+  return { doc, fileName };
+}
+
+export async function downloadShopProfitLossPdf(
+  rows: ShopProfitLossRow[],
+  totals: ShopProfitLossSummary['totals'],
+  generalCompanyExpenses: number,
+  settings: BusinessSettings,
+  meta: {
+    from?: string;
+    to?: string;
+    periodLabel: string;
+  }
+): Promise<boolean> {
+  try {
+    const { doc, fileName } = buildShopProfitLossDoc(
+      rows,
+      totals,
+      generalCompanyExpenses,
+      settings,
+      meta
+    );
     return doc.download(fileName);
   } catch (err) {
     console.error('[pdfExport] downloadShopProfitLossPdf failed:', err);
@@ -832,7 +938,33 @@ export async function downloadShopProfitLossPdf(
   }
 }
 
-export async function downloadSalesReportPdf(
+export async function printShopProfitLossPdf(
+  rows: ShopProfitLossRow[],
+  totals: ShopProfitLossSummary['totals'],
+  generalCompanyExpenses: number,
+  settings: BusinessSettings,
+  meta: {
+    from?: string;
+    to?: string;
+    periodLabel: string;
+  }
+): Promise<PdfPrintResult> {
+  try {
+    const { doc, fileName } = buildShopProfitLossDoc(
+      rows,
+      totals,
+      generalCompanyExpenses,
+      settings,
+      meta
+    );
+    return await doc.print(fileName);
+  } catch (err: any) {
+    console.error('[pdfExport] printShopProfitLossPdf failed:', err);
+    return { ok: false, error: err?.message || 'Failed to prepare Shop P&L for printing.' };
+  }
+}
+
+function buildSalesReportDoc(
   sales: Sale[],
   settings: BusinessSettings,
   meta: {
@@ -850,9 +982,8 @@ export async function downloadSalesReportPdf(
     totalRevenue: number;
     totalProfit: number;
   }
-): Promise<boolean> {
-  try {
-    const doc = createPdfBuilder();
+) {
+  const doc = createPdfBuilder();
     const cur = settings.currencySymbol || 'TSh';
 
     doc.drawBanner(
@@ -976,19 +1107,43 @@ export async function downloadSalesReportPdf(
       doc.advanceY(5);
     });
 
-    const dateTag =
-      meta.startDate && meta.endDate
-        ? meta.startDate === meta.endDate
-          ? meta.startDate
-          : `${meta.startDate}_to_${meta.endDate}`
-        : new Date().toISOString().slice(0, 10);
-    const fileName = `sales_report_${meta.periodKey}_${meta.shopLabel
-      .toLowerCase()
-      .replace(/\s+/g, '_')}_${dateTag}.pdf`;
+  const dateTag =
+    meta.startDate && meta.endDate
+      ? meta.startDate === meta.endDate
+        ? meta.startDate
+        : `${meta.startDate}_to_${meta.endDate}`
+      : new Date().toISOString().slice(0, 10);
+  const fileName = `sales_report_${meta.periodKey}_${meta.shopLabel
+    .toLowerCase()
+    .replace(/\s+/g, '_')}_${dateTag}.pdf`;
+  return { doc, fileName };
+}
+
+export async function downloadSalesReportPdf(
+  sales: Sale[],
+  settings: BusinessSettings,
+  meta: Parameters<typeof buildSalesReportDoc>[2]
+): Promise<boolean> {
+  try {
+    const { doc, fileName } = buildSalesReportDoc(sales, settings, meta);
     return doc.download(fileName);
   } catch (err) {
     console.error('[pdfExport] downloadSalesReportPdf failed:', err);
     return false;
+  }
+}
+
+export async function printSalesReportPdf(
+  sales: Sale[],
+  settings: BusinessSettings,
+  meta: Parameters<typeof buildSalesReportDoc>[2]
+): Promise<PdfPrintResult> {
+  try {
+    const { doc, fileName } = buildSalesReportDoc(sales, settings, meta);
+    return await doc.print(fileName);
+  } catch (err: any) {
+    console.error('[pdfExport] printSalesReportPdf failed:', err);
+    return { ok: false, error: err?.message || 'Failed to prepare sales report for printing.' };
   }
 }
 
@@ -1022,13 +1177,12 @@ export interface InventoryExportMeta {
   lowStockOnly?: boolean;
 }
 
-export async function downloadInventoryReportPdf(
+function buildInventoryReportDoc(
   rows: InventoryExportRow[],
   settings: BusinessSettings,
   meta: InventoryExportMeta
-): Promise<boolean> {
-  try {
-    const doc = createPdfBuilder();
+) {
+  const doc = createPdfBuilder();
     const cur = settings.currencySymbol || 'TSh';
     const scopeText =
       meta.scope === 'SHOP'
@@ -1136,10 +1290,20 @@ export async function downloadInventoryReportPdf(
       doc.advanceY(5);
     });
 
-    const cleanShop = (meta.shopLabel || 'inventory').toLowerCase().replace(/[^a-z0-9]+/g, '_');
-    const fileName = `inventory_${meta.scope.toLowerCase()}_${cleanShop}_${new Date()
-      .toISOString()
-      .slice(0, 10)}.pdf`;
+  const cleanShop = (meta.shopLabel || 'inventory').toLowerCase().replace(/[^a-z0-9]+/g, '_');
+  const fileName = `inventory_${meta.scope.toLowerCase()}_${cleanShop}_${new Date()
+    .toISOString()
+    .slice(0, 10)}.pdf`;
+  return { doc, fileName };
+}
+
+export async function downloadInventoryReportPdf(
+  rows: InventoryExportRow[],
+  settings: BusinessSettings,
+  meta: InventoryExportMeta
+): Promise<boolean> {
+  try {
+    const { doc, fileName } = buildInventoryReportDoc(rows, settings, meta);
     return doc.download(fileName);
   } catch (err) {
     console.error('[pdfExport] downloadInventoryReportPdf failed:', err);
@@ -1147,14 +1311,27 @@ export async function downloadInventoryReportPdf(
   }
 }
 
-export async function downloadLowStockReportPdf(
+export async function printInventoryReportPdf(
+  rows: InventoryExportRow[],
+  settings: BusinessSettings,
+  meta: InventoryExportMeta
+): Promise<PdfPrintResult> {
+  try {
+    const { doc, fileName } = buildInventoryReportDoc(rows, settings, meta);
+    return await doc.print(fileName);
+  } catch (err: any) {
+    console.error('[pdfExport] printInventoryReportPdf failed:', err);
+    return { ok: false, error: err?.message || 'Failed to prepare inventory report for printing.' };
+  }
+}
+
+function buildLowStockReportDoc(
   products: Product[],
   shops: Shop[],
   settings: BusinessSettings,
   scopeLabel: string
-): Promise<boolean> {
-  try {
-    const doc = createPdfBuilder();
+) {
+  const doc = createPdfBuilder();
     const cur = settings.currencySymbol || 'TSh';
     const shopsById = new Map(shops.map(s => [s.id, s.name]));
 
@@ -1234,7 +1411,18 @@ export async function downloadLowStockReportPdf(
       });
     }
 
-    const fileName = `low_stock_report_${new Date().toISOString().slice(0, 10)}.pdf`;
+  const fileName = `low_stock_report_${new Date().toISOString().slice(0, 10)}.pdf`;
+  return { doc, fileName };
+}
+
+export async function downloadLowStockReportPdf(
+  products: Product[],
+  shops: Shop[],
+  settings: BusinessSettings,
+  scopeLabel: string
+): Promise<boolean> {
+  try {
+    const { doc, fileName } = buildLowStockReportDoc(products, shops, settings, scopeLabel);
     return doc.download(fileName);
   } catch (err) {
     console.error('[pdfExport] downloadLowStockReportPdf failed:', err);
@@ -1242,7 +1430,22 @@ export async function downloadLowStockReportPdf(
   }
 }
 
-export async function downloadLossReportPdf(
+export async function printLowStockReportPdf(
+  products: Product[],
+  shops: Shop[],
+  settings: BusinessSettings,
+  scopeLabel: string
+): Promise<PdfPrintResult> {
+  try {
+    const { doc, fileName } = buildLowStockReportDoc(products, shops, settings, scopeLabel);
+    return await doc.print(fileName);
+  } catch (err: any) {
+    console.error('[pdfExport] printLowStockReportPdf failed:', err);
+    return { ok: false, error: err?.message || 'Failed to prepare low stock report for printing.' };
+  }
+}
+
+function buildLossReportDoc(
   losses: InventoryMovement[],
   settings: BusinessSettings,
   meta: {
@@ -1250,9 +1453,8 @@ export async function downloadLossReportPdf(
     totalLossValue: number;
     totalLossUnits: number;
   }
-): Promise<boolean> {
-  try {
-    const doc = createPdfBuilder();
+) {
+  const doc = createPdfBuilder();
     const cur = settings.currencySymbol || 'TSh';
 
     doc.drawBanner(
@@ -1311,13 +1513,45 @@ export async function downloadLossReportPdf(
       doc.advanceY(5);
     });
 
-    const fileName = `stock_loss_report_${meta.periodLabel.toLowerCase()}_${new Date()
-      .toISOString()
-      .slice(0, 10)}.pdf`;
+  const fileName = `stock_loss_report_${meta.periodLabel.toLowerCase()}_${new Date()
+    .toISOString()
+    .slice(0, 10)}.pdf`;
+  return { doc, fileName };
+}
+
+export async function downloadLossReportPdf(
+  losses: InventoryMovement[],
+  settings: BusinessSettings,
+  meta: {
+    periodLabel: string;
+    totalLossValue: number;
+    totalLossUnits: number;
+  }
+): Promise<boolean> {
+  try {
+    const { doc, fileName } = buildLossReportDoc(losses, settings, meta);
     return doc.download(fileName);
   } catch (err) {
     console.error('[pdfExport] downloadLossReportPdf failed:', err);
     return false;
+  }
+}
+
+export async function printLossReportPdf(
+  losses: InventoryMovement[],
+  settings: BusinessSettings,
+  meta: {
+    periodLabel: string;
+    totalLossValue: number;
+    totalLossUnits: number;
+  }
+): Promise<PdfPrintResult> {
+  try {
+    const { doc, fileName } = buildLossReportDoc(losses, settings, meta);
+    return await doc.print(fileName);
+  } catch (err: any) {
+    console.error('[pdfExport] printLossReportPdf failed:', err);
+    return { ok: false, error: err?.message || 'Failed to prepare loss report for printing.' };
   }
 }
 

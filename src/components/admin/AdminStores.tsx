@@ -31,6 +31,7 @@ import {
   Truck,
   FileText,
   Boxes,
+  Loader2,
 } from 'lucide-react';
 import { useApp, StoresSubTab } from '../../context/AppContext';
 import { StoreService } from '../../services/storeService';
@@ -45,7 +46,10 @@ import {
 import { ImportProgressBar } from '../common/ImportProgressBar';
 import { ExcelExportService } from '../../services/excelExportService';
 import { formatCurrency } from '../../utils/formatters';
-import { printStockTransferVoucher } from '../../utils/transferPrint';
+import {
+  downloadStockTransferVoucher,
+  printStockTransferVoucher,
+} from '../../utils/transferPrint';
 import {
   getAdminManagedShops,
   hasAdminAccess,
@@ -188,6 +192,60 @@ export const AdminStores: React.FC = () => {
   const [listVisibleLimit, setListVisibleLimit] = useState(STORE_PAGE_SIZE);
   const [viewingTransferId, setViewingTransferId] = useState<string | null>(null);
   const [deletingTransfer, setDeletingTransfer] = useState<StockTransfer | null>(null);
+  const [printingTransferId, setPrintingTransferId] = useState<string | null>(null);
+  const [downloadingTransferId, setDownloadingTransferId] = useState<string | null>(null);
+
+  const handlePrintTransfer = async (transfer: StockTransfer) => {
+    if (printingTransferId) return;
+    setPrintingTransferId(transfer.id);
+    try {
+      const res = await printStockTransferVoucher(transfer, settings);
+      addToast(
+        res.ok
+          ? {
+              type: 'success',
+              title:
+                res.mode === 'fallback_download'
+                  ? 'Opened Transfer Voucher PDF'
+                  : 'Print Dialog Opened',
+              description:
+                res.mode === 'fallback_download'
+                  ? 'Use the printer option in your PDF viewer to print.'
+                  : `Ready to print ${transfer.transferNumber}.`,
+            }
+          : {
+              type: 'error',
+              title: 'Print Failed',
+              description: res.error || 'Could not open print dialog on this device.',
+            }
+      );
+    } finally {
+      setPrintingTransferId(null);
+    }
+  };
+
+  const handleDownloadTransfer = async (transfer: StockTransfer) => {
+    if (downloadingTransferId) return;
+    setDownloadingTransferId(transfer.id);
+    try {
+      const ok = await downloadStockTransferVoucher(transfer, settings);
+      addToast(
+        ok
+          ? {
+              type: 'success',
+              title: 'Transfer PDF Downloaded',
+              description: `Saved stock_transfer_${transfer.transferNumber}.pdf to Downloads.`,
+            }
+          : {
+              type: 'error',
+              title: 'PDF Export Failed',
+              description: 'Could not save transfer voucher PDF on this device.',
+            }
+      );
+    } finally {
+      setDownloadingTransferId(null);
+    }
+  };
 
   // Store Excel Import Modal state
   const [isImportModalOpen, setIsImportModalOpen] = useState(false);
@@ -3844,26 +3902,29 @@ export const AdminStores: React.FC = () => {
                             </button>
                             <button
                               type="button"
-                              title="Download PDF"
-                              onClick={async () => {
-                                const ok = await printStockTransferVoucher(t, settings);
-                                addToast(
-                                  ok
-                                    ? {
-                                        type: 'success',
-                                        title: 'Transfer PDF Downloaded',
-                                        description: `Saved stock_transfer_${t.transferNumber}.pdf to Downloads.`,
-                                      }
-                                    : {
-                                        type: 'error',
-                                        title: 'PDF Export Failed',
-                                        description: 'Could not save transfer voucher PDF on this device.',
-                                      }
-                                );
-                              }}
-                              className="p-1.5 rounded-lg bg-emerald-600/15 hover:bg-emerald-600/30 border border-emerald-500/30 text-emerald-300 transition"
+                              title="Print Transfer Voucher"
+                              disabled={printingTransferId === t.id}
+                              onClick={() => handlePrintTransfer(t)}
+                              className="p-1.5 rounded-lg bg-indigo-600/15 hover:bg-indigo-600/30 border border-indigo-500/30 text-indigo-300 transition disabled:opacity-50"
                             >
-                              <Printer className="w-3.5 h-3.5" />
+                              {printingTransferId === t.id ? (
+                                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                              ) : (
+                                <Printer className="w-3.5 h-3.5" />
+                              )}
+                            </button>
+                            <button
+                              type="button"
+                              title="Download PDF"
+                              disabled={downloadingTransferId === t.id}
+                              onClick={() => handleDownloadTransfer(t)}
+                              className="p-1.5 rounded-lg bg-emerald-600/15 hover:bg-emerald-600/30 border border-emerald-500/30 text-emerald-300 transition disabled:opacity-50"
+                            >
+                              {downloadingTransferId === t.id ? (
+                                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                              ) : (
+                                <Download className="w-3.5 h-3.5" />
+                              )}
                             </button>
                             <button
                               type="button"
@@ -3936,7 +3997,7 @@ export const AdminStores: React.FC = () => {
                       </div>
                     </div>
 
-                    <div className="grid grid-cols-4 gap-1.5 pt-1">
+                    <div className="grid grid-cols-5 gap-1.5 pt-1">
                       <button
                         type="button"
                         onClick={() => {
@@ -3945,30 +4006,33 @@ export const AdminStores: React.FC = () => {
                         }}
                         className="flex items-center justify-center gap-1 py-1.5 rounded-lg bg-blue-600/15 border border-blue-500/30 text-blue-300 text-[11px] font-semibold"
                       >
-                        <Eye className="w-3.5 h-3.5" />
+                        <Eye className="w-3 h-3" />
                         <span>View</span>
                       </button>
                       <button
                         type="button"
-                        onClick={async () => {
-                          const ok = await printStockTransferVoucher(t, settings);
-                          addToast(
-                            ok
-                              ? {
-                                  type: 'success',
-                                  title: 'Transfer PDF Downloaded',
-                                  description: `Saved stock_transfer_${t.transferNumber}.pdf to Downloads.`,
-                                }
-                              : {
-                                  type: 'error',
-                                  title: 'PDF Export Failed',
-                                  description: 'Could not save transfer voucher PDF on this device.',
-                                }
-                          );
-                        }}
-                        className="flex items-center justify-center gap-1 py-1.5 rounded-lg bg-emerald-600/15 border border-emerald-500/30 text-emerald-300 text-[11px] font-semibold"
+                        disabled={printingTransferId === t.id}
+                        onClick={() => handlePrintTransfer(t)}
+                        className="flex items-center justify-center gap-1 py-1.5 rounded-lg bg-indigo-600/15 border border-indigo-500/30 text-indigo-300 text-[11px] font-semibold disabled:opacity-50"
                       >
-                        <Printer className="w-3.5 h-3.5" />
+                        {printingTransferId === t.id ? (
+                          <Loader2 className="w-3 h-3 animate-spin" />
+                        ) : (
+                          <Printer className="w-3 h-3" />
+                        )}
+                        <span>Print</span>
+                      </button>
+                      <button
+                        type="button"
+                        disabled={downloadingTransferId === t.id}
+                        onClick={() => handleDownloadTransfer(t)}
+                        className="flex items-center justify-center gap-1 py-1.5 rounded-lg bg-emerald-600/15 border border-emerald-500/30 text-emerald-300 text-[11px] font-semibold disabled:opacity-50"
+                      >
+                        {downloadingTransferId === t.id ? (
+                          <Loader2 className="w-3 h-3 animate-spin" />
+                        ) : (
+                          <Download className="w-3 h-3" />
+                        )}
                         <span>PDF</span>
                       </button>
                       <button
@@ -3976,7 +4040,7 @@ export const AdminStores: React.FC = () => {
                         onClick={() => openEditTransferForm(t)}
                         className="flex items-center justify-center gap-1 py-1.5 rounded-lg bg-amber-500/15 border border-amber-500/30 text-amber-300 text-[11px] font-semibold"
                       >
-                        <Edit3 className="w-3.5 h-3.5" />
+                        <Edit3 className="w-3 h-3" />
                         <span>Edit</span>
                       </button>
                       <button
@@ -3984,8 +4048,8 @@ export const AdminStores: React.FC = () => {
                         onClick={() => setDeletingTransfer(t)}
                         className="flex items-center justify-center gap-1 py-1.5 rounded-lg bg-rose-500/15 border border-rose-500/30 text-rose-300 text-[11px] font-semibold"
                       >
-                        <Trash2 className="w-3.5 h-3.5" />
-                        <span>Delete</span>
+                        <Trash2 className="w-3 h-3" />
+                        <span>Del</span>
                       </button>
                     </div>
                   </div>
@@ -4075,29 +4139,34 @@ export const AdminStores: React.FC = () => {
               </div>
             </div>
 
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2">
               <button
                 type="button"
-                onClick={async () => {
-                  const ok = await printStockTransferVoucher(viewingTransfer, settings);
-                  addToast(
-                    ok
-                      ? {
-                          type: 'success',
-                          title: 'Transfer PDF Downloaded',
-                          description: `Saved stock_transfer_${viewingTransfer.transferNumber}.pdf to Downloads.`,
-                        }
-                      : {
-                          type: 'error',
-                          title: 'PDF Export Failed',
-                          description: 'Could not save transfer voucher PDF on this device.',
-                        }
-                  );
-                }}
-                className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold transition"
+                disabled={printingTransferId === viewingTransfer.id}
+                onClick={() => handlePrintTransfer(viewingTransfer)}
+                className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-indigo-600/20 hover:bg-indigo-600 border border-indigo-500/35 text-indigo-300 hover:text-white text-xs font-semibold transition disabled:opacity-50"
               >
-                <Printer className="w-4 h-4" />
-                <span>Download PDF</span>
+                {printingTransferId === viewingTransfer.id ? (
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                ) : (
+                  <Printer className="w-4 h-4" />
+                )}
+                <span>{printingTransferId === viewingTransfer.id ? 'Printing...' : 'Print'}</span>
+              </button>
+              <button
+                type="button"
+                disabled={downloadingTransferId === viewingTransfer.id}
+                onClick={() => handleDownloadTransfer(viewingTransfer)}
+                className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold transition disabled:opacity-50"
+              >
+                {downloadingTransferId === viewingTransfer.id ? (
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                ) : (
+                  <Download className="w-4 h-4" />
+                )}
+                <span>
+                  {downloadingTransferId === viewingTransfer.id ? 'Generating...' : 'Download PDF'}
+                </span>
               </button>
               <button
                 type="button"

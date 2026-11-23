@@ -1,5 +1,6 @@
 import type { BusinessSettings, StockTransfer } from '../types';
 import { formatCurrency } from './formatters';
+import { downloadPdfBlob, PdfPrintResult, printPdfBlob } from './pdfExport';
 
 function escapePdfText(input: string): string {
   // Strip non-ASCII characters safely for standard Type1 Helvetica encoding and escape PDF literals
@@ -36,14 +37,12 @@ function wrapText(str: string, maxChars: number): string[] {
 }
 
 /**
- * Generates a clean multi-page A4 PDF voucher directly in memory and downloads it
- * as `stock_transfer_<transferNumber>.pdf` (works offline in Desktop Electron & Web).
+ * Builds a clean multi-page A4 PDF voucher directly in memory.
  */
-export async function printStockTransferVoucher(
+function buildStockTransferVoucherBlob(
   transfer: StockTransfer,
   settings: BusinessSettings
-): Promise<boolean> {
-  try {
+): { blob: Blob; fileName: string } {
     const pageWidth = 595.28; // A4 width in pt
     const pageHeight = 841.89; // A4 height in pt
     const marginLeft = 40;
@@ -367,18 +366,35 @@ export async function printStockTransferVoucher(
     }
 
     const blob = new Blob([bytes], { type: 'application/pdf' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = `stock_transfer_${transfer.transferNumber || transfer.id}.pdf`;
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-    window.setTimeout(() => URL.revokeObjectURL(url), 1500);
+    const fileName = `stock_transfer_${transfer.transferNumber || transfer.id}.pdf`;
+    return { blob, fileName };
+}
 
-    return true;
+export async function downloadStockTransferVoucher(
+  transfer: StockTransfer,
+  settings: BusinessSettings
+): Promise<boolean> {
+  try {
+    const { blob, fileName } = buildStockTransferVoucherBlob(transfer, settings);
+    return downloadPdfBlob(blob, fileName);
   } catch (err) {
     console.error('[transferPrint] Failed to generate transfer PDF:', err);
     return false;
+  }
+}
+
+export async function printStockTransferVoucher(
+  transfer: StockTransfer,
+  settings: BusinessSettings
+): Promise<PdfPrintResult> {
+  try {
+    const { blob, fileName } = buildStockTransferVoucherBlob(transfer, settings);
+    return printPdfBlob(blob, fileName);
+  } catch (err: any) {
+    console.error('[transferPrint] Failed to print transfer PDF:', err);
+    return {
+      ok: false,
+      error: err?.message || 'Could not print transfer voucher PDF.',
+    };
   }
 }

@@ -1,5 +1,6 @@
 import type { BusinessSettings, InventoryMovement } from '../types';
 import { formatCurrency, formatDateTime } from './formatters';
+import { downloadPdfBlob, PdfPrintResult, printPdfBlob } from './pdfExport';
 
 function escapePdfText(input: string): string {
   const ascii = String(input || '').replace(/[^\x20-\x7E]/g, ' ');
@@ -15,7 +16,7 @@ function truncate(str: string, maxLen: number): string {
   return `${s.slice(0, Math.max(1, maxLen - 3))}...`;
 }
 
-export async function printMovementsReportPdf(
+function buildMovementsReportBlob(
   movements: InventoryMovement[],
   settings: BusinessSettings,
   meta: {
@@ -23,8 +24,7 @@ export async function printMovementsReportPdf(
     typeLabel: string;
     shopLabel: string;
   }
-): Promise<boolean> {
-  try {
+): { blob: Blob; fileName: string } {
     const pageWidth = 595.28;
     const pageHeight = 841.89;
     const marginLeft = 36;
@@ -286,18 +286,44 @@ export async function printMovementsReportPdf(
     const cleanShop = (meta.shopLabel || 'all_shops').toLowerCase().replace(/[^a-z0-9]+/g, '_');
     const fileName = `stock_movements_${cleanShop}_${new Date().toISOString().slice(0, 10)}.pdf`;
     const blob = new Blob([bytes], { type: 'application/pdf' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = fileName;
-    link.style.display = 'none';
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-    window.setTimeout(() => URL.revokeObjectURL(url), 1500);
-    return true;
+    return { blob, fileName };
+}
+
+export async function downloadMovementsReportPdf(
+  movements: InventoryMovement[],
+  settings: BusinessSettings,
+  meta: {
+    periodLabel: string;
+    typeLabel: string;
+    shopLabel: string;
+  }
+): Promise<boolean> {
+  try {
+    const { blob, fileName } = buildMovementsReportBlob(movements, settings, meta);
+    return downloadPdfBlob(blob, fileName);
   } catch (err) {
-    console.error('[movementsPrint] printMovementsReportPdf failed:', err);
+    console.error('[movementsPrint] downloadMovementsReportPdf failed:', err);
     return false;
+  }
+}
+
+export async function printMovementsReportPdf(
+  movements: InventoryMovement[],
+  settings: BusinessSettings,
+  meta: {
+    periodLabel: string;
+    typeLabel: string;
+    shopLabel: string;
+  }
+): Promise<PdfPrintResult> {
+  try {
+    const { blob, fileName } = buildMovementsReportBlob(movements, settings, meta);
+    return printPdfBlob(blob, fileName);
+  } catch (err: any) {
+    console.error('[movementsPrint] printMovementsReportPdf failed:', err);
+    return {
+      ok: false,
+      error: err?.message || 'Could not print stock movements PDF.',
+    };
   }
 }
