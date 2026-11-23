@@ -504,13 +504,13 @@ async function upsertProduct(db: any, product: any, operation?: string) {
       product.name,
       product.sku,
       product.barcode || null,
-      product.categoryId,
+      product.categoryId || '',
       product.sellingPrice || 0,
       product.proposedSellingPrice || null,
       product.purchasePrice || 0,
       currentStock,
       storeStock,
-      product.minStock || 5,
+      product.minStock !== undefined && product.minStock !== null ? Number(product.minStock) : 0,
       product.unit || 'pcs',
       product.status || 'ACTIVE',
       product.imageUrl || product.image_url || null,
@@ -950,18 +950,20 @@ async function voidSale(db: any, payload: any) {
 async function createPurchase(db: any, purchase: any) {
   const nowIso = new Date().toISOString();
   const createdAt = purchase.createdAt || nowIso;
-  const updatedAt = purchase.updatedAt || createdAt;
+  // Always use server write time for updated_at so incremental pulls pick up backdated purchases
+  const updatedAt = nowIso;
 
   try {
     await db
       .prepare(
         `
       INSERT INTO purchases (
-        id, purchase_number, shop_id, shop_name, store_id, store_name, supplier_name, date,
+        id, purchase_number, shop_id, shop_name, store_id, store_name,
+        supplier_name, supplier_phone, date,
         total_amount, payment_status, notes, invoice_number,
         created_by_user_id, created_by_name, created_at, updated_at, last_synced_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO NOTHING
     `
       )
@@ -973,6 +975,7 @@ async function createPurchase(db: any, purchase: any) {
         purchase.storeId || null,
         purchase.storeName || null,
         purchase.supplierName,
+        purchase.supplierPhone || null,
         purchase.date || nowIso.slice(0, 10),
         purchase.totalAmount || 0,
         purchase.paymentStatus || 'PAID',
@@ -986,36 +989,72 @@ async function createPurchase(db: any, purchase: any) {
       )
       .run();
   } catch {
-    // Fallback if optional store_id/store_name/updated_at columns are not present
-    await db
-      .prepare(
-        `
-      INSERT INTO purchases (
-        id, purchase_number, shop_id, shop_name, supplier_name, date,
-        total_amount, payment_status, notes, invoice_number,
-        created_by_user_id, created_by_name, created_at, last_synced_at
-      )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(id) DO NOTHING
-    `
-      )
-      .bind(
-        purchase.id,
-        purchase.purchaseNumber,
-        purchase.shopId,
-        purchase.shopName || null,
-        purchase.supplierName,
-        purchase.date || nowIso.slice(0, 10),
-        purchase.totalAmount || 0,
-        purchase.paymentStatus || 'PAID',
-        purchase.notes || null,
-        purchase.invoiceNumber || null,
-        purchase.createdByUserId,
-        purchase.createdByName,
-        createdAt,
-        nowIso
-      )
-      .run();
+    try {
+      // Fallback if supplier_phone column has not been added to D1 yet
+      await db
+        .prepare(
+          `
+        INSERT INTO purchases (
+          id, purchase_number, shop_id, shop_name, store_id, store_name, supplier_name, date,
+          total_amount, payment_status, notes, invoice_number,
+          created_by_user_id, created_by_name, created_at, updated_at, last_synced_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO NOTHING
+      `
+        )
+        .bind(
+          purchase.id,
+          purchase.purchaseNumber,
+          purchase.shopId,
+          purchase.shopName || null,
+          purchase.storeId || null,
+          purchase.storeName || null,
+          purchase.supplierName,
+          purchase.date || nowIso.slice(0, 10),
+          purchase.totalAmount || 0,
+          purchase.paymentStatus || 'PAID',
+          purchase.notes || null,
+          purchase.invoiceNumber || null,
+          purchase.createdByUserId,
+          purchase.createdByName,
+          createdAt,
+          updatedAt,
+          nowIso
+        )
+        .run();
+    } catch {
+      // Legacy fallback if optional store_id/store_name/updated_at columns are not present
+      await db
+        .prepare(
+          `
+        INSERT INTO purchases (
+          id, purchase_number, shop_id, shop_name, supplier_name, date,
+          total_amount, payment_status, notes, invoice_number,
+          created_by_user_id, created_by_name, created_at, last_synced_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO NOTHING
+      `
+        )
+        .bind(
+          purchase.id,
+          purchase.purchaseNumber,
+          purchase.shopId,
+          purchase.shopName || null,
+          purchase.supplierName,
+          purchase.date || nowIso.slice(0, 10),
+          purchase.totalAmount || 0,
+          purchase.paymentStatus || 'PAID',
+          purchase.notes || null,
+          purchase.invoiceNumber || null,
+          purchase.createdByUserId,
+          purchase.createdByName,
+          createdAt,
+          nowIso
+        )
+        .run();
+    }
   }
 
   for (const item of purchase.items || []) {
@@ -1049,35 +1088,74 @@ async function createPurchase(db: any, purchase: any) {
       const newPurchaseQty = Number(item.quantity) || 0;
       const newUnitCost = Number(item.unitCost) || 0;
 
+      const hasSellingPrice =
+        item.sellingPrice !== undefined &&
+        item.sellingPrice !== null &&
+        Number.isFinite(Number(item.sellingPrice)) &&
+        Number(item.sellingPrice) >= 0;
+      const newSellingPrice = hasSellingPrice
+        ? Number(Number(item.sellingPrice).toFixed(2))
+        : null;
+
       let newStock = currentStock;
       let newStoreStock = currentStoreStock;
 
       if (purchase.storeId) {
         newStoreStock += newPurchaseQty;
-        await db
-          .prepare(
-            `UPDATE products SET store_stock = ?, purchase_price = ?, updated_at = ? WHERE id = ?`
-          )
-          .bind(
-            newStoreStock,
-            Number(newUnitCost.toFixed(2)),
-            new Date().toISOString(),
-            item.productId
-          )
-          .run();
+        if (hasSellingPrice) {
+          await db
+            .prepare(
+              `UPDATE products SET store_stock = ?, purchase_price = ?, selling_price = ?, updated_at = ? WHERE id = ?`
+            )
+            .bind(
+              newStoreStock,
+              Number(newUnitCost.toFixed(2)),
+              newSellingPrice,
+              new Date().toISOString(),
+              item.productId
+            )
+            .run();
+        } else {
+          await db
+            .prepare(
+              `UPDATE products SET store_stock = ?, purchase_price = ?, updated_at = ? WHERE id = ?`
+            )
+            .bind(
+              newStoreStock,
+              Number(newUnitCost.toFixed(2)),
+              new Date().toISOString(),
+              item.productId
+            )
+            .run();
+        }
       } else {
         newStock += newPurchaseQty;
-        await db
-          .prepare(
-            `UPDATE products SET current_stock = ?, purchase_price = ?, updated_at = ? WHERE id = ?`
-          )
-          .bind(
-            newStock,
-            Number(newUnitCost.toFixed(2)),
-            new Date().toISOString(),
-            item.productId
-          )
-          .run();
+        if (hasSellingPrice) {
+          await db
+            .prepare(
+              `UPDATE products SET current_stock = ?, purchase_price = ?, selling_price = ?, updated_at = ? WHERE id = ?`
+            )
+            .bind(
+              newStock,
+              Number(newUnitCost.toFixed(2)),
+              newSellingPrice,
+              new Date().toISOString(),
+              item.productId
+            )
+            .run();
+        } else {
+          await db
+            .prepare(
+              `UPDATE products SET current_stock = ?, purchase_price = ?, updated_at = ? WHERE id = ?`
+            )
+            .bind(
+              newStock,
+              Number(newUnitCost.toFixed(2)),
+              new Date().toISOString(),
+              item.productId
+            )
+            .run();
+        }
       }
 
       await db
@@ -1174,7 +1252,9 @@ async function updatePurchase(db: any, purchase: any) {
       .prepare(
         `
       UPDATE purchases
-      SET supplier_name = ?, invoice_number = ?, payment_status = ?, notes = ?, total_amount = ?,
+      SET supplier_name = ?, supplier_phone = ?, date = COALESCE(?, date),
+          created_at = COALESCE(?, created_at),
+          invoice_number = ?, payment_status = ?, notes = ?, total_amount = ?,
           store_id = COALESCE(?, store_id), store_name = COALESCE(?, store_name),
           updated_at = ?, last_synced_at = ?
       WHERE id = ?
@@ -1182,34 +1262,68 @@ async function updatePurchase(db: any, purchase: any) {
       )
       .bind(
         purchase.supplierName,
+        purchase.supplierPhone || null,
+        purchase.date || null,
+        purchase.createdAt || null,
         purchase.invoiceNumber || null,
         purchase.paymentStatus || 'PAID',
         purchase.notes || null,
         purchase.totalAmount || 0,
         purchase.storeId || null,
         purchase.storeName || null,
-        updatedAt,
+        nowIso,
         nowIso,
         purchase.id
       )
       .run();
   } catch {
-    await db
-      .prepare(
-        `
-      UPDATE purchases SET supplier_name = ?, invoice_number = ?, payment_status = ?, notes = ?, total_amount = ?, last_synced_at = ? WHERE id = ?
-    `
-      )
-      .bind(
-        purchase.supplierName,
-        purchase.invoiceNumber || null,
-        purchase.paymentStatus || 'PAID',
-        purchase.notes || null,
-        purchase.totalAmount || 0,
-        nowIso,
-        purchase.id
-      )
-      .run();
+    try {
+      await db
+        .prepare(
+          `
+        UPDATE purchases
+        SET supplier_name = ?, date = COALESCE(?, date),
+            created_at = COALESCE(?, created_at),
+            invoice_number = ?, payment_status = ?, notes = ?, total_amount = ?,
+            store_id = COALESCE(?, store_id), store_name = COALESCE(?, store_name),
+            updated_at = ?, last_synced_at = ?
+        WHERE id = ?
+      `
+        )
+        .bind(
+          purchase.supplierName,
+          purchase.date || null,
+          purchase.createdAt || null,
+          purchase.invoiceNumber || null,
+          purchase.paymentStatus || 'PAID',
+          purchase.notes || null,
+          purchase.totalAmount || 0,
+          purchase.storeId || null,
+          purchase.storeName || null,
+          nowIso,
+          nowIso,
+          purchase.id
+        )
+        .run();
+    } catch {
+      await db
+        .prepare(
+          `
+        UPDATE purchases SET supplier_name = ?, date = COALESCE(?, date), invoice_number = ?, payment_status = ?, notes = ?, total_amount = ?, last_synced_at = ? WHERE id = ?
+      `
+        )
+        .bind(
+          purchase.supplierName,
+          purchase.date || null,
+          purchase.invoiceNumber || null,
+          purchase.paymentStatus || 'PAID',
+          purchase.notes || null,
+          purchase.totalAmount || 0,
+          nowIso,
+          purchase.id
+        )
+        .run();
+    }
   }
 
   for (const item of purchase.items || []) {
@@ -1243,35 +1357,74 @@ async function updatePurchase(db: any, purchase: any) {
       const newPurchaseQty = Number(item.quantity) || 0;
       const newUnitCost = Number(item.unitCost) || 0;
 
+      const hasSellingPrice =
+        item.sellingPrice !== undefined &&
+        item.sellingPrice !== null &&
+        Number.isFinite(Number(item.sellingPrice)) &&
+        Number(item.sellingPrice) >= 0;
+      const newSellingPrice = hasSellingPrice
+        ? Number(Number(item.sellingPrice).toFixed(2))
+        : null;
+
       let newStock = currentStock;
       let newStoreStock = currentStoreStock;
 
       if (effectiveStoreId) {
         newStoreStock += newPurchaseQty;
-        await db
-          .prepare(
-            `UPDATE products SET store_stock = ?, purchase_price = ?, updated_at = ? WHERE id = ?`
-          )
-          .bind(
-            newStoreStock,
-            Number(newUnitCost.toFixed(2)),
-            nowIso,
-            item.productId
-          )
-          .run();
+        if (hasSellingPrice) {
+          await db
+            .prepare(
+              `UPDATE products SET store_stock = ?, purchase_price = ?, selling_price = ?, updated_at = ? WHERE id = ?`
+            )
+            .bind(
+              newStoreStock,
+              Number(newUnitCost.toFixed(2)),
+              newSellingPrice,
+              nowIso,
+              item.productId
+            )
+            .run();
+        } else {
+          await db
+            .prepare(
+              `UPDATE products SET store_stock = ?, purchase_price = ?, updated_at = ? WHERE id = ?`
+            )
+            .bind(
+              newStoreStock,
+              Number(newUnitCost.toFixed(2)),
+              nowIso,
+              item.productId
+            )
+            .run();
+        }
       } else {
         newStock += newPurchaseQty;
-        await db
-          .prepare(
-            `UPDATE products SET current_stock = ?, purchase_price = ?, updated_at = ? WHERE id = ?`
-          )
-          .bind(
-            newStock,
-            Number(newUnitCost.toFixed(2)),
-            nowIso,
-            item.productId
-          )
-          .run();
+        if (hasSellingPrice) {
+          await db
+            .prepare(
+              `UPDATE products SET current_stock = ?, purchase_price = ?, selling_price = ?, updated_at = ? WHERE id = ?`
+            )
+            .bind(
+              newStock,
+              Number(newUnitCost.toFixed(2)),
+              newSellingPrice,
+              nowIso,
+              item.productId
+            )
+            .run();
+        } else {
+          await db
+            .prepare(
+              `UPDATE products SET current_stock = ?, purchase_price = ?, updated_at = ? WHERE id = ?`
+            )
+            .bind(
+              newStock,
+              Number(newUnitCost.toFixed(2)),
+              nowIso,
+              item.productId
+            )
+            .run();
+        }
       }
     }
   }
