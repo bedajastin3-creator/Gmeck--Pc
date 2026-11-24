@@ -6,12 +6,13 @@ import { CloudflareApi } from '../services/cloudflareApi';
 import { User, Sale, ToastMessage, Shop } from '../types';
 import { getColorOption } from '../utils/colors';
 import { generateUUID } from '../utils/crypto';
+import { hasAdminAccess } from '../utils/permissions';
 
 export type StoresSubTab = 'stores' | 'inventory' | 'transfer' | 'list' | 'transfer_view';
 export type ShopsSubTab = 'list' | 'add';
 export type InventoryFilter = 'ALL' | 'SHOP' | 'STORE';
 export type ProductsSubTab = 'product_list' | 'add_product' | 'category_list' | 'add_category';
-export type PurchasesSubTab = 'list' | 'add' | 'returns';
+export type PurchasesSubTab = 'list' | 'add' | 'returns' | 'suppliers';
 export type ExpensesSubTab = 'list' | 'add';
 export type SellersSubTab = 'list' | 'add';
 
@@ -86,7 +87,11 @@ const AppContext = createContext<AppContextType | undefined>(undefined);
 export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [currentUser, setCurrentUser] = useState<User | null>(() => AuthService.getActiveUser());
   const [dbState, setDbState] = useState<DatabaseState>(() => db.getState());
-  const [activeTab, setActiveTab] = useState<string>('dashboard');
+  const [activeTab, setActiveTabState] = useState<string>(() => {
+    const u = AuthService.getActiveUser();
+    if (u && !hasAdminAccess(u)) return 'new_sale';
+    return 'dashboard';
+  });
   const [storesSubTab, setStoresSubTab] = useState<StoresSubTab>('stores');
   const [storesNavTick, setStoresNavTick] = useState<number>(0);
   const [shopsSubTab, setShopsSubTab] = useState<ShopsSubTab>('list');
@@ -118,7 +123,18 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   useEffect(() => {
     currentUserRef.current = currentUser;
+    if (currentUser && !hasAdminAccess(currentUser)) {
+      setActiveTabState(prev => (prev === 'new_sale' || prev === 'settings' ? prev : 'new_sale'));
+    }
   }, [currentUser]);
+
+  const setActiveTab = (tab: string) => {
+    if (currentUserRef.current && !hasAdminAccess(currentUserRef.current)) {
+      setActiveTabState(tab === 'settings' ? 'settings' : 'new_sale');
+      return;
+    }
+    setActiveTabState(tab);
+  };
 
   const setSelectedShopId = (shopId: string) => {
     setSelectedShopIdState(shopId);

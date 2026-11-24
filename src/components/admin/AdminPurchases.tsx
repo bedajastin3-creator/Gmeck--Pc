@@ -23,6 +23,7 @@ import {
   Printer,
   PackagePlus,
   UserPlus,
+  Truck,
 } from 'lucide-react';
 import { useApp } from '../../context/AppContext';
 import { PurchaseIcon } from '../common/PurchaseIcon';
@@ -45,11 +46,36 @@ import {
 
 const PAGE_SIZE = 15;
 const SAVED_SUPPLIERS_KEY = 'omnibiz_saved_suppliers_v1';
+const DELETED_SUPPLIERS_KEY = 'omnibiz_deleted_suppliers_v1';
 type PurchasePeriodFilter = 'all' | 'day' | 'week' | 'month' | 'custom';
 
 interface SavedSupplier {
+  id?: string;
+  shopId?: string;
+  shopName?: string;
   name: string;
   phone?: string;
+  notes?: string;
+  sourceKeys?: string[];
+  updatedAt?: string;
+}
+
+interface SupplierDirectoryItem {
+  id: string;
+  shopId: string;
+  shopName: string;
+  name: string;
+  phone?: string;
+  notes?: string;
+  sourceKeys: string[];
+  purchaseCount: number;
+  totalSpent: number;
+  lastPurchaseDate?: string;
+  isSaved: boolean;
+}
+
+function makeScopedSupplierKey(shopId: string, nameKey: string): string {
+  return `${shopId || '__unassigned__'}::${nameKey.trim().toLowerCase()}`;
 }
 
 function loadSavedSuppliers(): SavedSupplier[] {
@@ -60,10 +86,29 @@ function loadSavedSuppliers(): SavedSupplier[] {
     if (!Array.isArray(parsed)) return [];
     return parsed
       .filter((s: any) => s && typeof s.name === 'string' && s.name.trim())
-      .map((s: any) => ({
-        name: s.name.trim(),
-        phone: typeof s.phone === 'string' && s.phone.trim() ? s.phone.trim() : undefined,
-      }));
+      .map((s: any) => {
+        const cleanName = s.name.trim();
+        const cleanShopId =
+          typeof s.shopId === 'string' && s.shopId.trim() ? s.shopId.trim() : undefined;
+        return {
+          id:
+            typeof s.id === 'string' && s.id.trim()
+              ? s.id.trim()
+              : `sup_${cleanShopId || 'legacy'}_${cleanName.toLowerCase()}`,
+          shopId: cleanShopId,
+          shopName:
+            typeof s.shopName === 'string' && s.shopName.trim() ? s.shopName.trim() : undefined,
+          name: cleanName,
+          phone: typeof s.phone === 'string' && s.phone.trim() ? s.phone.trim() : undefined,
+          notes: typeof s.notes === 'string' && s.notes.trim() ? s.notes.trim() : undefined,
+          sourceKeys: Array.isArray(s.sourceKeys)
+            ? s.sourceKeys
+                .filter((k: any) => typeof k === 'string' && k.trim())
+                .map((k: string) => k.trim().toLowerCase())
+            : [],
+          updatedAt: typeof s.updatedAt === 'string' ? s.updatedAt : undefined,
+        };
+      });
   } catch {
     return [];
   }
@@ -72,6 +117,28 @@ function loadSavedSuppliers(): SavedSupplier[] {
 function persistSavedSuppliers(list: SavedSupplier[]) {
   try {
     localStorage.setItem(SAVED_SUPPLIERS_KEY, JSON.stringify(list));
+  } catch {
+    // ignore storage quota errors
+  }
+}
+
+function loadDeletedSupplierKeys(): string[] {
+  try {
+    const raw = localStorage.getItem(DELETED_SUPPLIERS_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter((k: any) => typeof k === 'string' && k.trim())
+      .map((k: string) => k.trim().toLowerCase());
+  } catch {
+    return [];
+  }
+}
+
+function persistDeletedSupplierKeys(keys: string[]) {
+  try {
+    localStorage.setItem(DELETED_SUPPLIERS_KEY, JSON.stringify(Array.from(new Set(keys))));
   } catch {
     // ignore storage quota errors
   }
@@ -163,6 +230,7 @@ export const AdminPurchases: React.FC = () => {
 
   // Form state (full-page Add / Edit Purchase)
   const [purchaseShopId, setPurchaseShopId] = useState('');
+  const [businessLocationKey, setBusinessLocationKey] = useState('');
   const [destinationType, setDestinationType] = useState<'SHOP_FLOOR' | 'STORE'>('SHOP_FLOOR');
   const [purchaseStoreId, setPurchaseStoreId] = useState('');
   const [purchaseDate, setPurchaseDate] = useState(() => toLocalYMD(new Date()));
@@ -191,12 +259,26 @@ export const AdminPurchases: React.FC = () => {
   const [createProdError, setCreateProdError] = useState('');
   const [isCreatingProduct, setIsCreatingProduct] = useState(false);
 
-  // Saved suppliers directory + Add New Supplier modal state
+  // Saved suppliers directory + Add/Edit/Delete Supplier state + Create Purchase vendor search
   const [savedSuppliers, setSavedSuppliers] = useState<SavedSupplier[]>(() => loadSavedSuppliers());
+  const [deletedSupplierKeys, setDeletedSupplierKeys] = useState<string[]>(() =>
+    loadDeletedSupplierKeys()
+  );
   const [isAddSupplierOpen, setIsAddSupplierOpen] = useState(false);
+  const [editingSupplierTarget, setEditingSupplierTarget] = useState<SupplierDirectoryItem | null>(
+    null
+  );
   const [newSupplierName, setNewSupplierName] = useState('');
   const [newSupplierPhone, setNewSupplierPhone] = useState('');
+  const [newSupplierNotes, setNewSupplierNotes] = useState('');
+  const [newSupplierShopId, setNewSupplierShopId] = useState('');
   const [newSupplierError, setNewSupplierError] = useState('');
+  const [supplierToDelete, setSupplierToDelete] = useState<SupplierDirectoryItem | null>(null);
+  const [vendorSearchQuery, setVendorSearchQuery] = useState('');
+  const [isVendorSearchOpen, setIsVendorSearchOpen] = useState(false);
+  const vendorSearchBoxRef = useRef<HTMLDivElement>(null);
+  const [supplierListSearch, setSupplierListSearch] = useState('');
+  const [supplierListShopFilter, setSupplierListShopFilter] = useState('ALL');
 
   const canRecordPurchase = true;
   const settings = dbState.settings;
@@ -323,7 +405,8 @@ export const AdminPurchases: React.FC = () => {
     return map;
   }, [dbState.stores]);
 
-  const isGlobalSearchActive = Boolean(searchQuery.trim()) && !searchPeriodOnly && periodFilter !== 'all';
+  const isGlobalSearchActive =
+    Boolean(searchQuery.trim()) && !searchPeriodOnly && periodFilter !== 'all';
 
   // Filter (period + multi-token search) -> sort by purchase date desc, then createdAt desc
   const purchases = useMemo(() => {
@@ -476,6 +559,7 @@ export const AdminPurchases: React.FC = () => {
         : availableShops[0]?.id) ||
       '';
     setPurchaseShopId(targetShop);
+    setBusinessLocationKey('');
     setDestinationType('SHOP_FLOOR');
     setPurchaseStoreId('');
     setPurchaseDate(toLocalYMD(new Date()));
@@ -490,6 +574,8 @@ export const AdminPurchases: React.FC = () => {
     setItems([]);
     setPurchaseProductSearch('');
     setPurchaseSearchLimit(PAGE_SIZE);
+    setVendorSearchQuery('');
+    setIsVendorSearchOpen(false);
     setFormError('');
   };
 
@@ -516,53 +602,208 @@ export const AdminPurchases: React.FC = () => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [purchasesNavTick, purchasesSubTab]);
 
-  // Build deduplicated list of existing suppliers (from past purchases + locally added suppliers)
-  const existingSuppliers = useMemo(() => {
-    const map = new Map<string, SavedSupplier>();
+  // Close Create Purchase vendor search dropdown on outside click
+  useEffect(() => {
+    const handleOutsideClick = (event: MouseEvent) => {
+      if (
+        vendorSearchBoxRef.current &&
+        !vendorSearchBoxRef.current.contains(event.target as Node)
+      ) {
+        setIsVendorSearchOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handleOutsideClick);
+    return () => document.removeEventListener('mousedown', handleOutsideClick);
+  }, []);
 
-    const sortedPurchases = [...(dbState.purchases || [])].sort(
+  const shopNameById = useMemo(() => {
+    const map: Record<string, string> = {};
+    for (const sh of dbState.shops || []) {
+      map[sh.id] = sh.name;
+    }
+    return map;
+  }, [dbState.shops]);
+
+  // Build shop-scoped Supplier Directory:
+  // Each supplier belongs to the Shop that created it and is visible ONLY to that shop's Shop Admin/users and Platform Admin.
+  const supplierDirectory = useMemo<SupplierDirectoryItem[]>(() => {
+    if (!currentUser) return [];
+    const deletedSet = new Set(deletedSupplierKeys.map(k => k.toLowerCase()));
+    const isDeletedForShop = (shopId: string, nameKey: string) =>
+      deletedSet.has(makeScopedSupplierKey(shopId, nameKey)) || deletedSet.has(nameKey);
+
+    const entries = new Map<string, SupplierDirectoryItem>();
+    const aliasToPrimaryKey = new Map<string, string>();
+
+    const allPurchasesSorted = [...(dbState.purchases || [])].sort(
       (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
     );
-    for (const p of sortedPurchases) {
+
+    // Helper for legacy saved suppliers missing shopId: infer shop from matching purchase if any
+    const inferredShopByLegacyName = new Map<string, string>();
+    for (const p of allPurchasesSorted) {
       const cleanName = (p.supplierName || '').trim();
-      if (!cleanName || cleanName.toLowerCase() === 'walk-in supplier') continue;
-      const key = cleanName.toLowerCase();
-      const existing = map.get(key);
-      if (!existing) {
-        map.set(key, {
-          name: cleanName,
-          phone: p.supplierPhone?.trim() || undefined,
-        });
-      } else if (!existing.phone && p.supplierPhone?.trim()) {
-        existing.phone = p.supplierPhone.trim();
+      if (!cleanName || !p.shopId) continue;
+      const k = cleanName.toLowerCase();
+      if (!inferredShopByLegacyName.has(k)) {
+        inferredShopByLegacyName.set(k, p.shopId);
       }
     }
 
+    // 1. Seed from savedSuppliers first (strictly scoped by shopId)
     for (const s of savedSuppliers) {
       const cleanName = s.name.trim();
       if (!cleanName || cleanName.toLowerCase() === 'walk-in supplier') continue;
-      const key = cleanName.toLowerCase();
-      const existing = map.get(key);
-      if (!existing) {
-        map.set(key, { name: cleanName, phone: s.phone });
-      } else if (s.phone) {
-        existing.phone = s.phone;
+      const nameKey = cleanName.toLowerCase();
+      const resolvedShopId = s.shopId || inferredShopByLegacyName.get(nameKey) || '';
+
+      // Enforce shop visibility: non-platform admins ONLY see suppliers belonging to their accessible shop(s)
+      if (!platformAdmin) {
+        if (!resolvedShopId || !visibleShopIdSet.has(resolvedShopId)) continue;
+      }
+
+      if (isDeletedForShop(resolvedShopId, nameKey)) continue;
+
+      const scopedKey = makeScopedSupplierKey(resolvedShopId, nameKey);
+      const sourceKeys = Array.from(
+        new Set([nameKey, ...(s.sourceKeys || []).map(k => k.toLowerCase())])
+      );
+      entries.set(scopedKey, {
+        id: s.id || `sup_${scopedKey}`,
+        shopId: resolvedShopId,
+        shopName:
+          (resolvedShopId && shopNameById[resolvedShopId]) ||
+          s.shopName ||
+          (resolvedShopId ? 'Unknown Shop' : 'Unassigned'),
+        name: cleanName,
+        phone: s.phone?.trim() || undefined,
+        notes: s.notes?.trim() || undefined,
+        sourceKeys,
+        purchaseCount: 0,
+        totalSpent: 0,
+        lastPurchaseDate: undefined,
+        isSaved: true,
+      });
+      for (const alias of sourceKeys) {
+        aliasToPrimaryKey.set(makeScopedSupplierKey(resolvedShopId, alias), scopedKey);
       }
     }
+
+    // 2. Merge accessible historical purchases scoped to each purchase's shopId
+    const accessiblePurchases = allPurchasesSorted.filter(
+      p => !!p.shopId && (platformAdmin || visibleShopIdSet.has(p.shopId))
+    );
+
+    for (const p of accessiblePurchases) {
+      const cleanName = (p.supplierName || '').trim();
+      if (!cleanName || cleanName.toLowerCase() === 'walk-in supplier') continue;
+      const pShopId = p.shopId;
+      const rawNameKey = cleanName.toLowerCase();
+      const rawScopedKey = makeScopedSupplierKey(pShopId, rawNameKey);
+      const mappedKey = aliasToPrimaryKey.get(rawScopedKey);
+      const targetKey = mappedKey || rawScopedKey;
+
+      if (!mappedKey && isDeletedForShop(pShopId, rawNameKey)) continue;
+
+      let item = entries.get(targetKey);
+      if (!item) {
+        item = {
+          id: `sup_${rawScopedKey}`,
+          shopId: pShopId,
+          shopName: shopNameById[pShopId] || p.shopName || 'Unknown Shop',
+          name: cleanName,
+          phone: p.supplierPhone?.trim() || undefined,
+          notes: undefined,
+          sourceKeys: [rawNameKey],
+          purchaseCount: 0,
+          totalSpent: 0,
+          lastPurchaseDate: undefined,
+          isSaved: false,
+        };
+        entries.set(targetKey, item);
+        aliasToPrimaryKey.set(rawScopedKey, targetKey);
+      } else if (!item.phone && p.supplierPhone?.trim()) {
+        item.phone = p.supplierPhone.trim();
+      }
+
+      if ((p as any).status !== 'VOIDED') {
+        item.purchaseCount += 1;
+        item.totalSpent += p.totalAmount || 0;
+        const pDate = getPurchaseLocalYMD(p);
+        if (!item.lastPurchaseDate || pDate > item.lastPurchaseDate) {
+          item.lastPurchaseDate = pDate;
+        }
+      }
+    }
+
+    return Array.from(entries.values()).sort(
+      (a, b) => a.name.localeCompare(b.name) || a.shopName.localeCompare(b.shopName)
+    );
+  }, [
+    currentUser,
+    dbState.purchases,
+    savedSuppliers,
+    deletedSupplierKeys,
+    platformAdmin,
+    visibleShopIdSet,
+    shopNameById,
+  ]);
+
+  // Supplier list used by Create Purchase dropdown & vendor search bar — strictly scoped to the selected Purchase Shop
+  const existingSuppliers = useMemo(() => {
+    const targetShopId = purchaseShopId || availableShops[0]?.id || '';
+    const list: SupplierDirectoryItem[] = targetShopId
+      ? supplierDirectory.filter(s => s.shopId === targetShopId)
+      : [...supplierDirectory];
 
     const currentClean = supplierName.trim();
-    if (currentClean && currentClean.toLowerCase() !== 'walk-in supplier') {
-      const key = currentClean.toLowerCase();
-      if (!map.has(key)) {
-        map.set(key, {
-          name: currentClean,
-          phone: supplierPhone.trim() || undefined,
-        });
-      }
+    if (
+      currentClean &&
+      currentClean.toLowerCase() !== 'walk-in supplier' &&
+      !list.some(s => s.name.toLowerCase() === currentClean.toLowerCase())
+    ) {
+      list.push({
+        id: `sup_${makeScopedSupplierKey(targetShopId, currentClean)}`,
+        shopId: targetShopId,
+        shopName: (targetShopId && shopNameById[targetShopId]) || 'Selected Shop',
+        name: currentClean,
+        phone: supplierPhone.trim() || undefined,
+        notes: undefined,
+        sourceKeys: [currentClean.toLowerCase()],
+        purchaseCount: 0,
+        totalSpent: 0,
+        isSaved: false,
+      });
+      list.sort((a, b) => a.name.localeCompare(b.name));
     }
+    return list;
+  }, [supplierDirectory, purchaseShopId, availableShops, supplierName, supplierPhone, shopNameById]);
 
-    return Array.from(map.values()).sort((a, b) => a.name.localeCompare(b.name));
-  }, [dbState.purchases, savedSuppliers, supplierName, supplierPhone]);
+  const filteredVendorSearchResults = useMemo(() => {
+    const raw = vendorSearchQuery.trim().toLowerCase();
+    if (!raw) return existingSuppliers.slice(0, 12);
+    const tokens = raw.split(/\s+/).filter(Boolean);
+    return existingSuppliers.filter(sup => {
+      const hay = `${sup.name} ${sup.phone || ''} ${sup.notes || ''}`.toLowerCase();
+      return tokens.every(tok => hay.includes(tok));
+    });
+  }, [existingSuppliers, vendorSearchQuery]);
+
+  // Suppliers scoped by the Supplier List shop filter (for Platform Admin / multi-shop users)
+  const shopFilteredSuppliers = useMemo(() => {
+    if (supplierListShopFilter === 'ALL') return supplierDirectory;
+    return supplierDirectory.filter(sup => sup.shopId === supplierListShopFilter);
+  }, [supplierDirectory, supplierListShopFilter]);
+
+  const filteredSupplierList = useMemo(() => {
+    const raw = supplierListSearch.trim().toLowerCase();
+    if (!raw) return shopFilteredSuppliers;
+    const tokens = raw.split(/\s+/).filter(Boolean);
+    return shopFilteredSuppliers.filter(sup => {
+      const hay = `${sup.name} ${sup.phone || ''} ${sup.notes || ''} ${sup.shopName || ''}`.toLowerCase();
+      return tokens.every(tok => hay.includes(tok));
+    });
+  }, [shopFilteredSuppliers, supplierListSearch]);
 
   // Categories scoped to the active purchase shop (for inline Create Product modal)
   const purchaseShopCategories = useMemo(() => {
@@ -576,6 +817,16 @@ export const AdminPurchases: React.FC = () => {
     const targetShopId = purchaseShopId || availableShops[0]?.id || '';
     const shopObj = availableShops.find(s => s.id === targetShopId);
     const shopName = shopObj?.name || 'Selected Shop';
+
+    if (!isEditMode && !businessLocationKey) {
+      return {
+        key: '',
+        type: 'SHOP_FLOOR' as const,
+        shopId: targetShopId,
+        storeId: undefined as string | undefined,
+        label: 'Not selected — choose Business Location first',
+      };
+    }
 
     if (destinationType === 'STORE' && purchaseStoreId) {
       const storeObj = (dbState.stores || []).find(
@@ -599,12 +850,21 @@ export const AdminPurchases: React.FC = () => {
       storeId: undefined as string | undefined,
       label: `Shop Floor: ${shopName}`,
     };
-  }, [purchaseShopId, availableShops, destinationType, purchaseStoreId, dbState.stores]);
+  }, [
+    purchaseShopId,
+    availableShops,
+    isEditMode,
+    businessLocationKey,
+    destinationType,
+    purchaseStoreId,
+    dbState.stores,
+  ]);
 
+  // Optional second location options — strictly SAME SHOP ONLY, excluding the location already selected on the purchase form
   const createProdSecondLocationOptions = useMemo(() => {
     const targetShopId = createProdPrimaryLocation.shopId;
     const primaryKey = createProdPrimaryLocation.key;
-    if (!targetShopId) return [] as { key: string; label: string }[];
+    if (!targetShopId || !primaryKey) return [] as { key: string; label: string }[];
 
     const targetShop = availableShops.find(s => s.id === targetShopId);
     const targetShopName = targetShop?.name || 'Shop';
@@ -700,12 +960,45 @@ export const AdminPurchases: React.FC = () => {
     setPurchasesSubTab('add');
   };
 
+  const resolveDefaultSupplierShopId = () => {
+    if (purchasesSubTab === 'add') {
+      return purchaseShopId || availableShops[0]?.id || '';
+    }
+    if (supplierListShopFilter !== 'ALL' && visibleShopIdSet.has(supplierListShopFilter)) {
+      return supplierListShopFilter;
+    }
+    if (selectedShopId !== 'ALL' && visibleShopIdSet.has(selectedShopId)) {
+      return selectedShopId;
+    }
+    if (currentShop?.id && visibleShopIdSet.has(currentShop.id)) {
+      return currentShop.id;
+    }
+    return availableShops[0]?.id || '';
+  };
+
+  const openAddSupplierModal = (prefillName: string = '') => {
+    setEditingSupplierTarget(null);
+    setNewSupplierName(prefillName);
+    setNewSupplierPhone('');
+    setNewSupplierNotes('');
+    setNewSupplierShopId(resolveDefaultSupplierShopId());
+    setNewSupplierError('');
+    setIsAddSupplierOpen(true);
+  };
+
+  const openEditSupplierModal = (sup: SupplierDirectoryItem) => {
+    setEditingSupplierTarget(sup);
+    setNewSupplierName(sup.name);
+    setNewSupplierPhone(sup.phone || '');
+    setNewSupplierNotes(sup.notes || '');
+    setNewSupplierShopId(sup.shopId || resolveDefaultSupplierShopId());
+    setNewSupplierError('');
+    setIsAddSupplierOpen(true);
+  };
+
   const handleSelectSupplier = (selectedValue: string) => {
     if (selectedValue === '__ADD_NEW_SUPPLIER__') {
-      setNewSupplierName('');
-      setNewSupplierPhone('');
-      setNewSupplierError('');
-      setIsAddSupplierOpen(true);
+      openAddSupplierModal('');
       return;
     }
 
@@ -719,7 +1012,11 @@ export const AdminPurchases: React.FC = () => {
       s => s.name.toLowerCase() === selectedValue.toLowerCase()
     );
     setSupplierName(matched ? matched.name : selectedValue);
-    setSupplierPhone(matched?.phone || '');
+    if (matched?.phone) {
+      setSupplierPhone(matched.phone);
+    } else {
+      setSupplierPhone('');
+    }
   };
 
   const handleSaveNewSupplier = (e: React.FormEvent) => {
@@ -727,29 +1024,224 @@ export const AdminPurchases: React.FC = () => {
     setNewSupplierError('');
     const cleanName = newSupplierName.trim();
     const cleanPhone = newSupplierPhone.trim() || undefined;
+    const cleanNotes = newSupplierNotes.trim() || undefined;
+    const targetShopId =
+      purchasesSubTab === 'add'
+        ? purchaseShopId || newSupplierShopId || availableShops[0]?.id || ''
+        : newSupplierShopId || resolveDefaultSupplierShopId();
+
+    if (!targetShopId) {
+      setNewSupplierError('Please select the Shop that owns this supplier.');
+      return;
+    }
+
+    if (!platformAdmin && !visibleShopIdSet.has(targetShopId)) {
+      setNewSupplierError('You can only create or manage suppliers under your own shop.');
+      return;
+    }
 
     if (!cleanName) {
       setNewSupplierError('Please enter the supplier name.');
       return;
     }
 
+    if (cleanName.toLowerCase() === 'walk-in supplier') {
+      setNewSupplierError('"Walk-in Supplier" is reserved as the default option.');
+      return;
+    }
+
+    const targetShopName = shopNameById[targetShopId] || 'Shop';
+    const newNameKey = cleanName.toLowerCase();
+    const newScopedKey = makeScopedSupplierKey(targetShopId, newNameKey);
+
+    if (editingSupplierTarget) {
+      const oldShopId = editingSupplierTarget.shopId || targetShopId;
+      const oldNameKey = editingSupplierTarget.name.toLowerCase();
+      const duplicate = supplierDirectory.find(
+        s =>
+          s.shopId === targetShopId &&
+          s.name.toLowerCase() === newNameKey &&
+          !(s.shopId === oldShopId && s.name.toLowerCase() === oldNameKey)
+      );
+      if (duplicate) {
+        setNewSupplierError(
+          `A supplier named "${duplicate.name}" already exists under ${targetShopName}.`
+        );
+        return;
+      }
+
+      const mergedSourceKeys = Array.from(
+        new Set([
+          ...(oldShopId === targetShopId ? editingSupplierTarget.sourceKeys : []),
+          ...(oldShopId === targetShopId ? [oldNameKey] : []),
+          newNameKey,
+        ])
+      );
+
+      const updatedEntry: SavedSupplier = {
+        id: editingSupplierTarget.id || `sup_${newScopedKey}`,
+        shopId: targetShopId,
+        shopName: targetShopName,
+        name: cleanName,
+        phone: cleanPhone,
+        notes: cleanNotes,
+        sourceKeys: mergedSourceKeys,
+        updatedAt: new Date().toISOString(),
+      };
+
+      const nextList: SavedSupplier[] = [
+        updatedEntry,
+        ...savedSuppliers.filter(s => {
+          const sShopId = s.shopId || '';
+          const sameOld =
+            sShopId === oldShopId &&
+            (s.name.toLowerCase() === oldNameKey ||
+              (s.sourceKeys || []).includes(oldNameKey));
+          const sameNew = sShopId === targetShopId && s.name.toLowerCase() === newNameKey;
+          return !sameOld && !sameNew;
+        }),
+      ];
+      setSavedSuppliers(nextList);
+      persistSavedSuppliers(nextList);
+
+      // Ensure renamed supplier is not hidden under this shop
+      const oldScopedKey = makeScopedSupplierKey(oldShopId, oldNameKey);
+      const nextDeleted = deletedSupplierKeys.filter(
+        k => k !== newScopedKey && k !== oldScopedKey && k !== newNameKey
+      );
+      if (nextDeleted.length !== deletedSupplierKeys.length) {
+        setDeletedSupplierKeys(nextDeleted);
+        persistDeletedSupplierKeys(nextDeleted);
+      }
+
+      if (purchaseShopId === targetShopId && supplierName.trim().toLowerCase() === oldNameKey) {
+        setSupplierName(cleanName);
+        setSupplierPhone(cleanPhone || '');
+      }
+
+      setIsAddSupplierOpen(false);
+      setEditingSupplierTarget(null);
+      setNewSupplierName('');
+      setNewSupplierPhone('');
+      setNewSupplierNotes('');
+
+      addToast({
+        type: 'success',
+        title: 'Supplier Updated',
+        description: `${cleanName} (${targetShopName}) was updated successfully.`,
+      });
+      return;
+    }
+
+    // Creating a new shop-scoped supplier
+    const existingDuplicate = supplierDirectory.find(
+      s => s.shopId === targetShopId && s.name.toLowerCase() === newNameKey
+    );
+    if (existingDuplicate) {
+      setNewSupplierError(
+        `A supplier named "${existingDuplicate.name}" already exists under ${targetShopName}.`
+      );
+      return;
+    }
+
     const nextList: SavedSupplier[] = [
-      { name: cleanName, phone: cleanPhone },
-      ...savedSuppliers.filter(s => s.name.toLowerCase() !== cleanName.toLowerCase()),
+      {
+        id: `sup_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+        shopId: targetShopId,
+        shopName: targetShopName,
+        name: cleanName,
+        phone: cleanPhone,
+        notes: cleanNotes,
+        sourceKeys: [newNameKey],
+        updatedAt: new Date().toISOString(),
+      },
+      ...savedSuppliers.filter(
+        s => !((s.shopId || '') === targetShopId && s.name.toLowerCase() === newNameKey)
+      ),
     ];
     setSavedSuppliers(nextList);
     persistSavedSuppliers(nextList);
 
-    setSupplierName(cleanName);
-    setSupplierPhone(cleanPhone || '');
+    // If this shop-scoped supplier name was previously deleted, restore it cleanly
+    const nextDeleted = deletedSupplierKeys.filter(
+      k => k !== newScopedKey && k !== newNameKey
+    );
+    if (nextDeleted.length !== deletedSupplierKeys.length) {
+      setDeletedSupplierKeys(nextDeleted);
+      persistDeletedSupplierKeys(nextDeleted);
+    }
+
+    if (purchasesSubTab === 'add' && targetShopId === purchaseShopId) {
+      setSupplierName(cleanName);
+      setSupplierPhone(cleanPhone || '');
+      setVendorSearchQuery('');
+      setIsVendorSearchOpen(false);
+    }
+
     setIsAddSupplierOpen(false);
+    setEditingSupplierTarget(null);
     setNewSupplierName('');
     setNewSupplierPhone('');
+    setNewSupplierNotes('');
 
     addToast({
       type: 'success',
-      title: 'Supplier Added & Selected',
-      description: `${cleanName}${cleanPhone ? ` (${cleanPhone})` : ''} is now selected for this purchase.`,
+      title: purchasesSubTab === 'add' ? 'Supplier Added & Selected' : 'Supplier Added',
+      description:
+        purchasesSubTab === 'add'
+          ? `${cleanName} added under ${targetShopName} and selected for this purchase.`
+          : `${cleanName} has been added under ${targetShopName}.`,
+    });
+  };
+
+  const handleConfirmDeleteSupplier = () => {
+    if (!supplierToDelete) return;
+    const supShopId = supplierToDelete.shopId || '';
+    if (!platformAdmin && supShopId && !visibleShopIdSet.has(supShopId)) {
+      setSupplierToDelete(null);
+      return;
+    }
+
+    const rawNameKeys = Array.from(
+      new Set([
+        supplierToDelete.name.toLowerCase(),
+        ...supplierToDelete.sourceKeys.map(k => k.toLowerCase()),
+      ])
+    );
+    const scopedKeysToRemove = rawNameKeys.map(k => makeScopedSupplierKey(supShopId, k));
+    const removeRawSet = new Set(rawNameKeys);
+
+    const nextSaved = savedSuppliers.filter(s => {
+      const sameShop = (s.shopId || '') === supShopId;
+      if (!sameShop) return true;
+      return (
+        !removeRawSet.has(s.name.toLowerCase()) &&
+        !(s.sourceKeys || []).some(k => removeRawSet.has(k.toLowerCase()))
+      );
+    });
+    setSavedSuppliers(nextSaved);
+    persistSavedSuppliers(nextSaved);
+
+    const nextDeleted = Array.from(new Set([...deletedSupplierKeys, ...scopedKeysToRemove]));
+    setDeletedSupplierKeys(nextDeleted);
+    persistDeletedSupplierKeys(nextDeleted);
+
+    if (
+      purchaseShopId === supShopId &&
+      removeRawSet.has(supplierName.trim().toLowerCase())
+    ) {
+      setSupplierName('');
+      setSupplierPhone('');
+    }
+
+    const removedName = supplierToDelete.name;
+    const removedShopName = supplierToDelete.shopName;
+    setSupplierToDelete(null);
+
+    addToast({
+      type: 'info',
+      title: 'Supplier Deleted',
+      description: `${removedName} (${removedShopName}) was removed from Supplier List.`,
     });
   };
 
@@ -757,6 +1249,9 @@ export const AdminPurchases: React.FC = () => {
     setEditingPurchase(purchase);
     setIsEditMode(true);
     setPurchaseShopId(purchase.shopId);
+    setBusinessLocationKey(
+      purchase.storeId ? `STORE:${purchase.storeId}` : `SHOP:${purchase.shopId}`
+    );
     setDestinationType(purchase.storeId ? 'STORE' : 'SHOP_FLOOR');
     setPurchaseStoreId(purchase.storeId || '');
     setPurchaseDate(getPurchaseLocalYMD(purchase));
@@ -789,6 +1284,8 @@ export const AdminPurchases: React.FC = () => {
 
     setPurchaseProductSearch('');
     setPurchaseSearchLimit(PAGE_SIZE);
+    setVendorSearchQuery('');
+    setIsVendorSearchOpen(false);
     setFormError('');
     setPurchasesSubTab('add');
   };
@@ -812,11 +1309,15 @@ export const AdminPurchases: React.FC = () => {
           productId: product.id,
           quantity: '1',
           unitCost:
-            product.purchasePrice !== undefined && product.purchasePrice !== null && product.purchasePrice > 0
+            product.purchasePrice !== undefined &&
+            product.purchasePrice !== null &&
+            product.purchasePrice > 0
               ? product.purchasePrice.toString()
               : '',
           sellingPrice:
-            product.sellingPrice !== undefined && product.sellingPrice !== null && product.sellingPrice > 0
+            product.sellingPrice !== undefined &&
+            product.sellingPrice !== null &&
+            product.sellingPrice > 0
               ? product.sellingPrice.toString()
               : '',
         },
@@ -913,9 +1414,14 @@ export const AdminPurchases: React.FC = () => {
       return;
     }
 
+    if (!isEditMode && !businessLocationKey) {
+      setCreateProdError('Please select a Business Location on the purchase form first.');
+      return;
+    }
+
     const isStoreDirected = destinationType === 'STORE';
     if (isStoreDirected && !purchaseStoreId) {
-      setCreateProdError('Please select a destination Store on the purchase form first.');
+      setCreateProdError('Please select a valid Business Location on the purchase form first.');
       return;
     }
 
@@ -1046,9 +1552,7 @@ export const AdminPurchases: React.FC = () => {
     return {
       shopLabel: scopeLabel,
       periodKey: effectivePeriodKey,
-      periodTitle: isGlobalSearchActive
-        ? 'Purchases Search Report'
-        : periodRange.periodTitle,
+      periodTitle: isGlobalSearchActive ? 'Purchases Search Report' : periodRange.periodTitle,
       periodLabel: isGlobalSearchActive
         ? 'Search Results (All Dates)'
         : periodRange.periodLabel,
@@ -1110,8 +1614,7 @@ export const AdminPurchases: React.FC = () => {
     setDownloadingPurchaseId(purchase.id);
     try {
       const resolvedStore =
-        purchase.storeName ||
-        (purchase.storeId ? storeNameMap[purchase.storeId] : undefined);
+        purchase.storeName || (purchase.storeId ? storeNameMap[purchase.storeId] : undefined);
       const ok = await downloadSinglePurchasePdf(purchase, settings, resolvedStore);
       if (ok) {
         addToast({
@@ -1130,8 +1633,7 @@ export const AdminPurchases: React.FC = () => {
     setPrintingPurchaseId(purchase.id);
     try {
       const resolvedStore =
-        purchase.storeName ||
-        (purchase.storeId ? storeNameMap[purchase.storeId] : undefined);
+        purchase.storeName || (purchase.storeId ? storeNameMap[purchase.storeId] : undefined);
       const res = await printSinglePurchasePdf(purchase, settings, resolvedStore);
       if (res.ok) {
         addToast({
@@ -1199,15 +1701,41 @@ export const AdminPurchases: React.FC = () => {
 
     const finalSupplierName = supplierName.trim() || 'Walk-in Supplier';
     const finalSupplierPhone = supplierPhone.trim() || undefined;
+    const targetPurchaseShopId = editingPurchase
+      ? editingPurchase.shopId
+      : purchaseShopId || availableShops[0]?.id || '';
+    const targetPurchaseShopName =
+      (targetPurchaseShopId && shopNameById[targetPurchaseShopId]) || undefined;
 
+    // Remember supplier phone update in shop-scoped local directory for future purchases
     if (
       finalSupplierName.toLowerCase() !== 'walk-in supplier' &&
-      finalSupplierPhone
+      finalSupplierPhone &&
+      targetPurchaseShopId
     ) {
+      const nameKey = finalSupplierName.toLowerCase();
+      const existingEntry = savedSuppliers.find(
+        s =>
+          (s.shopId || '') === targetPurchaseShopId &&
+          (s.name.toLowerCase() === nameKey || (s.sourceKeys || []).includes(nameKey))
+      );
       const nextSaved: SavedSupplier[] = [
-        { name: finalSupplierName, phone: finalSupplierPhone },
+        {
+          id: existingEntry?.id || `sup_${makeScopedSupplierKey(targetPurchaseShopId, nameKey)}`,
+          shopId: targetPurchaseShopId,
+          shopName: targetPurchaseShopName || existingEntry?.shopName,
+          name: existingEntry?.name || finalSupplierName,
+          phone: finalSupplierPhone,
+          notes: existingEntry?.notes,
+          sourceKeys: Array.from(new Set([nameKey, ...(existingEntry?.sourceKeys || [])])),
+          updatedAt: new Date().toISOString(),
+        },
         ...savedSuppliers.filter(
-          s => s.name.toLowerCase() !== finalSupplierName.toLowerCase()
+          s =>
+            !(
+              (s.shopId || '') === targetPurchaseShopId &&
+              (s.name.toLowerCase() === nameKey || (s.sourceKeys || []).includes(nameKey))
+            )
         ),
       ];
       setSavedSuppliers(nextSaved);
@@ -1244,8 +1772,12 @@ export const AdminPurchases: React.FC = () => {
         setFormError(res.error || 'Failed to update purchase.');
       }
     } else {
+      if (!businessLocationKey) {
+        setFormError('Please select a Business Location.');
+        return;
+      }
       if (destinationType === 'STORE' && !purchaseStoreId) {
-        setFormError('Please select a destination store or switch to Direct to Shop Floor.');
+        setFormError('Please select a valid Business Location.');
         return;
       }
 
@@ -1268,7 +1800,9 @@ export const AdminPurchases: React.FC = () => {
         const isPast = effectiveDate < toLocalYMD(new Date());
         addToast({
           type: 'success',
-          title: isPast ? `Past Purchase Recorded (${effectiveDate})` : 'Purchase Recorded & Stock Ingested',
+          title: isPast
+            ? `Past Purchase Recorded (${effectiveDate})`
+            : 'Purchase Recorded & Stock Ingested',
           description:
             destinationType === 'STORE'
               ? `Order from ${finalSupplierName} recorded for ${effectiveDate} and added to Store warehouse stock.`
@@ -1408,15 +1942,48 @@ export const AdminPurchases: React.FC = () => {
   // ─────────────────────────────────────────────────────────────
   if (purchasesSubTab === 'add' && canRecordPurchase) {
     const activeShopStores = (dbState.stores || []).filter(
-      st => st.shopId === purchaseShopId && st.status === 'ACTIVE'
+      st => st.shopId === purchaseShopId && st.status === 'ACTIVE' && !st.isShopFloor
     );
+    const selectedPurchaseShop =
+      availableShops.find(s => s.id === purchaseShopId) || availableShops[0] || null;
+    const businessLocationOptions: { key: string; label: string; kind: 'SHOP' | 'STORE' }[] = [
+      ...(selectedPurchaseShop
+        ? [
+            {
+              key: `SHOP:${selectedPurchaseShop.id}`,
+              label: `🏪 ${selectedPurchaseShop.name} (Shop)`,
+              kind: 'SHOP' as const,
+            },
+          ]
+        : []),
+      ...activeShopStores.map(st => ({
+        key: `STORE:${st.id}`,
+        label: `🏭 ${st.name} (Store)${st.location ? ` — ${st.location}` : ''}`,
+        kind: 'STORE' as const,
+      })),
+    ];
+
+    const handleBusinessLocationChange = (val: string) => {
+      setBusinessLocationKey(val);
+      setFormError('');
+      if (val.startsWith('STORE:')) {
+        setDestinationType('STORE');
+        setPurchaseStoreId(val.slice('STORE:'.length));
+      } else if (val.startsWith('SHOP:')) {
+        setDestinationType('SHOP_FLOOR');
+        setPurchaseStoreId('');
+      } else {
+        setDestinationType('SHOP_FLOOR');
+        setPurchaseStoreId('');
+      }
+    };
 
     return (
       <div
         id="admin-purchases-add-page"
         className="flex-1 p-3.5 sm:p-6 bg-slate-950 text-slate-100 overflow-y-auto pb-24 sm:pb-8"
       >
-        <div className="max-w-3xl mx-auto">
+        <div className="w-full">
           {/* Page Header */}
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-5 pb-4 border-b border-slate-800">
             <div className="flex items-center gap-3 min-w-0">
@@ -1483,7 +2050,13 @@ export const AdminPurchases: React.FC = () => {
                       setPurchaseShopId(nextShopId);
                       setPurchaseProductSearch('');
                       setPurchaseSearchLimit(PAGE_SIZE);
+                      setBusinessLocationKey('');
+                      setDestinationType('SHOP_FLOOR');
                       setPurchaseStoreId('');
+                      setSupplierName('');
+                      setSupplierPhone('');
+                      setVendorSearchQuery('');
+                      setIsVendorSearchOpen(false);
                     }}
                     className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2.5 text-white focus:outline-none focus:ring-1 focus:ring-blue-500"
                   >
@@ -1495,64 +2068,47 @@ export const AdminPurchases: React.FC = () => {
                   </select>
                 </div>
 
-                <div className="p-3.5 rounded-xl bg-slate-950/80 border border-slate-800 space-y-2.5">
-                  <label className="block text-slate-300 font-semibold">Destination *</label>
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setDestinationType('SHOP_FLOOR');
-                        setPurchaseStoreId('');
-                      }}
-                      className={`px-3.5 py-2.5 rounded-xl border text-left font-semibold flex items-center gap-2 transition ${
-                        destinationType === 'SHOP_FLOOR'
-                          ? 'bg-blue-600/20 border-blue-500 text-blue-300'
-                          : 'bg-slate-900 border-slate-800 text-slate-400 hover:text-slate-200'
-                      }`}
-                    >
-                      <Store className="w-4 h-4 shrink-0" />
-                      <span>Direct to Shop Floor</span>
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setDestinationType('STORE');
-                      }}
-                      className={`px-3.5 py-2.5 rounded-xl border text-left font-semibold flex items-center gap-2 transition ${
-                        destinationType === 'STORE'
-                          ? 'bg-blue-600/20 border-blue-500 text-blue-300'
-                          : 'bg-slate-900 border-slate-800 text-slate-400 hover:text-slate-200'
-                      }`}
-                    >
-                      <Warehouse className="w-4 h-4 shrink-0" />
-                      <span>Send to Store (Warehouse)</span>
-                    </button>
-                  </div>
-
-                  {destinationType === 'STORE' && (
-                    <div className="pt-1">
-                      <label className="block text-slate-400 text-[11px] mb-1">
-                        Select Store (Warehouse) *
-                      </label>
-                      {activeShopStores.length > 0 ? (
-                        <select
-                          value={purchaseStoreId}
-                          onChange={e => setPurchaseStoreId(e.target.value)}
-                          className="w-full bg-slate-900 border border-slate-700 rounded-xl px-3 py-2.5 text-white focus:outline-none focus:ring-1 focus:ring-blue-500"
-                        >
-                          <option value="">Select destination store...</option>
-                          {activeShopStores.map(st => (
-                            <option key={st.id} value={st.id}>
-                              {st.name}
-                              {st.location ? ` — ${st.location}` : ''}
-                            </option>
-                          ))}
-                        </select>
+                <div className="p-3.5 rounded-xl bg-slate-950/80 border border-slate-800 space-y-2">
+                  <label className="block text-slate-300 font-semibold">
+                    Business Location *
+                  </label>
+                  <select
+                    id="purchase-business-location-select"
+                    value={businessLocationKey}
+                    onChange={e => handleBusinessLocationChange(e.target.value)}
+                    className="w-full bg-slate-900 border border-slate-700 rounded-xl px-3.5 py-2.5 text-white focus:outline-none focus:ring-1 focus:ring-blue-500"
+                  >
+                    <option value="">Select location</option>
+                    {businessLocationOptions.map(opt => (
+                      <option key={opt.key} value={opt.key}>
+                        {opt.label}
+                      </option>
+                    ))}
+                  </select>
+                  {businessLocationKey && (
+                    <div className="flex items-center gap-1.5 text-[11px] text-slate-400 pt-0.5">
+                      {destinationType === 'STORE' ? (
+                        <>
+                          <Warehouse className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
+                          <span>
+                            Incoming stock will be added to{' '}
+                            <span className="text-indigo-300 font-semibold">
+                              {activeShopStores.find(st => st.id === purchaseStoreId)?.name || 'Store'}
+                            </span>{' '}
+                            (Store).
+                          </span>
+                        </>
                       ) : (
-                        <p className="text-[11px] text-amber-400 py-1">
-                          No active stores exist for this shop yet. Create one in Stores &amp;
-                          Transfer or choose Direct to Shop Floor.
-                        </p>
+                        <>
+                          <Store className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                          <span>
+                            Incoming stock will be added directly to{' '}
+                            <span className="text-emerald-300 font-semibold">
+                              {selectedPurchaseShop?.name || 'Shop'}
+                            </span>{' '}
+                            (Shop Floor).
+                          </span>
+                        </>
                       )}
                     </div>
                   )}
@@ -1560,7 +2116,7 @@ export const AdminPurchases: React.FC = () => {
               </div>
             )}
 
-            {/* Purchase Date Calendar (Default Today — Switch to Past Date to Backdate) */}
+            {/* Purchase Date Calendar */}
             <div
               className={`p-3.5 rounded-xl border space-y-2 transition ${
                 purchaseDate < todayYMD
@@ -1635,22 +2191,143 @@ export const AdminPurchases: React.FC = () => {
                   <label className="text-slate-300 font-semibold">Supplier / Vendor</label>
                   <button
                     type="button"
-                    onClick={() => {
-                      setNewSupplierName('');
-                      setNewSupplierPhone('');
-                      setNewSupplierError('');
-                      setIsAddSupplierOpen(true);
-                    }}
+                    onClick={() => openAddSupplierModal(vendorSearchQuery.trim())}
                     className="inline-flex items-center gap-1 text-[11px] font-semibold text-emerald-400 hover:text-emerald-300 transition"
                   >
                     <UserPlus className="w-3 h-3" />
                     <span>+ New Supplier</span>
                   </button>
                 </div>
+
+                {/* Vendor Search Bar */}
+                <div ref={vendorSearchBoxRef} className="relative mb-2">
+                  <Search className="w-3.5 h-3.5 text-slate-500 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+                  <input
+                    id="purchase-vendor-search-input"
+                    type="text"
+                    value={vendorSearchQuery}
+                    inputMode="search"
+                    autoComplete="off"
+                    onFocus={() => setIsVendorSearchOpen(true)}
+                    onChange={e => {
+                      setVendorSearchQuery(e.target.value);
+                      setIsVendorSearchOpen(true);
+                    }}
+                    onKeyDown={e => {
+                      if (e.key === 'Escape') {
+                        setIsVendorSearchOpen(false);
+                        return;
+                      }
+                      if (e.key === 'Enter') {
+                        e.preventDefault();
+                        const q = vendorSearchQuery.trim().toLowerCase();
+                        if (!q) return;
+                        const exact = filteredVendorSearchResults.find(
+                          s => s.name.toLowerCase() === q
+                        );
+                        const match =
+                          exact ||
+                          (filteredVendorSearchResults.length === 1
+                            ? filteredVendorSearchResults[0]
+                            : null);
+                        if (match) {
+                          handleSelectSupplier(match.name);
+                          setVendorSearchQuery('');
+                          setIsVendorSearchOpen(false);
+                        }
+                      }
+                    }}
+                    placeholder="Search vendor name or phone..."
+                    className="w-full bg-slate-950 border border-slate-800 rounded-xl pl-8 pr-8 py-2 text-xs text-white placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
+                  />
+                  {vendorSearchQuery && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setVendorSearchQuery('');
+                        setIsVendorSearchOpen(false);
+                      }}
+                      aria-label="Clear vendor search"
+                      className="absolute right-2 top-1/2 -translate-y-1/2 p-1 rounded-md text-slate-400 hover:text-white hover:bg-slate-800 transition"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  )}
+
+                  {isVendorSearchOpen && vendorSearchQuery.trim().length > 0 && (
+                    <div className="absolute left-0 right-0 top-full mt-1 z-30 bg-slate-900 border border-slate-700 rounded-xl shadow-2xl overflow-hidden max-h-56 overflow-y-auto divide-y divide-slate-800/80">
+                      {filteredVendorSearchResults.length > 0 ? (
+                        filteredVendorSearchResults.map(sup => {
+                          const isCurrent =
+                            supplierName.trim().toLowerCase() === sup.name.toLowerCase();
+                          return (
+                            <button
+                              key={sup.id}
+                              type="button"
+                              onClick={() => {
+                                handleSelectSupplier(sup.name);
+                                setVendorSearchQuery('');
+                                setIsVendorSearchOpen(false);
+                              }}
+                              className={`w-full px-3 py-2 text-left flex items-center justify-between gap-2 hover:bg-slate-800/80 transition ${
+                                isCurrent ? 'bg-blue-600/15' : ''
+                              }`}
+                            >
+                              <div className="min-w-0">
+                                <div className="text-xs font-semibold text-white truncate">
+                                  {sup.name}
+                                </div>
+                                {sup.phone && (
+                                  <div className="text-[10px] text-slate-400 font-mono truncate">
+                                    {sup.phone}
+                                  </div>
+                                )}
+                              </div>
+                              {isCurrent ? (
+                                <Check className="w-3.5 h-3.5 text-blue-400 shrink-0" />
+                              ) : (
+                                <span className="text-[10px] text-slate-500 shrink-0">Select</span>
+                              )}
+                            </button>
+                          );
+                        })
+                      ) : (
+                        <div className="px-3 py-2.5 text-[11px] text-slate-400">
+                          No vendor found matching &ldquo;{vendorSearchQuery.trim()}&rdquo;.
+                        </div>
+                      )}
+
+                      {!existingSuppliers.some(
+                        s => s.name.toLowerCase() === vendorSearchQuery.trim().toLowerCase()
+                      ) && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const prefill = vendorSearchQuery.trim();
+                            setIsVendorSearchOpen(false);
+                            openAddSupplierModal(prefill);
+                          }}
+                          className="w-full px-3 py-2 text-left text-[11px] font-semibold text-emerald-400 hover:bg-emerald-500/10 flex items-center gap-1.5 transition"
+                        >
+                          <UserPlus className="w-3.5 h-3.5 shrink-0" />
+                          <span className="truncate">
+                            Add &ldquo;{vendorSearchQuery.trim()}&rdquo; as New Supplier
+                          </span>
+                        </button>
+                      )}
+                    </div>
+                  )}
+                </div>
+
+                {/* Supplier Select Dropdown */}
                 <div className="flex items-center gap-1.5">
                   <select
                     value={supplierName}
-                    onChange={e => handleSelectSupplier(e.target.value)}
+                    onChange={e => {
+                      handleSelectSupplier(e.target.value);
+                      setVendorSearchQuery('');
+                      setIsVendorSearchOpen(false);
+                    }}
                     className="flex-1 min-w-0 bg-slate-950 border border-slate-800 rounded-xl px-3 py-2.5 text-white focus:outline-none focus:ring-1 focus:ring-blue-500"
                   >
                     <option value="">Walk-in Supplier (Default)</option>
@@ -1664,12 +2341,7 @@ export const AdminPurchases: React.FC = () => {
                   </select>
                   <button
                     type="button"
-                    onClick={() => {
-                      setNewSupplierName('');
-                      setNewSupplierPhone('');
-                      setNewSupplierError('');
-                      setIsAddSupplierOpen(true);
-                    }}
+                    onClick={() => openAddSupplierModal(vendorSearchQuery.trim())}
                     title="Add New Supplier"
                     aria-label="Add New Supplier"
                     className="shrink-0 p-2.5 rounded-xl bg-emerald-600/15 hover:bg-emerald-600 border border-emerald-500/30 text-emerald-400 hover:text-white transition"
@@ -1734,7 +2406,7 @@ export const AdminPurchases: React.FC = () => {
                       setPurchaseSearchLimit(PAGE_SIZE);
                     }}
                     onKeyDown={handlePurchaseSearchKeyDown}
-                    placeholder="Search product name, SKU, or barcode — click to add..."
+                    placeholder="Search product name, SKU, or barcode — tap to add..."
                     className="w-full bg-slate-950 border border-slate-700 rounded-xl pl-9 pr-9 py-2.5 text-xs text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500 transition"
                   />
                   {purchaseProductSearch && (
@@ -1785,7 +2457,7 @@ export const AdminPurchases: React.FC = () => {
                         {purchaseSearchResults.length.toLocaleString()}
                       </strong>{' '}
                       match{purchaseSearchResults.length === 1 ? '' : 'es'} for &ldquo;
-                      {purchaseProductSearch.trim()}&rdquo; — select a product to add
+                      {purchaseProductSearch.trim()}&rdquo; — tap a product to add
                     </span>
                   </div>
 
@@ -1892,7 +2564,7 @@ export const AdminPurchases: React.FC = () => {
                   <Package className="w-7 h-7 mx-auto text-slate-600 mb-1.5" />
                   <p className="text-xs font-medium text-slate-400">No products added yet</p>
                   <p className="text-[11px] text-slate-500 mt-0.5">
-                    Search above and select a product to add it to this purchase.
+                    Search above and tap a product to add it to this purchase.
                   </p>
                 </div>
               ) : (
@@ -2063,7 +2735,8 @@ export const AdminPurchases: React.FC = () => {
                                   </span>
                                   {sellChanged && (
                                     <span className="text-amber-300/90 font-medium">
-                                      Updates product price: {formatCurrency(originalSell, settings.currencySymbol)} →{' '}
+                                      Updates product price:{' '}
+                                      {formatCurrency(originalSell, settings.currencySymbol)} →{' '}
                                       {formatCurrency(sellVal, settings.currencySymbol)}
                                     </span>
                                   )}
@@ -2133,14 +2806,16 @@ export const AdminPurchases: React.FC = () => {
                   className="flex-1 px-4 py-3 rounded-xl bg-blue-600 hover:bg-blue-500 active:bg-blue-700 text-white font-bold shadow-lg transition flex items-center justify-center gap-2"
                 >
                   <Check className="w-4 h-4" />
-                  <span>{editingPurchase ? 'Update & Recalculate Stock' : 'Record Purchase & Add Stock'}</span>
+                  <span>
+                    {editingPurchase ? 'Update & Recalculate Stock' : 'Record Purchase & Add Stock'}
+                  </span>
                 </button>
               </div>
             </div>
           </form>
         </div>
 
-        {/* Inline Create Product Modal */}
+        {/* Inline Create Product Modal (auto-attaches to purchase list) */}
         {isCreateProductOpen && (
           <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-slate-950/80 backdrop-blur-sm sm:p-4 overflow-y-auto">
             <div className="bg-slate-900 border border-slate-800 rounded-t-2xl sm:rounded-2xl max-w-lg w-full p-4 sm:p-6 shadow-2xl max-h-[92vh] overflow-y-auto my-auto">
@@ -2323,8 +2998,12 @@ export const AdminPurchases: React.FC = () => {
                       <Store className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
                     )}
                     <div className="min-w-0 flex-1">
-                      <span className="text-slate-400">Primary (Purchase Destination): </span>
-                      <span className="text-white font-semibold">
+                      <span className="text-slate-400">Primary (Business Location): </span>
+                      <span
+                        className={`font-semibold ${
+                          !createProdPrimaryLocation.key ? 'text-amber-400' : 'text-white'
+                        }`}
+                      >
                         {createProdPrimaryLocation.label}
                       </span>
                     </div>
@@ -2414,7 +3093,7 @@ export const AdminPurchases: React.FC = () => {
           </div>
         )}
 
-        {/* Add New Supplier Modal */}
+        {/* Add / Edit Supplier Modal */}
         {isAddSupplierOpen && (
           <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-slate-950/80 backdrop-blur-sm sm:p-4 overflow-y-auto">
             <div className="bg-slate-900 border border-slate-800 rounded-t-2xl sm:rounded-2xl max-w-md w-full p-4 sm:p-6 shadow-2xl my-auto">
@@ -2423,16 +3102,21 @@ export const AdminPurchases: React.FC = () => {
                   <UserPlus className="w-5 h-5 shrink-0" />
                   <div className="min-w-0">
                     <h3 className="text-sm sm:text-base font-bold text-white truncate">
-                      Add New Supplier
+                      {editingSupplierTarget ? 'Edit Supplier' : 'Add New Supplier'}
                     </h3>
                     <p className="text-[11px] text-slate-400 truncate">
-                      Saves supplier for future purchases &amp; selects them now
+                      {editingSupplierTarget
+                        ? 'Update vendor details in your supplier directory'
+                        : 'Saves supplier for future purchases & selects them now'}
                     </p>
                   </div>
                 </div>
                 <button
                   type="button"
-                  onClick={() => setIsAddSupplierOpen(false)}
+                  onClick={() => {
+                    setIsAddSupplierOpen(false);
+                    setEditingSupplierTarget(null);
+                  }}
                   className="text-slate-400 hover:text-white p-1 shrink-0"
                 >
                   <X className="w-5 h-5" />
@@ -2446,6 +3130,21 @@ export const AdminPurchases: React.FC = () => {
               )}
 
               <form onSubmit={handleSaveNewSupplier} className="space-y-3.5 text-xs">
+                <div className="flex items-center justify-between gap-2 px-3 py-2 rounded-xl bg-slate-950/90 border border-slate-800">
+                  <div className="flex items-center gap-2 min-w-0">
+                    <Store className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                    <span className="text-slate-400 shrink-0">Shop:</span>
+                    <span className="font-semibold text-white truncate">
+                      {shopNameById[newSupplierShopId || purchaseShopId] ||
+                        availableShops[0]?.name ||
+                        'Selected Shop'}
+                    </span>
+                  </div>
+                  <span className="text-[10px] font-medium text-emerald-400/90 shrink-0">
+                    Private to shop
+                  </span>
+                </div>
+
                 <div>
                   <label className="block text-slate-300 font-semibold mb-1">
                     Supplier Name *
@@ -2478,10 +3177,26 @@ export const AdminPurchases: React.FC = () => {
                   </div>
                 </div>
 
+                <div>
+                  <label className="block text-slate-300 font-semibold mb-1">
+                    Location / Notes (Optional)
+                  </label>
+                  <input
+                    type="text"
+                    value={newSupplierNotes}
+                    onChange={e => setNewSupplierNotes(e.target.value)}
+                    placeholder="e.g. Kariakoo Street, Electronics Wholesaler"
+                    className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2.5 text-white focus:outline-none focus:ring-1 focus:ring-emerald-500"
+                  />
+                </div>
+
                 <div className="flex items-center gap-2.5 pt-2">
                   <button
                     type="button"
-                    onClick={() => setIsAddSupplierOpen(false)}
+                    onClick={() => {
+                      setIsAddSupplierOpen(false);
+                      setEditingSupplierTarget(null);
+                    }}
                     className="px-4 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 font-semibold transition"
                   >
                     Cancel
@@ -2491,7 +3206,9 @@ export const AdminPurchases: React.FC = () => {
                     className="flex-1 px-4 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 active:bg-emerald-700 text-white font-bold shadow-lg transition flex items-center justify-center gap-2"
                   >
                     <UserPlus className="w-4 h-4" />
-                    <span>Save &amp; Select Supplier</span>
+                    <span>
+                      {editingSupplierTarget ? 'Save Changes' : 'Save & Select Supplier'}
+                    </span>
                   </button>
                 </div>
               </form>
@@ -2839,7 +3556,534 @@ export const AdminPurchases: React.FC = () => {
   }
 
   // ─────────────────────────────────────────────────────────────
-  // VIEW 3: PURCHASE LIST (Default)
+  // VIEW 3: SUPPLIER LIST
+  // ─────────────────────────────────────────────────────────────
+  if (purchasesSubTab === 'suppliers') {
+    const totalSuppliersCount = shopFilteredSuppliers.length;
+    const suppliersWithPhoneCount = shopFilteredSuppliers.filter(s => Boolean(s.phone)).length;
+    const totalSupplierVolume = shopFilteredSuppliers.reduce((sum, s) => sum + s.totalSpent, 0);
+
+    return (
+      <div
+        id="admin-suppliers-view"
+        className="flex-1 p-3.5 sm:p-6 bg-slate-950 text-slate-100 overflow-y-auto pb-24 sm:pb-6"
+      >
+        {/* Header */}
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-5 pb-4 border-b border-slate-800">
+          <div className="flex items-center gap-2.5">
+            <div className="p-2 rounded-xl bg-sky-500/15 border border-sky-500/25 shrink-0">
+              <Truck className="w-5 h-5 text-sky-400" />
+            </div>
+            <div>
+              <h2 className="text-lg sm:text-xl font-bold text-white tracking-tight">
+                Supplier List
+              </h2>
+              <p className="text-xs text-slate-400 mt-0.5">
+                {platformAdmin
+                  ? 'Manage shop-scoped suppliers across all shops (visible to Platform Admin & owning Shop Admin)'
+                  : 'Manage vendors & suppliers created under your shop'}
+              </p>
+            </div>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={() => setPurchasesSubTab('list')}
+              className="inline-flex items-center justify-center gap-1.5 px-3.5 py-2.5 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-800 text-slate-200 font-semibold text-xs transition"
+            >
+              <ClipboardList className="w-4 h-4 text-orange-400" />
+              <span>Purchase List</span>
+            </button>
+
+            <button
+              type="button"
+              id="add-supplier-page-btn"
+              onClick={() => openAddSupplierModal('')}
+              className="inline-flex items-center justify-center gap-1.5 px-4 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 active:bg-emerald-700 text-white font-semibold text-xs shadow-lg transition"
+            >
+              <UserPlus className="w-4 h-4" />
+              <span>Add Supplier</span>
+            </button>
+          </div>
+        </div>
+
+        {/* Summary KPI Cards */}
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 mb-4">
+          <div className="bg-slate-900 border border-slate-800 rounded-xl p-3.5">
+            <div className="text-[11px] font-medium text-slate-400 flex items-center justify-between">
+              <span>Total Suppliers</span>
+              <Truck className="w-4 h-4 text-sky-400" />
+            </div>
+            <div className="text-xl font-bold font-mono text-white mt-1">
+              {totalSuppliersCount}
+            </div>
+          </div>
+
+          <div className="bg-slate-900 border border-slate-800 rounded-xl p-3.5">
+            <div className="text-[11px] font-medium text-slate-400 flex items-center justify-between">
+              <span>With Phone Number</span>
+              <Phone className="w-4 h-4 text-emerald-400" />
+            </div>
+            <div className="text-xl font-bold font-mono text-emerald-300 mt-1">
+              {suppliersWithPhoneCount}
+            </div>
+          </div>
+
+          <div className="bg-slate-900 border border-slate-800 rounded-xl p-3.5">
+            <div className="text-[11px] font-medium text-slate-400 flex items-center justify-between">
+              <span>Total Purchased Volume</span>
+              <PurchaseIcon className="w-4 h-4 text-orange-400" />
+            </div>
+            <div className="text-xl font-bold font-mono text-orange-300 mt-1">
+              {formatCurrency(totalSupplierVolume, settings.currencySymbol)}
+            </div>
+          </div>
+        </div>
+
+        {/* Search Bar + Shop Filter (when multi-shop) */}
+        <div className="bg-slate-900 border border-slate-800 rounded-xl p-3 mb-4 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 text-xs">
+          <div className="relative flex-1">
+            <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+            <input
+              id="supplier-list-search-input"
+              type="text"
+              value={supplierListSearch}
+              onChange={e => setSupplierListSearch(e.target.value)}
+              placeholder="Search supplier by name, phone number, shop, or notes..."
+              className="w-full bg-slate-950 border border-slate-800 rounded-lg pl-9 pr-9 py-2.5 text-xs text-white placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-sky-500"
+            />
+            {supplierListSearch && (
+              <button
+                type="button"
+                onClick={() => setSupplierListSearch('')}
+                aria-label="Clear supplier search"
+                className="absolute right-2.5 top-1/2 -translate-y-1/2 p-1 rounded-md text-slate-400 hover:text-white hover:bg-slate-800 transition"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            )}
+          </div>
+          {(platformAdmin || availableShops.length > 1) && (
+            <select
+              id="supplier-list-shop-filter"
+              value={supplierListShopFilter}
+              onChange={e => setSupplierListShopFilter(e.target.value)}
+              className="bg-slate-950 border border-slate-800 rounded-lg px-3 py-2.5 text-xs text-white focus:outline-none focus:ring-1 focus:ring-sky-500 shrink-0"
+            >
+              <option value="ALL">All Accessible Shops</option>
+              {availableShops.map(sh => (
+                <option key={sh.id} value={sh.id}>
+                  {sh.name}
+                </option>
+              ))}
+            </select>
+          )}
+          <div className="text-[11px] text-slate-400 font-medium px-1 shrink-0">
+            Showing <span className="text-white font-semibold">{filteredSupplierList.length}</span>{' '}
+            of <span className="text-white font-semibold">{totalSuppliersCount}</span> suppliers
+          </div>
+        </div>
+
+        {/* Suppliers List Container */}
+        <div className="bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden shadow-xl">
+          {filteredSupplierList.length === 0 ? (
+            <div className="py-14 text-center text-slate-500 px-4">
+              <Truck className="w-9 h-9 mx-auto mb-2.5 opacity-35 text-sky-400" />
+              <p className="text-sm font-semibold text-slate-300">
+                {supplierListSearch.trim()
+                  ? `No suppliers match "${supplierListSearch.trim()}"`
+                  : 'No suppliers recorded yet'}
+              </p>
+              <p className="text-xs text-slate-500 mt-1 max-w-sm mx-auto">
+                {supplierListSearch.trim()
+                  ? 'Try a different vendor name or phone number, or add a new supplier.'
+                  : 'Add your suppliers here or when creating a purchase to keep vendor contacts organized.'}
+              </p>
+              <div className="mt-4 flex items-center justify-center gap-2">
+                {supplierListSearch.trim() && (
+                  <button
+                    type="button"
+                    onClick={() => setSupplierListSearch('')}
+                    className="px-3.5 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold transition"
+                  >
+                    Clear Search
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={() => openAddSupplierModal(supplierListSearch.trim())}
+                  className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold transition"
+                >
+                  <UserPlus className="w-3.5 h-3.5" />
+                  <span>Add Supplier</span>
+                </button>
+              </div>
+            </div>
+          ) : (
+            <>
+              {/* Mobile Cards (< md) */}
+              <div className="md:hidden divide-y divide-slate-800/80">
+                {filteredSupplierList.map(sup => (
+                  <div key={sup.id} className="p-3.5 space-y-2.5">
+                    <div className="flex items-start justify-between gap-2.5">
+                      <div className="flex items-start gap-2.5 min-w-0 flex-1">
+                        <div className="w-9 h-9 rounded-xl bg-sky-500/15 border border-sky-500/25 text-sky-300 font-bold text-xs flex items-center justify-center shrink-0 uppercase">
+                          {sup.name.charAt(0)}
+                        </div>
+                        <div className="min-w-0 flex-1">
+                          <div className="flex items-center gap-1.5 flex-wrap">
+                            <h4 className="font-bold text-xs text-white truncate">{sup.name}</h4>
+                            <span className="px-1.5 py-0.5 rounded bg-blue-950/80 border border-blue-800/50 text-blue-300 text-[10px] font-semibold">
+                              🏪 {sup.shopName}
+                            </span>
+                          </div>
+                          <div className="flex items-center gap-1.5 text-[11px] text-slate-400 font-mono mt-0.5">
+                            <Phone className="w-3 h-3 text-slate-500 shrink-0" />
+                            <span className="truncate">{sup.phone || 'No phone number'}</span>
+                          </div>
+                          {sup.notes && (
+                            <p className="text-[11px] text-slate-400 mt-1 line-clamp-2">
+                              {sup.notes}
+                            </p>
+                          )}
+                        </div>
+                      </div>
+
+                      <div className="flex items-center gap-1.5 shrink-0">
+                        <button
+                          type="button"
+                          onClick={() => openEditSupplierModal(sup)}
+                          title="Edit supplier"
+                          className="p-2 rounded-lg bg-slate-800 hover:bg-blue-600/25 border border-slate-700 hover:border-blue-500/40 text-slate-300 hover:text-blue-300 transition"
+                        >
+                          <Pencil className="w-3.5 h-3.5" />
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setSupplierToDelete(sup)}
+                          title="Delete supplier"
+                          className="p-2 rounded-lg bg-slate-800 hover:bg-rose-600/25 border border-slate-700 hover:border-rose-500/40 text-slate-300 hover:text-rose-300 transition"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-2 bg-slate-950/70 border border-slate-800/80 rounded-xl p-2.5 text-[11px]">
+                      <div>
+                        <span className="text-slate-500 block text-[10px]">Orders</span>
+                        <span className="text-slate-200 font-mono font-semibold">
+                          {sup.purchaseCount} purchase{sup.purchaseCount === 1 ? '' : 's'}
+                        </span>
+                        {sup.lastPurchaseDate && (
+                          <span className="block text-[10px] text-slate-500 mt-0.5">
+                            Last: {formatReadableYMD(sup.lastPurchaseDate)}
+                          </span>
+                        )}
+                      </div>
+                      <div className="text-right">
+                        <span className="text-slate-500 block text-[10px]">Total Purchased</span>
+                        <span className="text-orange-300 font-mono font-bold">
+                          {formatCurrency(sup.totalSpent, settings.currencySymbol)}
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+
+              {/* Desktop Table (md+) */}
+              <div className="hidden md:block overflow-x-auto">
+                <table className="w-full text-left text-xs">
+                  <thead>
+                    <tr className="border-b border-slate-800 bg-slate-950/70 text-slate-400">
+                      <th className="py-3 px-4 font-semibold">Supplier / Vendor</th>
+                      <th className="py-3 px-4 font-semibold">Shop</th>
+                      <th className="py-3 px-4 font-semibold">Phone Number</th>
+                      <th className="py-3 px-4 font-semibold">Purchases</th>
+                      <th className="py-3 px-4 text-right font-semibold">Total Purchased</th>
+                      <th className="py-3 px-4 text-right font-semibold">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-800/60">
+                    {filteredSupplierList.map(sup => (
+                      <tr key={sup.id} className="hover:bg-slate-800/30 transition">
+                        <td className="py-3.5 px-4">
+                          <div className="flex items-center gap-2.5">
+                            <div className="w-8 h-8 rounded-lg bg-sky-500/15 border border-sky-500/25 text-sky-300 font-bold text-xs flex items-center justify-center shrink-0 uppercase">
+                              {sup.name.charAt(0)}
+                            </div>
+                            <div className="min-w-0">
+                              <div className="font-bold text-white">{sup.name}</div>
+                              {sup.notes && (
+                                <div className="text-[11px] text-slate-400 truncate max-w-xs">
+                                  {sup.notes}
+                                </div>
+                              )}
+                            </div>
+                          </div>
+                        </td>
+                        <td className="py-3.5 px-4 whitespace-nowrap">
+                          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-blue-950/70 border border-blue-800/50 text-blue-300 text-[11px] font-semibold">
+                            <Store className="w-3 h-3 shrink-0" />
+                            <span>{sup.shopName}</span>
+                          </span>
+                        </td>
+                        <td className="py-3.5 px-4 font-mono text-slate-300 whitespace-nowrap">
+                          {sup.phone ? (
+                            <span className="inline-flex items-center gap-1.5">
+                              <Phone className="w-3.5 h-3.5 text-emerald-400" />
+                              {sup.phone}
+                            </span>
+                          ) : (
+                            <span className="text-slate-500">—</span>
+                          )}
+                        </td>
+                        <td className="py-3.5 px-4 whitespace-nowrap">
+                          <span className="font-mono font-semibold text-slate-200">
+                            {sup.purchaseCount}
+                          </span>{' '}
+                          <span className="text-slate-400">
+                            order{sup.purchaseCount === 1 ? '' : 's'}
+                          </span>
+                          {sup.lastPurchaseDate && (
+                            <div className="text-[10px] text-slate-500 mt-0.5">
+                              Last: {formatReadableYMD(sup.lastPurchaseDate)}
+                            </div>
+                          )}
+                        </td>
+                        <td className="py-3.5 px-4 text-right font-mono font-bold text-orange-300 whitespace-nowrap">
+                          {formatCurrency(sup.totalSpent, settings.currencySymbol)}
+                        </td>
+                        <td className="py-3.5 px-4 text-right whitespace-nowrap">
+                          <div className="inline-flex items-center justify-end gap-1.5">
+                            <button
+                              type="button"
+                              onClick={() => openEditSupplierModal(sup)}
+                              className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-blue-600/25 border border-slate-700 hover:border-blue-500/40 text-slate-200 hover:text-blue-300 text-[11px] font-semibold transition"
+                            >
+                              <Pencil className="w-3.5 h-3.5" />
+                              <span>Edit</span>
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setSupplierToDelete(sup)}
+                              className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-rose-600/25 border border-slate-700 hover:border-rose-500/40 text-slate-200 hover:text-rose-300 text-[11px] font-semibold transition"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                              <span>Delete</span>
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </>
+          )}
+        </div>
+
+        {/* Add / Edit Supplier Modal */}
+        {isAddSupplierOpen && (
+          <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-slate-950/80 backdrop-blur-sm sm:p-4 overflow-y-auto">
+            <div className="bg-slate-900 border border-slate-800 rounded-t-2xl sm:rounded-2xl max-w-md w-full p-4 sm:p-6 shadow-2xl my-auto">
+              <div className="flex items-center justify-between pb-3 border-b border-slate-800 mb-4">
+                <div className="flex items-center gap-2 text-emerald-400 min-w-0">
+                  {editingSupplierTarget ? (
+                    <Pencil className="w-5 h-5 shrink-0 text-blue-400" />
+                  ) : (
+                    <UserPlus className="w-5 h-5 shrink-0" />
+                  )}
+                  <div className="min-w-0">
+                    <h3 className="text-sm sm:text-base font-bold text-white truncate">
+                      {editingSupplierTarget ? 'Edit Supplier' : 'Add New Supplier'}
+                    </h3>
+                    <p className="text-[11px] text-slate-400 truncate">
+                      {editingSupplierTarget
+                        ? 'Update vendor name, phone number, or notes'
+                        : 'Save a new vendor to your Supplier List'}
+                    </p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setIsAddSupplierOpen(false);
+                    setEditingSupplierTarget(null);
+                  }}
+                  className="text-slate-400 hover:text-white p-1 shrink-0"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+
+              {newSupplierError && (
+                <div className="mb-3.5 p-3 rounded-xl bg-rose-500/15 border border-rose-500/30 text-rose-300 text-xs font-medium">
+                  {newSupplierError}
+                </div>
+              )}
+
+              <form onSubmit={handleSaveNewSupplier} className="space-y-3.5 text-xs">
+                {availableShops.length > 1 ? (
+                  <div>
+                    <label className="block text-slate-300 font-semibold mb-1">
+                      Shop / Business Unit *
+                    </label>
+                    <select
+                      value={newSupplierShopId}
+                      onChange={e => setNewSupplierShopId(e.target.value)}
+                      required
+                      disabled={Boolean(editingSupplierTarget && !platformAdmin)}
+                      className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2.5 text-white focus:outline-none focus:ring-1 focus:ring-emerald-500 disabled:opacity-60"
+                    >
+                      <option value="">Select shop...</option>
+                      {availableShops.map(sh => (
+                        <option key={sh.id} value={sh.id}>
+                          {sh.name}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                ) : (
+                  <div className="flex items-center gap-2 px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-[11px]">
+                    <Store className="w-3.5 h-3.5 text-blue-400 shrink-0" />
+                    <span className="text-slate-400">Shop:</span>
+                    <span className="font-semibold text-white truncate">
+                      {shopNameById[newSupplierShopId] || availableShops[0]?.name || 'Your Shop'}
+                    </span>
+                  </div>
+                )}
+
+                <div>
+                  <label className="block text-slate-300 font-semibold mb-1">
+                    Supplier Name *
+                  </label>
+                  <input
+                    type="text"
+                    required
+                    autoFocus
+                    value={newSupplierName}
+                    onChange={e => setNewSupplierName(e.target.value)}
+                    placeholder="e.g. Kariakoo Wholesale Ltd"
+                    className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2.5 text-white focus:outline-none focus:ring-1 focus:ring-emerald-500"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-slate-300 font-semibold mb-1">
+                    Supplier Number / Phone (Optional)
+                  </label>
+                  <div className="relative">
+                    <Phone className="w-3.5 h-3.5 text-slate-500 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+                    <input
+                      type="tel"
+                      inputMode="tel"
+                      value={newSupplierPhone}
+                      onChange={e => setNewSupplierPhone(e.target.value)}
+                      placeholder="e.g. +255 712 345 678"
+                      className="w-full bg-slate-950 border border-slate-800 rounded-xl pl-8 pr-3.5 py-2.5 text-white font-mono focus:outline-none focus:ring-1 focus:ring-emerald-500"
+                    />
+                  </div>
+                </div>
+
+                <div>
+                  <label className="block text-slate-300 font-semibold mb-1">
+                    Location / Notes (Optional)
+                  </label>
+                  <input
+                    type="text"
+                    value={newSupplierNotes}
+                    onChange={e => setNewSupplierNotes(e.target.value)}
+                    placeholder="e.g. Kariakoo Street, Electronics Wholesaler"
+                    className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2.5 text-white focus:outline-none focus:ring-1 focus:ring-emerald-500"
+                  />
+                </div>
+
+                <div className="flex items-center gap-2.5 pt-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setIsAddSupplierOpen(false);
+                      setEditingSupplierTarget(null);
+                    }}
+                    className="px-4 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 font-semibold transition"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="submit"
+                    className={`flex-1 px-4 py-2.5 rounded-xl text-white font-bold shadow-lg transition flex items-center justify-center gap-2 ${
+                      editingSupplierTarget
+                        ? 'bg-blue-600 hover:bg-blue-500 active:bg-blue-700'
+                        : 'bg-emerald-600 hover:bg-emerald-500 active:bg-emerald-700'
+                    }`}
+                  >
+                    {editingSupplierTarget ? (
+                      <>
+                        <Check className="w-4 h-4" />
+                        <span>Save Changes</span>
+                      </>
+                    ) : (
+                      <>
+                        <UserPlus className="w-4 h-4" />
+                        <span>Save Supplier</span>
+                      </>
+                    )}
+                  </button>
+                </div>
+              </form>
+            </div>
+          </div>
+        )}
+
+        {/* Delete Supplier Confirmation Modal */}
+        {supplierToDelete && (
+          <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-slate-950/80 backdrop-blur-sm sm:p-4">
+            <div className="bg-slate-900 border border-slate-800 rounded-t-2xl sm:rounded-2xl max-w-sm w-full p-5 shadow-2xl">
+              <div className="flex items-center gap-2.5 text-rose-400 mb-3">
+                <div className="p-2 rounded-xl bg-rose-500/15 border border-rose-500/25">
+                  <Trash2 className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="text-sm sm:text-base font-bold text-white">Delete Supplier</h3>
+                  <p className="text-[11px] text-slate-400">Remove vendor from Supplier List</p>
+                </div>
+              </div>
+
+              <p className="text-xs text-slate-300 leading-relaxed mb-4">
+                Are you sure you want to delete{' '}
+                <strong className="text-white">{supplierToDelete.name}</strong>? Past purchase
+                records remain preserved in Purchase List, while this supplier will be removed from
+                your Supplier List and vendor selector.
+              </p>
+
+              <div className="flex items-center gap-2.5">
+                <button
+                  type="button"
+                  onClick={() => setSupplierToDelete(null)}
+                  className="flex-1 px-4 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold transition"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={handleConfirmDeleteSupplier}
+                  className="flex-1 px-4 py-2.5 rounded-xl bg-rose-600 hover:bg-rose-500 active:bg-rose-700 text-white text-xs font-bold shadow-lg transition"
+                >
+                  Delete Supplier
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // VIEW 4: PURCHASE LIST (Default)
   // ─────────────────────────────────────────────────────────────
   return (
     <div
@@ -3026,7 +4270,10 @@ export const AdminPurchases: React.FC = () => {
               Orders: <strong className="text-white font-mono">{listMetrics.orderCount}</strong>
             </span>
             <span>
-              Units: <strong className="text-blue-300 font-mono">{listMetrics.totalUnits.toLocaleString()}</strong>
+              Units:{' '}
+              <strong className="text-blue-300 font-mono">
+                {listMetrics.totalUnits.toLocaleString()}
+              </strong>
             </span>
             <span>
               Total Spend:{' '}

@@ -16,10 +16,12 @@ import {
   Package,
   DollarSign,
   FileText,
+  ShoppingCart,
 } from 'lucide-react';
 import { useApp } from '../../context/AppContext';
 import { formatDate, formatDateTime } from '../../utils/formatters';
 import { NotificationService } from '../../services/notificationService';
+import { hasAdminAccess } from '../../utils/permissions';
 
 export const Header: React.FC = () => {
   const {
@@ -32,6 +34,7 @@ export const Header: React.FC = () => {
     selectedShopId,
     setSelectedShopId,
     availableShops,
+    activeTab,
     setActiveTab,
   } = useApp();
   const settings = dbState.settings;
@@ -198,7 +201,24 @@ export const Header: React.FC = () => {
 
         {/* Right side status indicators & user actions */}
         <div className="flex items-center gap-2.5">
-          {/* Notification Bell Dropdown */}
+          {/* Quick POS Shortcut Button */}
+          <button
+            id="header-pos-shortcut-btn"
+            type="button"
+            onClick={() => setActiveTab('new_sale')}
+            title="Open Add Sale (POS)"
+            className={`flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg text-xs font-bold tracking-wide transition-all cursor-pointer border ${
+              activeTab === 'new_sale'
+                ? 'bg-blue-500 text-white border-blue-300 shadow-lg shadow-blue-600/35 ring-2 ring-blue-400/40'
+                : 'bg-gradient-to-r from-blue-600 to-blue-500 hover:from-blue-500 hover:to-blue-400 text-white border-blue-400/40 shadow-md shadow-blue-950/50 hover:shadow-blue-600/30 active:scale-[0.98]'
+            }`}
+          >
+            <ShoppingCart className="w-3.5 h-3.5 shrink-0" />
+            <span>POS</span>
+          </button>
+
+          {/* Notification Bell Dropdown (Admins only) */}
+          {hasAdminAccess(currentUser) && (
           <div className="relative" ref={notifDropdownRef}>
             <button
               id="header-notification-bell"
@@ -313,6 +333,7 @@ export const Header: React.FC = () => {
               </div>
             )}
           </div>
+          )}
 
           {/* Sync & Offline Status Badge */}
           <button

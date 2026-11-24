@@ -168,7 +168,7 @@ export const NotificationCenter: React.FC = () => {
       </header>
 
       {/* Main Content */}
-      <div className="flex-1 overflow-y-auto p-4 space-y-4 max-w-5xl mx-auto w-full">
+      <div className="flex-1 overflow-y-auto p-4 space-y-4 w-full">
         {/* Filters */}
         <div className="bg-slate-900/90 border border-slate-800 rounded-xl p-3.5 space-y-3">
           <div className="flex flex-wrap items-center justify-between gap-3">

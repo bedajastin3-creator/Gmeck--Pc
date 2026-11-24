@@ -18,20 +18,27 @@ import {
   User as UserIcon,
   ChevronDown,
   Loader2,
+  Package,
 } from 'lucide-react';
 import { useApp } from '../../context/AppContext';
 import { SalesService, CartItemInput } from '../../services/salesService';
 import { CloudflareApi } from '../../services/cloudflareApi';
 import { SyncService } from '../../services/syncService';
 import { db } from '../../db/storage';
-import { Sale, SaleEditRequest } from '../../types';
+import { Product, Sale, SaleEditRequest } from '../../types';
 import { formatCurrency, formatDateTime } from '../../utils/formatters';
 import {
   downloadSaleEditsReportPdf,
   formatSaleEditDetails,
   printSaleEditsReportPdf,
 } from '../../utils/saleEditsPrint';
-import { downloadSalesReportPdf, printSalesReportPdf } from '../../utils/pdfExport';
+import {
+  downloadSalesReportPdf,
+  printSalesReportPdf,
+  downloadSoldProductsSummaryPdf,
+  printSoldProductsSummaryPdf,
+  SoldProductSummaryRow,
+} from '../../utils/pdfExport';
 import { saveTextFileCrossPlatform } from '../../utils/nativeDownload';
 import {
   getAdminManagedShops,
@@ -98,6 +105,8 @@ export const AdminSales: React.FC = () => {
   const [endDate, setEndDate] = useState<string>(() => initialTodayRange.end);
   const [isPrinting, setIsPrinting] = useState(false);
   const [isDownloadingPdf, setIsDownloadingPdf] = useState(false);
+  const [isDownloadingSoldProductsPdf, setIsDownloadingSoldProductsPdf] = useState(false);
+  const [isPrintingSoldProductsPdf, setIsPrintingSoldProductsPdf] = useState(false);
   const [isPrintingEditList, setIsPrintingEditList] = useState(false);
   const [isDownloadingEditList, setIsDownloadingEditList] = useState(false);
   const [isRefreshing, setIsRefreshing] = useState(false);
@@ -684,6 +693,136 @@ export const AdminSales: React.FC = () => {
       }
     } finally {
       setIsPrinting(false);
+    }
+  };
+
+  // Unique Sold Products Summary (strictly products sold in the currently selected period)
+  const soldProductsSummaryRows: SoldProductSummaryRow[] = (() => {
+    const floorStoreIdSet = new Set(
+      (dbState.stores || []).filter(st => st.isShopFloor).map(st => st.id)
+    );
+    const productById = new Map<string, Product>(products.map(p => [p.id, p]));
+    const getRemainingQty = (productId?: string): number => {
+      if (!productId) return 0;
+      const p = productById.get(productId);
+      if (!p) return 0;
+      const floorQty = Math.max(0, Number(p.currentStock) || 0);
+      const storeQty =
+        typeof p.storeStock === 'number' && Number.isFinite(p.storeStock)
+          ? Math.max(0, p.storeStock)
+          : p.storeStocks
+            ? Object.entries(p.storeStocks).reduce(
+                (sum, [sid, q]) =>
+                  floorStoreIdSet.has(sid) ? sum : sum + Math.max(0, Number(q || 0)),
+                0
+              )
+            : 0;
+      return floorQty + storeQty;
+    };
+
+    const agg = new Map<string, SoldProductSummaryRow>();
+    for (const sale of sales) {
+      if (sale.status !== 'COMPLETED') continue;
+      for (const item of sale.items || []) {
+        const qty = Number(item.quantity) || 0;
+        if (qty <= 0) continue;
+        const matchedProd = item.productId ? productById.get(item.productId) : undefined;
+        const key =
+          item.productId ||
+          `${sale.shopId || ''}::${(item.productName || '').trim().toLowerCase()}`;
+        const existing = agg.get(key);
+        if (existing) {
+          existing.totalSold += qty;
+        } else {
+          const baseName = (matchedProd?.name || item.productName || 'Unnamed Product').trim();
+          const fullName =
+            matchedProd?.variation && !baseName.toLowerCase().includes(matchedProd.variation.toLowerCase())
+              ? `${baseName} (${matchedProd.variation})`
+              : baseName;
+          agg.set(key, {
+            productName: fullName,
+            totalRemained: getRemainingQty(item.productId),
+            totalSold: qty,
+            unit: matchedProd?.unit,
+          });
+        }
+      }
+    }
+
+    return Array.from(agg.values()).sort(
+      (a, b) => b.totalSold - a.totalSold || a.productName.localeCompare(b.productName)
+    );
+  })();
+
+  const buildSoldProductsPdfMeta = () => ({
+    shopLabel: selectedShopName,
+    startDate: isSearchingAllDates ? undefined : effectiveStartDate || undefined,
+    endDate: isSearchingAllDates ? undefined : effectiveEndDate || undefined,
+    periodKey: isSearchingAllDates ? 'search' : activePeriodMeta.periodKey,
+    periodLabel: isSearchingAllDates ? 'All Dates (Search)' : activePeriodMeta.periodLabel,
+    dateRangeText: isSearchingAllDates ? 'All Dates' : activePeriodMeta.dateRangeText,
+    sellerLabel: selectedSellerLabel,
+    paymentLabel: selectedPaymentLabel,
+    searchQuery: searchQuery.trim() || undefined,
+  });
+
+  const handleDownloadSoldProductsPdf = async () => {
+    if (isDownloadingSoldProductsPdf) return;
+    setIsDownloadingSoldProductsPdf(true);
+    try {
+      const ok = await downloadSoldProductsSummaryPdf(
+        soldProductsSummaryRows,
+        settings,
+        buildSoldProductsPdfMeta()
+      );
+      if (ok) {
+        addToast({
+          type: 'success',
+          title: `Sold Products PDF Downloaded (${isSearchingAllDates ? 'Search' : activePeriodMeta.shortLabel})`,
+          description: `Exported ${soldProductsSummaryRows.length} unique sold product(s) with remaining and sold quantities.`,
+        });
+      } else {
+        addToast({
+          type: 'error',
+          title: 'PDF Export Failed',
+          description: 'Could not save Sold Products Summary PDF on this device.',
+        });
+      }
+    } finally {
+      setIsDownloadingSoldProductsPdf(false);
+    }
+  };
+
+  const handlePrintSoldProductsPdf = async () => {
+    if (isPrintingSoldProductsPdf) return;
+    setIsPrintingSoldProductsPdf(true);
+    try {
+      const res = await printSoldProductsSummaryPdf(
+        soldProductsSummaryRows,
+        settings,
+        buildSoldProductsPdfMeta()
+      );
+      if (res.ok) {
+        addToast({
+          type: 'success',
+          title:
+            res.mode === 'fallback_download'
+              ? 'Opened Sold Products PDF'
+              : 'Print Dialog Opened',
+          description:
+            res.mode === 'fallback_download'
+              ? 'Use the printer icon in your PDF viewer to print.'
+              : `Ready to print ${soldProductsSummaryRows.length} unique sold product(s) (${isSearchingAllDates ? 'Search' : activePeriodMeta.periodLabel}).`,
+        });
+      } else {
+        addToast({
+          type: 'error',
+          title: 'Print Failed',
+          description: res.error || 'Could not print Sold Products Summary on this device.',
+        });
+      }
+    } finally {
+      setIsPrintingSoldProductsPdf(false);
     }
   };
 
@@ -1414,11 +1553,57 @@ export const AdminSales: React.FC = () => {
             </span>
           </button>
           <button
+            type="button"
             onClick={handleExportCSV}
             className="flex items-center justify-center gap-1.5 px-3 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 active:bg-slate-600 text-slate-200 border border-slate-700 text-xs font-semibold transition"
           >
             <Download className="w-3.5 h-3.5 shrink-0" />
             <span>CSV</span>
+          </button>
+        </div>
+
+        {/* Separate Sold Products Summary PDF & Print (Product Name, Total Remained Qty, Total Sold Qty ONLY) */}
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+          <button
+            id="sales-sold-products-pdf-btn"
+            type="button"
+            onClick={handleDownloadSoldProductsPdf}
+            disabled={isDownloadingSoldProductsPdf}
+            className="flex items-center justify-center gap-1.5 px-3 py-2.5 rounded-xl bg-emerald-600/20 hover:bg-emerald-600 active:bg-emerald-700 text-emerald-300 hover:text-white border border-emerald-500/40 text-xs font-semibold shadow transition disabled:opacity-50"
+          >
+            <Package className="w-3.5 h-3.5 shrink-0" />
+            {isDownloadingSoldProductsPdf ? (
+              <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0" />
+            ) : (
+              <Download className="w-3.5 h-3.5 shrink-0" />
+            )}
+            <span className="truncate">
+              {isDownloadingSoldProductsPdf
+                ? 'Saving Sold Products PDF...'
+                : `Sold Products PDF (${isSearchingAllDates ? 'Search' : activePeriodMeta.shortLabel})`}
+            </span>
+            <span className="px-1.5 py-0.5 rounded-full bg-emerald-500/25 text-[10px] font-mono font-bold shrink-0">
+              {soldProductsSummaryRows.length}
+            </span>
+          </button>
+
+          <button
+            id="sales-sold-products-print-btn"
+            type="button"
+            onClick={handlePrintSoldProductsPdf}
+            disabled={isPrintingSoldProductsPdf}
+            className="flex items-center justify-center gap-1.5 px-3 py-2.5 rounded-xl bg-teal-600/20 hover:bg-teal-600 active:bg-teal-700 text-teal-300 hover:text-white border border-teal-500/40 text-xs font-semibold shadow transition disabled:opacity-50"
+          >
+            {isPrintingSoldProductsPdf ? (
+              <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0" />
+            ) : (
+              <Printer className="w-3.5 h-3.5 shrink-0" />
+            )}
+            <span className="truncate">
+              {isPrintingSoldProductsPdf
+                ? 'Printing Sold Products...'
+                : `Print Sold Products (${isSearchingAllDates ? 'Search' : activePeriodMeta.shortLabel})`}
+            </span>
           </button>
         </div>
       </div>

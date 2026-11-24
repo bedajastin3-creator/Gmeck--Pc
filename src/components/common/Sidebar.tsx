@@ -25,6 +25,7 @@ import {
   RotateCcw,
   FolderPlus,
   FolderTree,
+  Truck,
 } from 'lucide-react';
 import { useApp } from '../../context/AppContext';
 import { PurchaseIcon } from './PurchaseIcon';
@@ -166,218 +167,7 @@ export const Sidebar: React.FC = () => {
   ).length;
 
   const sellerNav: NavItem[] = [
-    { id: 'dashboard', label: 'Home', icon: Home, iconColor: 'text-sky-400' },
-    {
-      id: 'shops',
-      label: 'Shops & Business Unit',
-      icon: Store,
-      iconColor: 'text-amber-400',
-      requiresPermission: 'canManageShops',
-      children: [
-        {
-          id: 'add',
-          label: 'Add Shop',
-          icon: Plus,
-          iconColor: 'text-emerald-400',
-        },
-        {
-          id: 'list',
-          label: 'All Shops (List)',
-          icon: ClipboardList,
-          iconColor: 'text-amber-400',
-        },
-      ],
-    },
-    {
-      id: 'products',
-      label: 'Products & Categories',
-      icon: Package,
-      iconColor: 'text-violet-400',
-      badge: lowStockCount > 0 ? lowStockCount : undefined,
-      children: [
-        {
-          id: 'add_product',
-          label: 'Add Products',
-          icon: Plus,
-          iconColor: 'text-emerald-400',
-        },
-        ...(hasAnyPermission(['canEditProducts', 'canDeleteProducts'])
-          ? [
-              {
-                id: 'add_category',
-                label: 'Add Category',
-                icon: FolderPlus,
-                iconColor: 'text-sky-400',
-              },
-            ]
-          : []),
-        {
-          id: 'product_list',
-          label: 'Product List',
-          icon: Package,
-          iconColor: 'text-violet-400',
-        },
-        ...(hasAnyPermission(['canEditProducts', 'canDeleteProducts'])
-          ? [
-              {
-                id: 'category_list',
-                label: 'Category List',
-                icon: FolderTree,
-                iconColor: 'text-amber-400',
-              },
-            ]
-          : []),
-      ],
-    },
-    {
-      id: 'purchases',
-      label: 'Purchases',
-      icon: PurchaseIcon,
-      iconColor: 'text-orange-400',
-      children: [
-        {
-          id: 'add',
-          label: 'Add Purchase',
-          icon: Plus,
-          iconColor: 'text-emerald-400',
-        },
-        {
-          id: 'list',
-          label: 'Purchase List',
-          icon: ClipboardList,
-          iconColor: 'text-orange-400',
-        },
-        {
-          id: 'returns',
-          label: 'Return List',
-          icon: RotateCcw,
-          iconColor: 'text-amber-400',
-          badge: accessibleReturnsCount || undefined,
-        },
-      ],
-    },
-    {
-      id: 'sell',
-      label: 'Sell',
-      icon: ShoppingCart,
-      iconColor: 'text-emerald-400',
-      children: [
-        {
-          id: 'new_sale',
-          label: 'Add Sale (POS)',
-          icon: Plus,
-          iconColor: 'text-emerald-400',
-        },
-        {
-          id: hasAnyPermission(['canEditSales', 'canDeleteSales']) ? 'sales' : 'my_sales',
-          label: 'All Sales Reports',
-          icon: History,
-          iconColor: 'text-indigo-400',
-        },
-      ],
-    },
-    {
-      id: 'debts',
-      label: 'Debt Management',
-      icon: FileText,
-      iconColor: 'text-yellow-400',
-      badge:
-        overdueDebtsCount > 0
-          ? `${overdueDebtsCount} Overdue`
-          : debts.filter(d => d.status !== 'PAID').length || undefined,
-      badgeColor: overdueDebtsCount > 0 ? 'red' : 'amber',
-    },
-    {
-      id: 'notifications',
-      label: 'Notification Center',
-      icon: Bell,
-      iconColor: 'text-pink-400',
-      badge: unreadNotifsCount > 0 ? unreadNotifsCount : undefined,
-      badgeColor: 'red',
-    },
-    { id: 'receipts', label: 'Receipts', icon: Receipt, iconColor: 'text-teal-400' },
-
-    // Permission-gated items
-    {
-      id: 'inventory',
-      label: 'Stock & Inventory',
-      icon: Boxes,
-      iconColor: 'text-teal-400',
-      requiresPermission: 'canManageInventory',
-      children: [
-        {
-          id: 'ALL',
-          label: 'All Inventories',
-          icon: Boxes,
-          iconColor: 'text-teal-400',
-        },
-        {
-          id: 'SHOP',
-          label: 'Shop Inventory',
-          icon: Store,
-          iconColor: 'text-emerald-400',
-        },
-        {
-          id: 'STORE',
-          label: 'Store Inventory',
-          icon: Warehouse,
-          iconColor: 'text-indigo-400',
-        },
-      ],
-    },
-    {
-      id: 'expenses',
-      label: 'Expenses',
-      icon: TrendingDown,
-      iconColor: 'text-rose-400',
-      requiresAnyPermission: ['canViewExpenses', 'canRecordExpenses'],
-      children: [
-        ...(hasPermission('canRecordExpenses')
-          ? [
-              {
-                id: 'add',
-                label: 'Add Expense',
-                icon: Plus,
-                iconColor: 'text-emerald-400',
-              },
-            ]
-          : []),
-        {
-          id: 'list',
-          label: 'List',
-          icon: ClipboardList,
-          iconColor: 'text-rose-400',
-        },
-      ],
-    },
-    {
-      id: 'reports',
-      label: 'Reports & Analytics',
-      icon: BarChart3,
-      iconColor: 'text-fuchsia-400',
-      requiresPermission: 'canViewReports',
-    },
-    {
-      id: 'sellers',
-      label: 'User Management',
-      icon: Users,
-      iconColor: 'text-blue-400',
-      requiresPermission: 'canManageSellers',
-      children: [
-        {
-          id: 'add',
-          label: 'Add Seller Account',
-          icon: UserPlus,
-          iconColor: 'text-emerald-400',
-        },
-        {
-          id: 'list',
-          label: 'All Sellers (List)',
-          icon: Users,
-          iconColor: 'text-blue-400',
-        },
-      ],
-    },
+    { id: 'new_sale', label: 'New Sale (POS)', icon: ShoppingCart, iconColor: 'text-emerald-400' },
     { id: 'settings', label: 'Account Settings', icon: Settings, iconColor: 'text-sky-300' },
   ];
 
@@ -460,6 +250,12 @@ export const Sidebar: React.FC = () => {
           icon: RotateCcw,
           iconColor: 'text-amber-400',
           badge: accessibleReturnsCount || undefined,
+        },
+        {
+          id: 'suppliers',
+          label: 'Supplier List',
+          icon: Truck,
+          iconColor: 'text-sky-400',
         },
       ],
     },
@@ -819,7 +615,9 @@ export const Sidebar: React.FC = () => {
                                 } else if (item.id === 'inventory') {
                                   openInventoryFilter(child.id as 'ALL' | 'SHOP' | 'STORE');
                                 } else if (item.id === 'purchases') {
-                                  openPurchasesSubTab(child.id as 'add' | 'list' | 'returns');
+                                  openPurchasesSubTab(
+                                    child.id as 'add' | 'list' | 'returns' | 'suppliers'
+                                  );
                                 } else if (item.id === 'expenses') {
                                   openExpensesSubTab(child.id as 'add' | 'list');
                                 } else if (item.id === 'products') {

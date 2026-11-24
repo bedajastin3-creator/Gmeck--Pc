@@ -177,7 +177,9 @@ function applyCompletedTransferBalances(
 
   for (const item of transfer.items) {
     const qty = Number(item.quantity || 0);
-    if (qty <= 0) continue;
+    if (!Number.isFinite(qty) || qty < 0) continue;
+    // Reversing a 0-qty copy transfer should not modify any existing stock balances
+    if (direction === -1 && qty === 0) continue;
 
     const srcIdx = products.findIndex(p => p.id === item.productId);
     if (srcIdx === -1) {
@@ -201,89 +203,92 @@ function applyCompletedTransferBalances(
     };
 
     // 1. Source adjustment (direction = +1 deducts from source, direction = -1 restores source)
-    if (transfer.sourceType === 'STORE') {
-      const sourceStore = stores.find(s => s.id === transfer.sourceId);
-      const currentAvail = Math.max(0, Number(srcStoreStocks[transfer.sourceId] || 0));
-      if (direction === 1 && currentAvail < qty) {
-        return {
-          success: false,
-          error: `Insufficient stock in ${transfer.sourceName} for "${srcProd.name}" (available: ${currentAvail}, requested: ${qty}).`,
-          updatedProductIds,
-          createdProducts,
-          movements,
-        };
-      }
-      const nextSourceQty = Math.max(0, currentAvail - direction * qty);
-      srcStoreStocks[transfer.sourceId] = nextSourceQty;
-      if (sourceStore) {
-        srcStoreDetails[sourceStore.id] = computeStoreDetail(
-          sourceStore,
-          nextSourceQty,
-          srcProd.purchasePrice || 0,
-          srcProd.sellingPrice || 0,
-          srcStoreDetails[sourceStore.id]
-        );
-      }
-      if (options?.recordMovements) {
-        movements.push({
-          id: generateUUID(),
-          shopId: srcProd.shopId,
-          shopName: transfer.sourceShopName,
-          storeId: transfer.sourceId,
-          productId: srcProd.id,
-          productName: srcProd.name,
-          previousQty: currentAvail,
-          changeQty: -qty,
-          newQty: nextSourceQty,
-          type: 'STORE_TRANSFER',
-          reason: `Transferred OUT to ${transfer.destName} (${transfer.transferNumber})`,
-          referenceId: transfer.id,
-          userId: currentUser.id,
-          userName: currentUser.name,
-          createdAt: now,
-        });
-      }
-    } else {
-      // Source is SHOP floor
-      const currentAvail = Math.max(0, Number(srcProd.currentStock || 0));
-      if (direction === 1 && currentAvail < qty) {
-        return {
-          success: false,
-          error: `Insufficient floor stock in ${transfer.sourceName} for "${srcProd.name}" (available: ${currentAvail}, requested: ${qty}).`,
-          updatedProductIds,
-          createdProducts,
-          movements,
-        };
-      }
-      const nextFloorQty = Math.max(0, currentAvail - direction * qty);
-      srcProd.currentStock = nextFloorQty;
-      for (const fl of srcShopStores.filter(s => s.isShopFloor)) {
-        srcStoreStocks[fl.id] = nextFloorQty;
-        srcStoreDetails[fl.id] = computeStoreDetail(
-          fl,
-          nextFloorQty,
-          srcProd.purchasePrice || 0,
-          srcProd.sellingPrice || 0,
-          srcStoreDetails[fl.id]
-        );
-      }
-      if (options?.recordMovements) {
-        movements.push({
-          id: generateUUID(),
-          shopId: srcProd.shopId,
-          shopName: transfer.sourceShopName,
-          productId: srcProd.id,
-          productName: srcProd.name,
-          previousQty: currentAvail,
-          changeQty: -qty,
-          newQty: nextFloorQty,
-          type: 'STORE_TRANSFER',
-          reason: `Transferred OUT to ${transfer.destName} (${transfer.transferNumber})`,
-          referenceId: transfer.id,
-          userId: currentUser.id,
-          userName: currentUser.name,
-          createdAt: now,
-        });
+    // When qty === 0, keep source untouched (copy/register product to destination with 0 qty)
+    if (qty > 0) {
+      if (transfer.sourceType === 'STORE') {
+        const sourceStore = stores.find(s => s.id === transfer.sourceId);
+        const currentAvail = Math.max(0, Number(srcStoreStocks[transfer.sourceId] || 0));
+        if (direction === 1 && currentAvail < qty) {
+          return {
+            success: false,
+            error: `Insufficient stock in ${transfer.sourceName} for "${srcProd.name}" (available: ${currentAvail}, requested: ${qty}).`,
+            updatedProductIds,
+            createdProducts,
+            movements,
+          };
+        }
+        const nextSourceQty = Math.max(0, currentAvail - direction * qty);
+        srcStoreStocks[transfer.sourceId] = nextSourceQty;
+        if (sourceStore) {
+          srcStoreDetails[sourceStore.id] = computeStoreDetail(
+            sourceStore,
+            nextSourceQty,
+            srcProd.purchasePrice || 0,
+            srcProd.sellingPrice || 0,
+            srcStoreDetails[sourceStore.id]
+          );
+        }
+        if (options?.recordMovements) {
+          movements.push({
+            id: generateUUID(),
+            shopId: srcProd.shopId,
+            shopName: transfer.sourceShopName,
+            storeId: transfer.sourceId,
+            productId: srcProd.id,
+            productName: srcProd.name,
+            previousQty: currentAvail,
+            changeQty: -qty,
+            newQty: nextSourceQty,
+            type: 'STORE_TRANSFER',
+            reason: `Transferred OUT to ${transfer.destName} (${transfer.transferNumber})`,
+            referenceId: transfer.id,
+            userId: currentUser.id,
+            userName: currentUser.name,
+            createdAt: now,
+          });
+        }
+      } else {
+        // Source is SHOP floor
+        const currentAvail = Math.max(0, Number(srcProd.currentStock || 0));
+        if (direction === 1 && currentAvail < qty) {
+          return {
+            success: false,
+            error: `Insufficient floor stock in ${transfer.sourceName} for "${srcProd.name}" (available: ${currentAvail}, requested: ${qty}).`,
+            updatedProductIds,
+            createdProducts,
+            movements,
+          };
+        }
+        const nextFloorQty = Math.max(0, currentAvail - direction * qty);
+        srcProd.currentStock = nextFloorQty;
+        for (const fl of srcShopStores.filter(s => s.isShopFloor)) {
+          srcStoreStocks[fl.id] = nextFloorQty;
+          srcStoreDetails[fl.id] = computeStoreDetail(
+            fl,
+            nextFloorQty,
+            srcProd.purchasePrice || 0,
+            srcProd.sellingPrice || 0,
+            srcStoreDetails[fl.id]
+          );
+        }
+        if (options?.recordMovements) {
+          movements.push({
+            id: generateUUID(),
+            shopId: srcProd.shopId,
+            shopName: transfer.sourceShopName,
+            productId: srcProd.id,
+            productName: srcProd.name,
+            previousQty: currentAvail,
+            changeQty: -qty,
+            newQty: nextFloorQty,
+            type: 'STORE_TRANSFER',
+            reason: `Transferred OUT to ${transfer.destName} (${transfer.transferNumber})`,
+            referenceId: transfer.id,
+            userId: currentUser.id,
+            userName: currentUser.name,
+            createdAt: now,
+          });
+        }
       }
     }
 
@@ -752,8 +757,8 @@ export class StoreService {
       if (!prod) {
         return { success: false, error: 'One or more selected products no longer exist.' };
       }
-      const qty = Number(raw.quantity || 0);
-      if (!Number.isFinite(qty) || qty <= 0) {
+      const qty = Number(raw.quantity ?? 0);
+      if (!Number.isFinite(qty) || qty < 0) {
         return { success: false, error: `Invalid quantity for "${prod.name}".` };
       }
       const unitPrice =
@@ -944,8 +949,8 @@ export class StoreService {
       if (!prod) {
         return { success: false, error: 'One or more selected products no longer exist.' };
       }
-      const qty = Number(raw.quantity || 0);
-      if (!Number.isFinite(qty) || qty <= 0) {
+      const qty = Number(raw.quantity ?? 0);
+      if (!Number.isFinite(qty) || qty < 0) {
         return { success: false, error: `Invalid quantity for "${prod.name}".` };
       }
       const unitPrice =

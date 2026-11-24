@@ -172,7 +172,6 @@ export const AdminStores: React.FC = () => {
   const [selectedTransferMap, setSelectedTransferMap] = useState<Record<string, string>>({});
   const [selectedPriceMap, setSelectedPriceMap] = useState<Record<string, string>>({});
   const [productSearch, setProductSearch] = useState('');
-  const [transferStockedOnly] = useState(true);
   const [transferVisibleLimit, setTransferVisibleLimit] = useState(STORE_PAGE_SIZE);
   const [selectedQueueFilter, setSelectedQueueFilter] = useState('');
   const [selectedQueueVisibleLimit, setSelectedQueueVisibleLimit] = useState(STORE_PAGE_SIZE);
@@ -587,7 +586,7 @@ export const AdminStores: React.FC = () => {
     }
 
     for (const sh of activeShops) {
-      if (transferableStores.some(st => st.shopId === sh.id)) {
+      if (transferableStores.some(st => st.shopId === sh.id) || activeShops.length > 1) {
         opts.push({
           key: encodeLocationKey('SHOP', sh.id),
           type: 'SHOP',
@@ -689,6 +688,22 @@ export const AdminStores: React.FC = () => {
           label: `Store: ${st.name} (${sh?.name || 'Shop'}${st.location ? ` · ${st.location}` : ''})`,
         });
       }
+
+      const otherShops = activeShops
+        .filter(sh => sh.id !== selectedSourceLocation.shopId)
+        .sort((a, b) => a.name.localeCompare(b.name));
+      for (const sh of otherShops) {
+        opts.push({
+          key: encodeLocationKey('SHOP', sh.id),
+          type: 'SHOP',
+          id: sh.id,
+          shopId: sh.id,
+          name: `${sh.name} (Shop Floor)`,
+          location: sh.address || sh.name,
+          groupLabel: 'Other Shop Floor (Shop → Shop)',
+          label: `Shop: ${sh.name}${sh.address ? ` · ${sh.address}` : ''}`,
+        });
+      }
     }
 
     return opts;
@@ -744,15 +759,37 @@ export const AdminStores: React.FC = () => {
     return baseAvail;
   };
 
-  // Search-only products belonging to selected Location Source (multi-token match like Purchase search)
+  // Search-only products belonging to selected Location Source (multi-token match like Purchase search, including 0-qty products)
   const storeScopedProducts = useMemo(() => {
     const q = productSearch.trim().toLowerCase();
     if (!q || !selectedSourceLocation) return [];
     const tokens = q.split(/\s+/).filter(Boolean);
 
+    const isAssociatedWithSource = (p: Product): boolean => {
+      if (selectedSourceLocation.type === 'STORE' && selectedSourceStore) {
+        if (getSourceAvailableQty(p) > 0) return true;
+        return Boolean(
+          p.storeId === selectedSourceStore.id ||
+            (p.storeStocks && selectedSourceStore.id in p.storeStocks) ||
+            (p.storeDetails && selectedSourceStore.id in p.storeDetails)
+        );
+      }
+      if (selectedSourceLocation.type === 'SHOP') {
+        if (getSourceAvailableQty(p) > 0) return true;
+        const shopWarehouses = transferableStores.filter(st => st.shopId === p.shopId);
+        const hasWarehouseEntry = shopWarehouses.some(
+          st =>
+            getProductQtyInStore(p, st) > 0 ||
+            Boolean(p.storeDetails?.[st.id]) ||
+            p.storeId === st.id
+        );
+        return !hasWarehouseEntry;
+      }
+      return true;
+    };
+
     const filtered = accessibleProducts.filter(p => {
       if (p.shopId !== selectedSourceLocation.shopId) return false;
-      if (transferStockedOnly && getSourceAvailableQty(p) <= 0) return false;
 
       const cf = p.customFields;
       const hay = [
@@ -777,14 +814,17 @@ export const AdminStores: React.FC = () => {
       const aQty = getSourceAvailableQty(a);
       const bQty = getSourceAvailableQty(b);
       if (bQty !== aQty) return bQty - aQty;
+      const aHere = isAssociatedWithSource(a) ? 1 : 0;
+      const bHere = isAssociatedWithSource(b) ? 1 : 0;
+      if (aHere !== bHere) return bHere - aHere;
       return a.name.localeCompare(b.name);
     });
   }, [
     accessibleProducts,
     selectedSourceLocation,
     selectedSourceStore,
+    transferableStores,
     productSearch,
-    transferStockedOnly,
     productStoreQtyCache,
     editingTransferRecord,
   ]);
@@ -810,7 +850,8 @@ export const AdminStores: React.FC = () => {
       if (selectedSourceLocation && product.shopId !== selectedSourceLocation.shopId) continue;
 
       const available = getSourceAvailableQty(product);
-      const parsedQty = Number(qtyStr);
+      const isBlankQty = qtyStr.trim() === '';
+      const parsedQty = isBlankQty ? NaN : Number(qtyStr);
       const defaultPrice = Number(product.sellingPrice || product.purchasePrice || 0);
       const priceStr =
         productId in selectedPriceMap ? selectedPriceMap[productId] : String(defaultPrice);
@@ -822,10 +863,7 @@ export const AdminStores: React.FC = () => {
 
       const requiresStockCheck = transferStatus === 'COMPLETED';
       const isExceeding = requiresStockCheck && Number.isFinite(parsedQty) && parsedQty > available;
-      const isInvalidQty =
-        !Number.isFinite(parsedQty) ||
-        parsedQty <= 0 ||
-        (requiresStockCheck && available <= 0);
+      const isInvalidQty = isBlankQty || !Number.isFinite(parsedQty) || parsedQty < 0;
 
       entries.push({
         product,
@@ -1092,8 +1130,12 @@ export const AdminStores: React.FC = () => {
           if (!matchesFilters(p)) return false;
           if (invStockedOnly) {
             const qtyHere = getProductQtyInStore(p, st);
-            const hasDetailsHere = Boolean(p.storeDetails?.[st.id]);
-            if (qtyHere <= 0 && !hasDetailsHere) return false;
+            const hasDetailsHere = Boolean(
+              p.storeDetails?.[st.id] ||
+                (p.storeStocks && st.id in p.storeStocks) ||
+                p.storeId === st.id
+            );
+            if (qtyHere <= 0 && !(q && hasDetailsHere) && !p.storeDetails?.[st.id]) return false;
           }
           return true;
         })
@@ -1365,18 +1407,20 @@ export const AdminStores: React.FC = () => {
     const defaultPrice = String(Number(product.sellingPrice || product.purchasePrice || 0));
 
     setTransferError('');
-    if (transferStatus === 'COMPLETED' && available <= 0) {
-      addToast({
-        type: 'warning',
-        title: 'Out of Stock at Location From',
-        description: `"${product.name}" currently has 0 units at ${selectedSourceLocation?.name || 'source location'}.`,
-      });
-      return;
-    }
 
     if (product.id in selectedTransferMap) {
       const currentQty = Number(selectedTransferMap[product.id]) || 0;
       const nextQty = currentQty + 1;
+      if (transferStatus === 'COMPLETED' && available <= 0) {
+        addToast({
+          type: 'info',
+          title: 'Added with 0 Quantity',
+          description: `"${product.name}" has 0 stock at ${selectedSourceLocation?.name || 'source'} and will be copied to the destination with 0 qty.`,
+        });
+        setProductSearch('');
+        setTransferVisibleLimit(STORE_PAGE_SIZE);
+        return;
+      }
       if (transferStatus === 'COMPLETED' && nextQty > available) {
         addToast({
           type: 'warning',
@@ -1404,7 +1448,7 @@ export const AdminStores: React.FC = () => {
       }));
       setSelectedTransferMap(prev => ({
         ...prev,
-        [product.id]: '1',
+        [product.id]: available > 0 ? '1' : '0',
       }));
     }
 
@@ -1490,11 +1534,13 @@ export const AdminStores: React.FC = () => {
         setTransferError(`Enter a valid price (0 or greater) for "${firstBad.product.name}".`);
       } else if (firstBad.isExceeding) {
         setTransferError(
-          `Quantity for "${firstBad.product.name}" (${firstBad.parsedQty}) exceeds available stock (${firstBad.available} ${firstBad.product.unit || 'pcs'}).`
+          firstBad.available <= 0
+            ? `Only 0 ${firstBad.product.unit || 'pcs'} available for "${firstBad.product.name}". Enter 0 to copy it to the destination with 0 quantity.`
+            : `Quantity for "${firstBad.product.name}" (${firstBad.parsedQty}) exceeds available stock (${firstBad.available} ${firstBad.product.unit || 'pcs'}).`
         );
       } else {
         setTransferError(
-          `Enter a valid quantity greater than 0 for "${firstBad.product.name}".`
+          `Enter a valid quantity (0 or greater) for "${firstBad.product.name}".`
         );
       }
       return;
@@ -2927,7 +2973,7 @@ export const AdminStores: React.FC = () => {
 
       {/* SUB-TAB 3: FULL-PAGE STOCK TRANSFER FORM */}
       {activeSubTab === 'transfer' && (
-        <div className="space-y-4 max-w-5xl mx-auto">
+        <div className="space-y-4 w-full">
           <div className="flex flex-wrap items-center justify-between gap-3 px-3.5 sm:px-0 pb-4 border-b border-slate-800">
             <div className="flex items-center gap-3 min-w-0">
               <button
@@ -3222,21 +3268,17 @@ export const AdminStores: React.FC = () => {
                             const qtyHere = getSourceAvailableQty(p);
                             const existingQtyStr = selectedTransferMap[p.id];
                             const isAdded = p.id in selectedTransferMap;
-                            const isOutOfStock =
-                              transferStatus === 'COMPLETED' && qtyHere <= 0;
+                            const isZeroCopy = transferStatus === 'COMPLETED' && qtyHere <= 0;
 
                             return (
                               <button
                                 key={p.id}
                                 type="button"
-                                disabled={isOutOfStock}
                                 onClick={() => handleAddTransferProduct(p)}
                                 className={`w-full text-left px-3 py-3 flex items-center justify-between gap-3 transition active:bg-slate-800/80 ${
-                                  isOutOfStock
-                                    ? 'opacity-50 cursor-not-allowed'
-                                    : isAdded
-                                      ? 'bg-blue-950/25 hover:bg-blue-950/40'
-                                      : 'hover:bg-slate-900/80'
+                                  isAdded
+                                    ? 'bg-blue-950/25 hover:bg-blue-950/40'
+                                    : 'hover:bg-slate-900/80'
                                 }`}
                               >
                                 <div className="min-w-0 flex-1">
@@ -3257,7 +3299,7 @@ export const AdminStores: React.FC = () => {
                                   </div>
                                   <div className="flex items-center flex-wrap gap-x-2.5 gap-y-0.5 mt-1 text-[11px] text-slate-400 font-mono">
                                     <span>{p.sku}</span>
-                                    <span className={qtyHere > 0 ? 'text-blue-400' : 'text-rose-400'}>
+                                    <span className={qtyHere > 0 ? 'text-blue-400' : 'text-amber-400'}>
                                       Avail: {qtyHere.toLocaleString()} {p.unit}
                                     </span>
                                     <span className="text-emerald-400/90">
@@ -3271,15 +3313,17 @@ export const AdminStores: React.FC = () => {
 
                                 <span
                                   className={`inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-[11px] font-semibold shrink-0 transition ${
-                                    isOutOfStock
-                                      ? 'bg-slate-900 text-slate-500 border border-slate-800'
-                                      : isAdded
-                                        ? 'bg-blue-600/25 text-blue-200 border border-blue-500/40'
+                                    isAdded
+                                      ? 'bg-blue-600/25 text-blue-200 border border-blue-500/40'
+                                      : isZeroCopy
+                                        ? 'bg-amber-600/20 hover:bg-amber-600/30 text-amber-300 border border-amber-500/35'
                                         : 'bg-blue-600 text-white shadow-sm'
                                   }`}
                                 >
                                   <Plus className="w-3.5 h-3.5" />
-                                  <span>{isAdded ? '+1' : 'Add'}</span>
+                                  <span>
+                                    {isAdded ? (isZeroCopy ? 'In List' : '+1') : isZeroCopy ? 'Copy (0)' : 'Add'}
+                                  </span>
                                 </span>
                               </button>
                             );
@@ -3391,9 +3435,9 @@ export const AdminStores: React.FC = () => {
                               <div className="w-[112px] shrink-0 flex items-center gap-1">
                                 <input
                                   type="number"
-                                  min="1"
+                                  min="0"
                                   max={
-                                    transferStatus === 'COMPLETED' && entry.available > 0
+                                    transferStatus === 'COMPLETED'
                                       ? entry.available
                                       : undefined
                                   }
@@ -3417,7 +3461,7 @@ export const AdminStores: React.FC = () => {
                                   onClick={() =>
                                     handleChangeSelectedTransferQty(
                                       entry.product.id,
-                                      String(Math.max(1, entry.available))
+                                      String(Math.max(0, entry.available))
                                     )
                                   }
                                   className="px-1.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-[10px] font-semibold text-blue-300 shrink-0"
@@ -4106,7 +4150,7 @@ export const AdminStores: React.FC = () => {
 
       {/* SUB-TAB 5: FULL-PAGE TRANSFER VIEW DETAILS */}
       {activeSubTab === 'transfer_view' && viewingTransfer && (
-        <div className="space-y-4 max-w-4xl mx-auto">
+        <div className="space-y-4 w-full">
           <div className="flex flex-wrap items-center justify-between gap-3 pb-4 border-b border-slate-800">
             <div className="flex items-center gap-3 min-w-0">
               <button

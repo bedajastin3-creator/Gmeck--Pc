@@ -351,7 +351,7 @@ export const AdminShops: React.FC = () => {
         id="admin-shops-add-page"
         className="flex-1 p-3.5 sm:p-6 bg-slate-950 text-slate-100 overflow-y-auto pb-24 sm:pb-6"
       >
-        <div className="max-w-2xl mx-auto space-y-4 sm:space-y-5">
+        <div className="w-full space-y-4 sm:space-y-5">
           {/* Header */}
           <div className="flex items-center justify-between gap-3 bg-slate-900/90 p-3.5 sm:p-5 rounded-xl border border-slate-800">
             <div className="flex items-center gap-3 min-w-0">

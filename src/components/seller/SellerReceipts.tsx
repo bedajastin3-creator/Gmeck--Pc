@@ -150,7 +150,7 @@ export const SellerReceipts: React.FC = () => {
       </div>
 
       {/* Search Box */}
-      <div className="max-w-xl bg-slate-900 border border-slate-800 rounded-2xl p-4 sm:p-5 mb-6 shadow-xl">
+      <div className="w-full bg-slate-900 border border-slate-800 rounded-2xl p-4 sm:p-5 mb-6 shadow-xl">
         <form onSubmit={handleSearch} className="flex gap-2">
           <div className="relative flex-1">
             <Receipt className="w-4 h-4 text-slate-400 absolute left-3 top-3" />
@@ -206,7 +206,7 @@ export const SellerReceipts: React.FC = () => {
       </div>
 
       {/* Period Filter Pills */}
-      <div className="max-w-xl bg-slate-900 border border-slate-800 rounded-2xl p-3.5 mb-5 space-y-3">
+      <div className="w-full bg-slate-900 border border-slate-800 rounded-2xl p-3.5 mb-5 space-y-3">
         <div className="flex items-center gap-1.5 text-slate-400 text-xs">
           <Calendar className="w-3.5 h-3.5 shrink-0" />
           <span className="text-[11px] font-semibold uppercase tracking-wider">

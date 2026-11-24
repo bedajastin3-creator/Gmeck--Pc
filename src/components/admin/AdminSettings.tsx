@@ -275,7 +275,7 @@ export const AdminSettings: React.FC = () => {
         </p>
       </div>
 
-      <div className="max-w-4xl space-y-4 sm:space-y-6">
+      <div className="w-full space-y-4 sm:space-y-6">
         {/* Admin Profile Card */}
         <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 sm:p-6 shadow-xl">
           <div className="flex items-center gap-2 mb-3.5 pb-3 border-b border-slate-800">

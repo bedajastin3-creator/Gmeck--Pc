@@ -1866,3 +1866,185 @@ export async function printSinglePurchasePdf(
     return { ok: false, error: err?.message || 'Failed to prepare purchase voucher for printing.' };
   }
 }
+
+export interface SoldProductSummaryRow {
+  productName: string;
+  totalRemained: number;
+  totalSold: number;
+  unit?: string;
+}
+
+export interface SoldProductsSummaryPdfMeta {
+  shopLabel: string;
+  startDate?: string;
+  endDate?: string;
+  periodKey: string;
+  periodLabel: string;
+  dateRangeText: string;
+  sellerLabel?: string;
+  paymentLabel?: string;
+  searchQuery?: string;
+}
+
+function buildSoldProductsSummaryDoc(
+  rows: SoldProductSummaryRow[],
+  settings: BusinessSettings,
+  meta: SoldProductsSummaryPdfMeta
+) {
+  const doc = createPdfBuilder();
+
+  doc.drawBanner(
+    settings,
+    'SOLD PRODUCTS SUMMARY',
+    `${meta.shopLabel} | ${meta.periodLabel}`,
+    `Dates: ${meta.dateRangeText}`
+  );
+
+  const totalSoldUnits = rows.reduce((s, r) => s + (Number(r.totalSold) || 0), 0);
+  const totalRemainedUnits = rows.reduce((s, r) => s + (Number(r.totalRemained) || 0), 0);
+
+  const y0 = doc.getY();
+  doc.drawRect(doc.marginLeft, y0 - 40, doc.contentWidth, 44, [0.95, 0.97, 0.99]);
+  doc.drawText(
+    `Unique Sold Products: ${rows.length}`,
+    doc.marginLeft + 10,
+    y0 - 12,
+    8.5,
+    true,
+    [0.12, 0.25, 0.5]
+  );
+  const filterLine = [
+    meta.sellerLabel ? `Seller: ${meta.sellerLabel}` : null,
+    meta.paymentLabel ? `Payment: ${meta.paymentLabel}` : null,
+    meta.searchQuery ? `Search: "${meta.searchQuery}"` : null,
+  ]
+    .filter(Boolean)
+    .join('  |  ');
+  doc.drawText(
+    truncate(filterLine || 'All Filters', 70),
+    doc.marginLeft + 10,
+    y0 - 26,
+    7.8,
+    false,
+    [0.35, 0.4, 0.5]
+  );
+  doc.drawRightText(
+    `Total Sold Qty: ${Number(totalSoldUnits.toFixed(3)).toLocaleString()}`,
+    doc.pageWidth - doc.marginRight - 10,
+    y0 - 13,
+    8.8,
+    true,
+    [0.02, 0.52, 0.35]
+  );
+  doc.drawRightText(
+    `Total Remained Qty: ${Number(totalRemainedUnits.toFixed(3)).toLocaleString()}`,
+    doc.pageWidth - doc.marginRight - 10,
+    y0 - 27,
+    8.2,
+    true,
+    [0.15, 0.38, 0.72]
+  );
+  doc.advanceY(54);
+
+  const drawHeader = () => {
+    doc.drawRect(doc.marginLeft, doc.getY() - 15, doc.contentWidth, 18, [0.12, 0.16, 0.24]);
+    const yH = doc.getY() - 9;
+    doc.drawText('#', doc.marginLeft + 6, yH, 7.5, true, [1, 1, 1]);
+    doc.drawText('PRODUCT NAME', doc.marginLeft + 28, yH, 7.5, true, [1, 1, 1]);
+    doc.drawRightText('TOTAL REMAINED QTY', doc.marginLeft + 390, yH, 7.5, true, [1, 1, 1]);
+    doc.drawRightText('TOTAL SOLD QTY', doc.pageWidth - doc.marginRight - 8, yH, 7.5, true, [1, 1, 1]);
+    doc.advanceY(22);
+  };
+
+  drawHeader();
+
+  if (rows.length === 0) {
+    doc.drawText(
+      'No sold products recorded for the selected period/filters.',
+      doc.marginLeft + 10,
+      doc.getY(),
+      9,
+      false,
+      [0.45, 0.5, 0.6]
+    );
+  } else {
+    rows.forEach((row, idx) => {
+      doc.ensureSpace(22, drawHeader);
+      const y = doc.getY();
+      const unitSuffix = row.unit ? ` ${row.unit}` : '';
+      const remainedStr = `${Number((Number(row.totalRemained) || 0).toFixed(3))}${unitSuffix}`;
+      const soldStr = `${Number((Number(row.totalSold) || 0).toFixed(3))}${unitSuffix}`;
+
+      doc.drawText(String(idx + 1), doc.marginLeft + 6, y, 8, false, [0.4, 0.45, 0.55]);
+      doc.drawText(truncate(row.productName || 'Unnamed Product', 52), doc.marginLeft + 28, y, 8.2, true);
+      doc.drawRightText(
+        remainedStr,
+        doc.marginLeft + 390,
+        y,
+        8.2,
+        true,
+        row.totalRemained <= 0 ? [0.75, 0.15, 0.22] : [0.15, 0.38, 0.72]
+      );
+      doc.drawRightText(
+        soldStr,
+        doc.pageWidth - doc.marginRight - 8,
+        y,
+        8.5,
+        true,
+        [0.02, 0.52, 0.35]
+      );
+
+      doc.advanceY(15);
+      doc.drawLine(
+        doc.marginLeft,
+        doc.getY() + 3,
+        doc.pageWidth - doc.marginRight,
+        doc.getY() + 3,
+        0.4,
+        [0.9, 0.92, 0.95]
+      );
+      doc.advanceY(5);
+    });
+  }
+
+  const dateTag =
+    meta.startDate && meta.endDate
+      ? meta.startDate === meta.endDate
+        ? meta.startDate
+        : `${meta.startDate}_to_${meta.endDate}`
+      : new Date().toISOString().slice(0, 10);
+  const cleanShop = (meta.shopLabel || 'all').toLowerCase().replace(/[^a-z0-9]+/g, '_');
+  const fileName = `sold_products_${meta.periodKey}_${cleanShop}_${dateTag}.pdf`;
+  return { doc, fileName };
+}
+
+export async function downloadSoldProductsSummaryPdf(
+  rows: SoldProductSummaryRow[],
+  settings: BusinessSettings,
+  meta: SoldProductsSummaryPdfMeta
+): Promise<boolean> {
+  try {
+    const { doc, fileName } = buildSoldProductsSummaryDoc(rows, settings, meta);
+    return doc.download(fileName);
+  } catch (err) {
+    console.error('[pdfExport] downloadSoldProductsSummaryPdf failed:', err);
+    return false;
+  }
+}
+
+export async function printSoldProductsSummaryPdf(
+  rows: SoldProductSummaryRow[],
+  settings: BusinessSettings,
+  meta: SoldProductsSummaryPdfMeta
+): Promise<PdfPrintResult> {
+  try {
+    const { doc, fileName } = buildSoldProductsSummaryDoc(rows, settings, meta);
+    return await doc.print(fileName);
+  } catch (err: any) {
+    console.error('[pdfExport] printSoldProductsSummaryPdf failed:', err);
+    return {
+      ok: false,
+      error: err?.message || 'Failed to prepare sold products summary for printing.',
+    };
+  }
+}

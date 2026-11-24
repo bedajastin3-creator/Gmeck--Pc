@@ -1631,7 +1631,7 @@ export const NewSalePOS: React.FC = () => {
             </div>
           ) : (
             <>
-              <div className="space-y-2 max-w-2xl mx-auto">
+              <div className="space-y-2 w-full">
                 {visibleProducts.map(product => {
                   const isOutOfStock = product.currentStock <= 0;
                   const isLowStock = product.currentStock > 0 && product.currentStock <= product.minStock;
@@ -1697,7 +1697,7 @@ export const NewSalePOS: React.FC = () => {
 
               {/* See More / See Less Footer */}
               {filteredProducts.length > PAGE_SIZE && (
-                <div className="mt-4 pt-4 border-t border-slate-800/60 max-w-2xl mx-auto flex items-center justify-between">
+                <div className="mt-4 pt-4 border-t border-slate-800/60 w-full flex items-center justify-between">
                   <div className="text-[11px] text-slate-500">
                     Showing {Math.min(visibleCount, filteredProducts.length)} of {filteredProducts.length}
                   </div>

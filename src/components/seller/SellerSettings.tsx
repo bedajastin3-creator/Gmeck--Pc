@@ -6,9 +6,11 @@ import { AuthService } from '../../services/authService';
 import { CloudflareApi } from '../../services/cloudflareApi';
 import { db } from '../../db/storage';
 import { SELLER_COLORS } from '../../utils/colors';
+import { hasAdminAccess } from '../../utils/permissions';
 
 export const SellerSettings: React.FC = () => {
   const { currentUser, addToast, sellerColor, refreshUser } = useApp();
+  const isAdminUser = hasAdminAccess(currentUser);
 
   // Password state
   const [currentPassword, setCurrentPassword] = useState('');
@@ -167,78 +169,84 @@ export const SellerSettings: React.FC = () => {
       <div className="mb-6 pb-4 border-b border-slate-800">
         <h2 className="text-xl font-bold text-white tracking-tight">Account Preferences</h2>
         <p className="text-xs text-slate-400 mt-0.5">
-          Customize your seller profile appearance and manage local authentication
+          {isAdminUser
+            ? 'Customize your profile appearance and manage local authentication'
+            : 'Choose your personal theme color for the POS terminal'}
         </p>
       </div>
 
-      <div className="max-w-3xl space-y-6">
-        {/* Hidden file input for avatar */}
-        <input
-          ref={avatarInputRef}
-          type="file"
-          accept="image/*"
-          onChange={handleAvatarUpload}
-          className="hidden"
-        />
+      <div className="w-full space-y-6">
+        {isAdminUser && (
+          <>
+            {/* Hidden file input for avatar */}
+            <input
+              ref={avatarInputRef}
+              type="file"
+              accept="image/*"
+              onChange={handleAvatarUpload}
+              className="hidden"
+            />
 
-        {/* Profile Card with Avatar Upload */}
-        <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 flex items-center justify-between">
-          <div className="flex items-center gap-4">
-            {/* Avatar with upload button */}
-            <div className="relative group">
-              {currentUser.avatarUrl ? (
-                <img 
-                  src={currentUser.avatarUrl} 
-                  alt={currentUser.name} 
-                  className="w-14 h-14 rounded-2xl object-cover shadow-lg"
-                  style={{ border: `2px solid ${sellerColor.primary}` }}
-                />
-              ) : (
-                <div
-                  className="w-14 h-14 rounded-2xl flex items-center justify-center font-bold text-xl text-white shadow-lg"
-                  style={{ backgroundColor: sellerColor.primary }}
-                >
-                  {currentUser.name.charAt(0).toUpperCase()}
+            {/* Profile Card with Avatar Upload */}
+            <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 flex items-center justify-between">
+              <div className="flex items-center gap-4">
+                {/* Avatar with upload button */}
+                <div className="relative group">
+                  {currentUser.avatarUrl ? (
+                    <img 
+                      src={currentUser.avatarUrl} 
+                      alt={currentUser.name} 
+                      className="w-14 h-14 rounded-2xl object-cover shadow-lg"
+                      style={{ border: `2px solid ${sellerColor.primary}` }}
+                    />
+                  ) : (
+                    <div
+                      className="w-14 h-14 rounded-2xl flex items-center justify-center font-bold text-xl text-white shadow-lg"
+                      style={{ backgroundColor: sellerColor.primary }}
+                    >
+                      {currentUser.name.charAt(0).toUpperCase()}
+                    </div>
+                  )}
+                  
+                  {/* Upload button overlay */}
+                  <button
+                    onClick={() => avatarInputRef.current?.click()}
+                    disabled={isUploadingAvatar}
+                    className="absolute -bottom-1 -right-1 p-1.5 rounded-full bg-blue-600 hover:bg-blue-500 text-white shadow-lg transition disabled:opacity-50"
+                    title="Upload profile picture"
+                  >
+                    {isUploadingAvatar ? (
+                      <Upload className="w-3.5 h-3.5 animate-pulse" />
+                    ) : (
+                      <Camera className="w-3.5 h-3.5" />
+                    )}
+                  </button>
                 </div>
-              )}
+                
+                <div>
+                  <h3 className="text-base font-bold text-white">{currentUser.name}</h3>
+                  <p className="text-xs text-slate-400">@{currentUser.username} • Active Account</p>
+                  <div className="flex items-center gap-2 mt-1">
+                    <span className="text-[10px] px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 font-semibold">
+                      Active
+                    </span>
+                    <span className="text-[10px] text-slate-500">Theme: {sellerColor.name}</span>
+                  </div>
+                </div>
+              </div>
               
-              {/* Upload button overlay */}
+              {/* Upload button (text) */}
               <button
                 onClick={() => avatarInputRef.current?.click()}
                 disabled={isUploadingAvatar}
-                className="absolute -bottom-1 -right-1 p-1.5 rounded-full bg-blue-600 hover:bg-blue-500 text-white shadow-lg transition disabled:opacity-50"
-                title="Upload profile picture"
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-medium transition disabled:opacity-50"
               >
-                {isUploadingAvatar ? (
-                  <Upload className="w-3.5 h-3.5 animate-pulse" />
-                ) : (
-                  <Camera className="w-3.5 h-3.5" />
-                )}
+                <Camera className="w-3.5 h-3.5" />
+                <span>{isUploadingAvatar ? 'Uploading...' : 'Change Photo'}</span>
               </button>
             </div>
-            
-            <div>
-              <h3 className="text-base font-bold text-white">{currentUser.name}</h3>
-              <p className="text-xs text-slate-400">@{currentUser.username} • Active Seller Account</p>
-              <div className="flex items-center gap-2 mt-1">
-                <span className="text-[10px] px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 font-semibold">
-                  Active
-                </span>
-                <span className="text-[10px] text-slate-500">Theme: {sellerColor.name}</span>
-              </div>
-            </div>
-          </div>
-          
-          {/* Upload button (text) */}
-          <button
-            onClick={() => avatarInputRef.current?.click()}
-            disabled={isUploadingAvatar}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-medium transition disabled:opacity-50"
-          >
-            <Camera className="w-3.5 h-3.5" />
-            <span>{isUploadingAvatar ? 'Uploading...' : 'Change Photo'}</span>
-          </button>
-        </div>
+          </>
+        )}
 
         {/* Account Color Palette Picker (Requirement #7) */}
         <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-xl">
@@ -280,7 +288,8 @@ export const SellerSettings: React.FC = () => {
           </div>
         </div>
 
-        {/* Change Password (Requirement #8) */}
+        {/* Change Password (Admins only) */}
+        {isAdminUser && (
         <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-xl">
           <div className="flex items-center gap-2 mb-2">
             <KeyRound className="w-5 h-5 text-purple-400" />
@@ -349,6 +358,7 @@ export const SellerSettings: React.FC = () => {
             </button>
           </form>
         </div>
+        )}
       </div>
     </div>
   );
