@@ -1980,10 +1980,74 @@ async function recordStockAdjustment(db: any, movement: any) {
     .run();
 
   if (movement.storeId) {
-    await db
-      .prepare(`UPDATE products SET store_stock = ?, updated_at = ? WHERE id = ?`)
-      .bind(movement.newQty, new Date().toISOString(), movement.productId)
-      .run();
+    const hasStoreCols = await ensureProductStoreColumns(db);
+    let existingProd: any = null;
+    if (hasStoreCols) {
+      try {
+        existingProd = await db
+          .prepare('SELECT store_stocks, store_details FROM products WHERE id = ?')
+          .bind(movement.productId)
+          .first();
+      } catch {
+        existingProd = null;
+      }
+    }
+
+    let nextStoreStocks: Record<string, number> = {};
+    if (movement.storeStocks && typeof movement.storeStocks === 'object') {
+      nextStoreStocks = movement.storeStocks;
+    } else {
+      try {
+        if (existingProd?.store_stocks) {
+          nextStoreStocks = JSON.parse(existingProd.store_stocks);
+        }
+      } catch {
+        nextStoreStocks = {};
+      }
+      nextStoreStocks[movement.storeId] = Math.max(0, Number(movement.newQty || 0));
+    }
+
+    let nextTotalStoreStock: number;
+    if (typeof movement.totalStoreStock === 'number' && Number.isFinite(movement.totalStoreStock)) {
+      nextTotalStoreStock = Math.max(0, movement.totalStoreStock);
+    } else {
+      let floorIds = new Set<string>();
+      try {
+        const floorRows = await db
+          .prepare('SELECT id FROM stores WHERE is_shop_floor = 1')
+          .all();
+        floorIds = new Set((floorRows?.results || []).map((r: any) => String(r.id)));
+      } catch {
+        floorIds = new Set<string>();
+      }
+      nextTotalStoreStock = Object.entries(nextStoreStocks).reduce(
+        (sum, [sid, q]) => (floorIds.has(sid) ? sum : sum + Math.max(0, Number(q || 0))),
+        0
+      );
+    }
+
+    if (hasStoreCols) {
+      const nextStoreDetailsStr = movement.storeDetails
+        ? JSON.stringify(movement.storeDetails)
+        : existingProd?.store_details || null;
+      await db
+        .prepare(
+          `UPDATE products SET store_stock = ?, store_stocks = ?, store_details = ?, updated_at = ? WHERE id = ?`
+        )
+        .bind(
+          nextTotalStoreStock,
+          JSON.stringify(nextStoreStocks),
+          nextStoreDetailsStr,
+          new Date().toISOString(),
+          movement.productId
+        )
+        .run();
+    } else {
+      await db
+        .prepare(`UPDATE products SET store_stock = ?, updated_at = ? WHERE id = ?`)
+        .bind(nextTotalStoreStock, new Date().toISOString(), movement.productId)
+        .run();
+    }
   } else {
     await db
       .prepare(
