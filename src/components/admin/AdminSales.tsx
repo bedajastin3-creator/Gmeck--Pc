@@ -648,6 +648,7 @@ export const AdminSales: React.FC = () => {
     searchQuery: searchQuery.trim() || undefined,
     totalRevenue: totalVolume,
     totalProfit,
+    products,
   });
 
   const handleDownloadPdf = async () => {

@@ -981,131 +981,254 @@ function buildSalesReportDoc(
     searchQuery?: string;
     totalRevenue: number;
     totalProfit: number;
+    products?: Product[];
   }
 ) {
   const doc = createPdfBuilder();
-    const cur = settings.currencySymbol || 'TSh';
+  const cur = settings.currencySymbol || 'TSh';
 
-    doc.drawBanner(
-      settings,
-      meta.periodTitle.toUpperCase(),
-      `${meta.shopLabel} | ${meta.periodLabel}`,
-      `Dates: ${meta.dateRangeText}`
-    );
+  doc.drawBanner(
+    settings,
+    meta.periodTitle.toUpperCase(),
+    `${meta.shopLabel} | ${meta.periodLabel}`,
+    `Dates: ${meta.dateRangeText}`
+  );
 
-    const completedCount = sales.filter(s => s.status === 'COMPLETED').length;
-    const voidedCount = sales.filter(s => s.status === 'VOIDED').length;
+  const productById = new Map<string, Product>((meta.products || []).map(p => [p.id, p]));
 
-    // Summary & Filters strip
-    const y0 = doc.getY();
-    doc.drawRect(doc.marginLeft, y0 - 44, doc.contentWidth, 48, [0.95, 0.97, 0.99]);
+  interface ProductSalesRow {
+    productName: string;
+    qtySold: number;
+    unit?: string;
+    totalSales: number;
+    totalProfit: number;
+  }
+
+  const productAgg = new Map<string, ProductSalesRow>();
+  let computedSalesSum = 0;
+  let computedProfitSum = 0;
+
+  for (const sale of sales) {
+    if (sale.status !== 'COMPLETED') continue;
+    const rawItemsTotal = (sale.items || []).reduce((s, it) => s + (Number(it.total) || 0), 0);
+    const scale =
+      rawItemsTotal > 0 && Number.isFinite(sale.total)
+        ? Math.max(0, Number(sale.total) || 0) / rawItemsTotal
+        : 1;
+
+    for (const item of sale.items || []) {
+      const qty = Number(item.quantity) || 0;
+      if (qty <= 0) continue;
+
+      const matchedProd = item.productId ? productById.get(item.productId) : undefined;
+      const baseName = (matchedProd?.name || item.productName || 'Unnamed Product').trim();
+      const fullName =
+        matchedProd?.variation && !baseName.toLowerCase().includes(matchedProd.variation.toLowerCase())
+          ? `${baseName} (${matchedProd.variation})`
+          : baseName;
+
+      const itemRev = (Number(item.total) || 0) * scale;
+      const itemCost = (Number(item.purchasePrice ?? matchedProd?.purchasePrice) || 0) * qty;
+      const itemProfit = itemRev - itemCost;
+
+      computedSalesSum += itemRev;
+      computedProfitSum += itemProfit;
+
+      const key = item.productId || fullName.toLowerCase();
+      const existing = productAgg.get(key);
+      if (existing) {
+        existing.qtySold += qty;
+        existing.totalSales += itemRev;
+        existing.totalProfit += itemProfit;
+      } else {
+        productAgg.set(key, {
+          productName: fullName,
+          qtySold: qty,
+          unit: matchedProd?.unit,
+          totalSales: itemRev,
+          totalProfit: itemProfit,
+        });
+      }
+    }
+  }
+
+  const productRows = Array.from(productAgg.values()).sort(
+    (a, b) =>
+      b.totalSales - a.totalSales ||
+      b.qtySold - a.qtySold ||
+      a.productName.localeCompare(b.productName)
+  );
+
+  const totalUnitsSold = productRows.reduce((s, r) => s + r.qtySold, 0);
+  const displayTotalRevenue =
+    Number.isFinite(meta.totalRevenue) && (meta.totalRevenue > 0 || computedSalesSum === 0)
+      ? meta.totalRevenue
+      : computedSalesSum;
+  const displayTotalProfit =
+    Number.isFinite(meta.totalProfit) && (meta.totalProfit !== 0 || computedProfitSum === 0)
+      ? meta.totalProfit
+      : computedProfitSum;
+
+  // Summary strip matching Remained Products design
+  const y0 = doc.getY();
+  doc.drawRect(doc.marginLeft, y0 - 40, doc.contentWidth, 44, [0.95, 0.97, 0.99]);
+  doc.drawText(
+    `Products Sold: ${productRows.length}   |   Total Qty: ${Number(totalUnitsSold.toFixed(3)).toLocaleString()}`,
+    doc.marginLeft + 10,
+    y0 - 12,
+    8.5,
+    true,
+    [0.12, 0.25, 0.5]
+  );
+  const activeFilterParts = [
+    meta.sellerLabel && meta.sellerLabel !== 'All Sellers' ? `Seller: ${meta.sellerLabel}` : null,
+    meta.paymentLabel && meta.paymentLabel !== 'All Payment Methods'
+      ? `Payment: ${meta.paymentLabel}`
+      : null,
+    meta.searchQuery ? `Search: "${meta.searchQuery}"` : null,
+  ].filter(Boolean);
+  doc.drawText(
+    truncate(activeFilterParts.join('  |  ') || `${meta.periodLabel} (${meta.dateRangeText})`, 66),
+    doc.marginLeft + 10,
+    y0 - 26,
+    7.8,
+    false,
+    [0.35, 0.4, 0.5]
+  );
+  doc.drawRightText(
+    `Total Sales: ${formatCurrency(displayTotalRevenue, cur)}`,
+    doc.pageWidth - doc.marginRight - 10,
+    y0 - 12,
+    8.8,
+    true,
+    [0.12, 0.25, 0.5]
+  );
+  doc.drawRightText(
+    `Gross Profit: ${formatCurrency(displayTotalProfit, cur)}`,
+    doc.pageWidth - doc.marginRight - 10,
+    y0 - 27,
+    8.5,
+    true,
+    displayTotalProfit >= 0 ? [0.02, 0.52, 0.35] : [0.75, 0.15, 0.22]
+  );
+  doc.advanceY(54);
+
+  const tableLeftX = doc.marginLeft;
+  const colNumEnd = doc.marginLeft + 26;
+  const colProdEnd = doc.marginLeft + 258;
+  const colQtyEnd = doc.marginLeft + 342;
+  const colSalesEnd = doc.marginLeft + 434;
+  const tableRightX = doc.pageWidth - doc.marginRight;
+  const colDividers = [tableLeftX, colNumEnd, colProdEnd, colQtyEnd, colSalesEnd, tableRightX];
+
+  const drawHeader = () => {
+    const headerTop = doc.getY() + 3;
+    const headerBottom = doc.getY() - 15;
+    doc.drawRect(tableLeftX, headerBottom, doc.contentWidth, 18, [0.12, 0.16, 0.24]);
+    for (const dx of colDividers) {
+      doc.drawLine(dx, headerBottom, dx, headerTop, 0.6, [0.3, 0.36, 0.46]);
+    }
+    const yH = doc.getY() - 9;
+    doc.drawText('#', tableLeftX + 6, yH, 7.5, true, [1, 1, 1]);
+    doc.drawText('PRODUCT NAME', colNumEnd + 8, yH, 7.5, true, [1, 1, 1]);
+    doc.drawRightText('QTY SOLD', colQtyEnd - 8, yH, 7.5, true, [1, 1, 1]);
+    doc.drawRightText('TOTAL SALES', colSalesEnd - 8, yH, 7.5, true, [1, 1, 1]);
+    doc.drawRightText('PROFIT', tableRightX - 8, yH, 7.5, true, [1, 1, 1]);
+    doc.advanceY(22);
+  };
+
+  drawHeader();
+
+  if (productRows.length === 0) {
     doc.drawText(
-      `Transactions: ${sales.length} (${completedCount} completed, ${voidedCount} voided)`,
+      'No sold products recorded for the selected period/filters.',
       doc.marginLeft + 10,
-      y0 - 12,
-      8.5,
-      true,
-      [0.12, 0.25, 0.5]
-    );
-    const filterLine = [
-      meta.sellerLabel ? `Seller: ${meta.sellerLabel}` : null,
-      meta.paymentLabel ? `Payment: ${meta.paymentLabel}` : null,
-      meta.statusLabel ? `Status: ${meta.statusLabel}` : null,
-      meta.searchQuery ? `Search: "${meta.searchQuery}"` : null,
-    ]
-      .filter(Boolean)
-      .join('  |  ');
-    doc.drawText(truncate(filterLine || 'All Filters', 76), doc.marginLeft + 10, y0 - 26, 7.8, false, [0.35, 0.4, 0.5]);
-    doc.drawRightText(
-      `Total Revenue: ${formatCurrency(meta.totalRevenue, cur)}`,
-      doc.pageWidth - doc.marginRight - 10,
-      y0 - 14,
+      doc.getY(),
       9,
-      true,
-      [0.12, 0.25, 0.5]
+      false,
+      [0.45, 0.5, 0.6]
     );
-    doc.drawRightText(
-      `Gross Profit: ${formatCurrency(meta.totalProfit, cur)}`,
-      doc.pageWidth - doc.marginRight - 10,
-      y0 - 30,
-      9,
-      true,
-      [0.02, 0.52, 0.35]
-    );
-    doc.advanceY(58);
-
-    const drawHeader = () => {
-      doc.drawRect(doc.marginLeft, doc.getY() - 15, doc.contentWidth, 18, [0.12, 0.16, 0.24]);
-      const yH = doc.getY() - 9;
-      doc.drawText('RECEIPT / DATE', doc.marginLeft + 6, yH, 7.5, true, [1, 1, 1]);
-      doc.drawText('SHOP / SELLER', doc.marginLeft + 115, yH, 7.5, true, [1, 1, 1]);
-      doc.drawText('ITEMS', doc.marginLeft + 215, yH, 7.5, true, [1, 1, 1]);
-      doc.drawText('STATUS', doc.marginLeft + 365, yH, 7.5, true, [1, 1, 1]);
-      doc.drawRightText('TOTAL', doc.marginLeft + 455, yH, 7.5, true, [1, 1, 1]);
-      doc.drawRightText('PROFIT', doc.pageWidth - doc.marginRight - 6, yH, 7.5, true, [1, 1, 1]);
-      doc.advanceY(22);
-    };
-
-    drawHeader();
-
-    sales.forEach(sale => {
-      doc.ensureSpace(30, drawHeader);
+  } else {
+    productRows.forEach((row, idx) => {
+      doc.ensureSpace(24, drawHeader);
       const y = doc.getY();
-      const isVoided = sale.status === 'VOIDED';
-      const itemsText = (sale.items || [])
-        .map(i => `${i.quantity}x ${i.productName}`)
-        .join(', ');
+      const rowTop = y + 9;
+      const unitSuffix = row.unit ? ` ${row.unit}` : '';
+      const qtyStr = `${Number(row.qtySold.toFixed(3))}${unitSuffix}`;
 
-      doc.drawText(truncate(`#${sale.receiptNumber}`, 16), doc.marginLeft + 6, y, 8, true);
+      doc.drawText(String(idx + 1), tableLeftX + 6, y, 8, false, [0.4, 0.45, 0.55]);
       doc.drawText(
-        truncate(formatDateTime(sale.createdAt), 20),
-        doc.marginLeft + 6,
-        y - 10,
-        7,
-        false,
-        [0.45, 0.5, 0.6]
-      );
-
-      doc.drawText(truncate(sale.shopName || 'Shop', 18), doc.marginLeft + 115, y, 8, true);
-      doc.drawText(
-        truncate(`${sale.sellerName} (${sale.paymentMethod})`, 22),
-        doc.marginLeft + 115,
-        y - 10,
-        7,
-        false,
-        [0.45, 0.5, 0.6]
-      );
-
-      doc.drawText(truncate(itemsText || 'No items', 30), doc.marginLeft + 215, y, 7.8, false);
-      doc.drawText(
-        sale.status,
-        doc.marginLeft + 365,
+        truncate(row.productName || 'Unnamed Product', 40),
+        colNumEnd + 8,
         y,
-        7.5,
-        true,
-        isVoided ? [0.75, 0.15, 0.22] : [0.02, 0.52, 0.35]
+        8.2,
+        true
       );
-
+      doc.drawRightText(qtyStr, colQtyEnd - 8, y, 8.2, true, [0.15, 0.38, 0.72]);
       doc.drawRightText(
-        formatCurrency(sale.total, cur),
-        doc.marginLeft + 455,
+        formatCurrency(row.totalSales, cur),
+        colSalesEnd - 8,
         y,
-        8,
+        8.2,
         true
       );
       doc.drawRightText(
-        isVoided ? formatCurrency(0, cur) : `+${formatCurrency(sale.grossProfit, cur)}`,
-        doc.pageWidth - doc.marginRight - 6,
+        `${row.totalProfit >= 0 ? '+' : ''}${formatCurrency(row.totalProfit, cur)}`,
+        tableRightX - 8,
         y,
-        8,
+        8.2,
         true,
-        isVoided ? [0.5, 0.5, 0.55] : [0.02, 0.52, 0.35]
+        row.totalProfit >= 0 ? [0.02, 0.52, 0.35] : [0.75, 0.15, 0.22]
       );
 
-      doc.advanceY(19);
-      doc.drawLine(doc.marginLeft, doc.getY() + 3, doc.pageWidth - doc.marginRight, doc.getY() + 3, 0.4, [0.9, 0.92, 0.95]);
+      doc.advanceY(15);
+      const rowBottom = doc.getY() + 3;
+      for (const dx of colDividers) {
+        doc.drawLine(dx, rowBottom, dx, rowTop, 0.5, [0.86, 0.89, 0.93]);
+      }
+      doc.drawLine(tableLeftX, rowBottom, tableRightX, rowBottom, 0.5, [0.86, 0.89, 0.93]);
       doc.advanceY(5);
     });
+
+    // Clean Totals Footer Row
+    doc.ensureSpace(26, drawHeader);
+    const totalRowTop = doc.getY() + 8;
+    const totalRowBottom = doc.getY() - 12;
+    doc.drawRect(tableLeftX, totalRowBottom, doc.contentWidth, 20, [0.94, 0.96, 0.99]);
+    for (const dx of colDividers) {
+      doc.drawLine(dx, totalRowBottom, dx, totalRowTop, 0.6, [0.78, 0.82, 0.88]);
+    }
+    doc.drawLine(tableLeftX, totalRowTop, tableRightX, totalRowTop, 0.7, [0.72, 0.78, 0.86]);
+    doc.drawLine(tableLeftX, totalRowBottom, tableRightX, totalRowBottom, 0.7, [0.72, 0.78, 0.86]);
+
+    const yTotal = doc.getY() - 5;
+    doc.drawText('TOTAL', colNumEnd + 8, yTotal, 8.2, true, [0.12, 0.25, 0.5]);
+    doc.drawRightText(
+      Number(totalUnitsSold.toFixed(3)).toLocaleString(),
+      colQtyEnd - 8,
+      yTotal,
+      8.2,
+      true,
+      [0.15, 0.38, 0.72]
+    );
+    doc.drawRightText(
+      formatCurrency(displayTotalRevenue, cur),
+      colSalesEnd - 8,
+      yTotal,
+      8.4,
+      true,
+      [0.12, 0.25, 0.5]
+    );
+    doc.drawRightText(
+      `${displayTotalProfit >= 0 ? '+' : ''}${formatCurrency(displayTotalProfit, cur)}`,
+      tableRightX - 8,
+      yTotal,
+      8.4,
+      true,
+      displayTotalProfit >= 0 ? [0.02, 0.52, 0.35] : [0.75, 0.15, 0.22]
+    );
+    doc.advanceY(20);
+  }
 
   const dateTag =
     meta.startDate && meta.endDate

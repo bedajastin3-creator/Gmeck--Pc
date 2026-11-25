@@ -75,6 +75,7 @@ interface AppContextType {
   // Sync status
   syncStatus: { state: SyncState; pendingCount: number };
   triggerSync: () => Promise<void>;
+  pullLatestNow: (force?: boolean) => Promise<boolean>;
   refreshStoresFromCloud: (force?: boolean) => Promise<{ success: boolean; error?: string }>;
   // Settings
   updateSettings: (settings: any) => void;
@@ -114,12 +115,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     return saved || 'ALL';
   });
   
-  const isSyncingRef = useRef<boolean>(false);
+  const isPullingRef = useRef<boolean>(false);
   const isPushingRef = useRef<boolean>(false);
   const lastPullTimeRef = useRef<number>(0);
   const currentUserRef = useRef<User | null>(currentUser);
-  const PULL_INTERVAL = 900000; // 15 minutes between background pulls (D1 cost optimization)
-  const FOCUS_PULL_COOLDOWN = 30000; // 30 seconds cooldown on window focus
+  const PULL_INTERVAL = 60000; // 60 seconds between background pulls so desktop/mobile App stays live
+  const FOCUS_PULL_COOLDOWN = 10000; // 10 seconds cooldown on window focus
 
   useEffect(() => {
     currentUserRef.current = currentUser;
@@ -165,22 +166,21 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
    * Called immediately after any local data change (via db.subscribe)
    */
   const pushPendingItems = async () => {
-    if (isPushingRef.current || isSyncingRef.current) return;
-    
+    if (isPushingRef.current) return;
+
     const queue = db.getSyncQueue();
     const pendingItems = queue.filter(item => item.status === 'PENDING');
-    
+
     if (pendingItems.length === 0) return;
-    
+
     isPushingRef.current = true;
-    isSyncingRef.current = true;
-    
+
     try {
       const online = await CloudflareApi.checkConnection();
-      
+
       if (online) {
         console.log(`[Sync] Pushing ${pendingItems.length} items to cloud...`);
-        
+
         const operations = pendingItems.map(item => ({
           id: item.id,
           operation: item.operation || item.action,
@@ -188,24 +188,24 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           entityId: item.entityId,
           payload: item.payload,
         }));
-        
+
         const pushResult = await CloudflareApi.pushSync(operations);
-        
+
         if (pushResult.success) {
-          const updatedQueue = queue.map(item => {
+          const updatedQueue = db.getSyncQueue().map(item => {
             if (item.status === 'PENDING') {
               return { ...item, status: 'SYNCED' as const };
             }
             return item;
           });
           db.saveSyncQueue(updatedQueue);
-          
+
           localStorage.setItem('omnibiz_last_synced_at', new Date().toISOString());
-          
+
           const state = db.getState();
           setDbState({ ...state });
           setSyncStatus(SyncService.getSyncStatus());
-          
+
           console.log(`[Sync] Successfully pushed ${pendingItems.length} items`);
         } else {
           console.log('[Sync] Push failed:', pushResult);
@@ -217,61 +217,66 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       console.log('[Sync] Push error:', error);
     } finally {
       isPushingRef.current = false;
-      isSyncingRef.current = false;
     }
   };
 
   /**
    * PULL LATEST CLOUD DATA
-   * Pulls every 15 minutes or on first load
+   * Pulls every 60s, on focus, on Home view mount, or on startup/login
    */
-  const pullCloudData = async (force: boolean = false) => {
-    if (isSyncingRef.current) return;
-    
+  const pullCloudData = async (force: boolean = false): Promise<boolean> => {
+    if (isPullingRef.current) return false;
+
     const now = Date.now();
     const timeSinceLastPull = now - lastPullTimeRef.current;
-    
-    if (!force && timeSinceLastPull < PULL_INTERVAL) return;
-    
-    isSyncingRef.current = true;
-    
+
+    if (!force && timeSinceLastPull < PULL_INTERVAL) return false;
+
+    isPullingRef.current = true;
+
     try {
       const online = await CloudflareApi.checkConnection();
       if (!online) {
-        isSyncingRef.current = false;
-        return;
+        return false;
       }
-      
+
       console.log('[Sync] Pulling cloud data...');
-      
+
       // Pass no since parameter to get ALL data on first load
       const pullResult = await CloudflareApi.pullSync();
-      
+
       if (pullResult.success && pullResult.data) {
         SyncService.applyCloudData(pullResult.data);
-        
+
         localStorage.setItem('omnibiz_last_synced_at', new Date().toISOString());
         localStorage.setItem('omnibiz_has_synced', 'true');
-        
+
         const state = db.getState();
         setDbState({ ...state });
         setSyncStatus(SyncService.getSyncStatus());
-        
+        lastPullTimeRef.current = Date.now();
+
         console.log('[Sync] Pull completed');
+        return true;
       }
-      
+
       lastPullTimeRef.current = Date.now();
+      return false;
     } catch (error) {
       console.log('[Sync] Pull error:', error);
+      return false;
     } finally {
-      isSyncingRef.current = false;
+      isPullingRef.current = false;
     }
   };
 
-  // 1. FORCE PULL ON APP STARTUP (ensures desktop app receives latest permissions/data from web)
+  // 1. FORCE PULL ON APP STARTUP (ensures desktop/mobile app receives latest permissions/data from web)
   useEffect(() => {
     console.log('[Startup] Pulling latest data and user permissions from cloud...');
-    pullCloudData(true);
+    (async () => {
+      await pushPendingItems();
+      await pullCloudData(true);
+    })();
   }, []);
 
   // 2. Listen to LocalDB changes and push immediately
@@ -321,7 +326,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     return () => unsubscribe();
   }, []);
 
-  // 3. Pull cloud data on login, periodically, and when app regains focus
+  // 3. Pull cloud data on login, periodically, when viewing dashboard, and when app regains focus
   useEffect(() => {
     if (currentUser?.id) {
       pullCloudData(true);
@@ -346,13 +351,21 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     };
   }, [currentUser?.id]);
 
+  // 3b. Pull fresh data whenever user switches to Home dashboard
+  useEffect(() => {
+    if (currentUser?.id && activeTab === 'dashboard') {
+      if (Date.now() - lastPullTimeRef.current >= 4000) {
+        pullCloudData(true);
+      }
+    }
+  }, [activeTab, currentUser?.id]);
+
   // 4. Push on reconnect
   useEffect(() => {
-    const handleOnline = () => {
+    const handleOnline = async () => {
       console.log('[Sync] Connection restored - pushing pending items');
-      pushPendingItems();
-      // Pull on reconnect
-      pullCloudData(true);
+      await pushPendingItems();
+      await pullCloudData(true);
     };
 
     const handleOffline = () => {
@@ -420,11 +433,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       description: `Logged in as ${freshUser.role}`,
     });
     
-    // Push any pending items and force-pull latest data/permissions after login
-    setTimeout(() => {
-      pushPendingItems();
-      pullCloudData(true);
-    }, 300);
+    // Push any pending items first, then force-pull latest data/permissions sequentially
+    setTimeout(async () => {
+      await pushPendingItems();
+      await pullCloudData(true);
+    }, 200);
   };
 
   const logout = () => {
@@ -673,6 +686,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         closeReceipt,
         syncStatus,
         triggerSync,
+        pullLatestNow: pullCloudData,
         refreshStoresFromCloud,
         updateSettings,
         sellerColor,

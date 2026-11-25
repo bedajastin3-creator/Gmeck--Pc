@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useEffect } from 'react';
 import {
   ShoppingCart,
   DollarSign,
@@ -14,7 +14,22 @@ import { ReportService } from '../../services/reportService';
 import { formatCurrency, formatDateTime } from '../../utils/formatters';
 
 export const SellerDashboard: React.FC = () => {
-  const { currentUser, setActiveTab, showReceipt, sellerColor, dbState } = useApp();
+  const { currentUser, setActiveTab, showReceipt, sellerColor, dbState, pullLatestNow } = useApp();
+
+  useEffect(() => {
+    if (!currentUser) return;
+    let mounted = true;
+    pullLatestNow(true);
+    const timer = window.setInterval(() => {
+      if (!mounted || document.visibilityState === 'hidden') return;
+      pullLatestNow(true);
+    }, 30000);
+    return () => {
+      mounted = false;
+      window.clearInterval(timer);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentUser?.id]);
 
   if (!currentUser) return null;
 

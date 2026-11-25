@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import {
   TrendingUp,
   DollarSign,
@@ -12,44 +12,96 @@ import {
   ArrowRight,
   Shield,
   CreditCard,
+  RefreshCw,
 } from 'lucide-react';
 import { useApp } from '../../context/AppContext';
 import { ReportService } from '../../services/reportService';
 import { formatCurrency, formatDateTime } from '../../utils/formatters';
+import { hasAdminAccess } from '../../utils/permissions';
+
+function toLocalYMD(d: Date): string {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
 
 export const AdminDashboard: React.FC = () => {
-  const { currentUser, dbState, setActiveTab, showReceipt, selectedShopId, currentShop } = useApp();
+  const { currentUser, dbState, setActiveTab, showReceipt, selectedShopId, currentShop, pullLatestNow } = useApp();
   const [timeFilter, setTimeFilter] = useState<'today' | 'week' | 'month' | 'all'>('today');
+  const [todayKey, setTodayKey] = useState<string>(() => toLocalYMD(new Date()));
+  const [isRefreshingLive, setIsRefreshingLive] = useState(false);
 
-  if (!currentUser || currentUser.role !== 'ADMIN') return null;
+  // Pull live data immediately on Home mount and every 30s while visible
+  useEffect(() => {
+    if (!currentUser || !hasAdminAccess(currentUser)) return;
+    let mounted = true;
 
-  const settings = dbState.settings;
+    const refreshLive = async () => {
+      if (document.visibilityState === 'hidden') return;
+      setTodayKey(toLocalYMD(new Date()));
+      await pullLatestNow(true);
+    };
 
-  // Compute date range based on filter
+    refreshLive();
+    const timer = window.setInterval(() => {
+      if (!mounted) return;
+      refreshLive();
+    }, 30000);
+
+    return () => {
+      mounted = false;
+      window.clearInterval(timer);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentUser?.id]);
+
+  // Compute local calendar date range based on filter
   const dateRange = useMemo(() => {
-    const now = new Date();
+    const [year, month, day] = todayKey.split('-').map(Number);
+    const now = new Date(year, (month || 1) - 1, day || 1);
     if (timeFilter === 'today') {
-      const todayStr = now.toISOString().slice(0, 10);
-      return { from: todayStr, to: todayStr };
+      return { from: todayKey, to: todayKey };
     }
     if (timeFilter === 'week') {
-      const past = new Date(now.getTime() - 7 * 86400000);
-      return { from: past.toISOString().slice(0, 10), to: now.toISOString().slice(0, 10) };
+      const past = new Date(now);
+      past.setDate(past.getDate() - 6);
+      return { from: toLocalYMD(past), to: todayKey };
     }
     if (timeFilter === 'month') {
       const past = new Date(now.getFullYear(), now.getMonth(), 1);
-      return { from: past.toISOString().slice(0, 10), to: now.toISOString().slice(0, 10) };
+      return { from: toLocalYMD(past), to: todayKey };
     }
     return {};
-  }, [timeFilter]);
+  }, [timeFilter, todayKey]);
+
+  const canAccessDashboard = Boolean(currentUser && hasAdminAccess(currentUser));
 
   const summary = useMemo(() => {
+    if (!canAccessDashboard || !currentUser) {
+      return null;
+    }
     return ReportService.getFinancialSummary(
       dateRange,
       { shopId: selectedShopId },
       currentUser
     );
-  }, [dateRange, selectedShopId, currentUser, dbState]);
+  }, [canAccessDashboard, dateRange, selectedShopId, currentUser, dbState]);
+
+  if (!canAccessDashboard || !currentUser || !summary) return null;
+
+  const settings = dbState.settings;
+
+  const handleManualLiveRefresh = async () => {
+    if (isRefreshingLive) return;
+    setIsRefreshingLive(true);
+    try {
+      setTodayKey(toLocalYMD(new Date()));
+      await pullLatestNow(true);
+    } finally {
+      setIsRefreshingLive(false);
+    }
+  };
 
   // Inventory stats filtered by shop if specific shop is selected
   const lowStockProducts = (dbState.products || []).filter(
@@ -78,26 +130,39 @@ export const AdminDashboard: React.FC = () => {
           </p>
         </div>
 
-        {/* Date Filters */}
-        <div className="flex items-center gap-1 bg-slate-900 p-1 rounded-xl border border-slate-800 text-xs font-semibold">
-          {[
-            { id: 'today', label: 'Today' },
-            { id: 'week', label: 'Last 7 Days' },
-            { id: 'month', label: 'This Month' },
-            { id: 'all', label: 'All Time' },
-          ].map(f => (
-            <button
-              key={f.id}
-              onClick={() => setTimeFilter(f.id as any)}
-              className={`px-3 py-1.5 rounded-lg transition ${
-                timeFilter === f.id
-                  ? 'bg-blue-600 text-white shadow-sm'
-                  : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800'
-              }`}
-            >
-              {f.label}
-            </button>
-          ))}
+        {/* Date Filters + Live Refresh */}
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            onClick={handleManualLiveRefresh}
+            disabled={isRefreshingLive}
+            title="Refresh live cloud data"
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-800 text-xs font-semibold text-emerald-300 transition disabled:opacity-60"
+          >
+            <RefreshCw className={`w-3.5 h-3.5 ${isRefreshingLive ? 'animate-spin' : ''}`} />
+            <span>{isRefreshingLive ? 'Syncing...' : 'Refresh'}</span>
+          </button>
+
+          <div className="flex items-center gap-1 bg-slate-900 p-1 rounded-xl border border-slate-800 text-xs font-semibold">
+            {[
+              { id: 'today', label: 'Today' },
+              { id: 'week', label: 'Last 7 Days' },
+              { id: 'month', label: 'This Month' },
+              { id: 'all', label: 'All Time' },
+            ].map(f => (
+              <button
+                key={f.id}
+                onClick={() => setTimeFilter(f.id as any)}
+                className={`px-3 py-1.5 rounded-lg transition ${
+                  timeFilter === f.id
+                    ? 'bg-blue-600 text-white shadow-sm'
+                    : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800'
+                }`}
+              >
+                {f.label}
+              </button>
+            ))}
+          </div>
         </div>
       </div>
 

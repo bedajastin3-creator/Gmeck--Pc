@@ -59,7 +59,7 @@ const MainLayout: React.FC = () => {
 
       switch (activeTab) {
         case 'dashboard':
-          return <SellerDashboard />;
+          return hasAdminAccess(currentUser) ? <AdminDashboard /> : <SellerDashboard />;
         case 'new_sale':
           return <NewSalePOS />;
         case 'products':
