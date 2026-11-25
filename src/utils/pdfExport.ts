@@ -1870,7 +1870,7 @@ export async function printSinglePurchasePdf(
 export interface SoldProductSummaryRow {
   productName: string;
   totalRemained: number;
-  totalSold: number;
+  totalSold?: number;
   unit?: string;
 }
 
@@ -1900,7 +1900,6 @@ function buildSoldProductsSummaryDoc(
     `Dates: ${meta.dateRangeText}`
   );
 
-  const totalSoldUnits = rows.reduce((s, r) => s + (Number(r.totalSold) || 0), 0);
   const totalRemainedUnits = rows.reduce((s, r) => s + (Number(r.totalRemained) || 0), 0);
 
   const y0 = doc.getY();
@@ -1929,30 +1928,30 @@ function buildSoldProductsSummaryDoc(
     [0.35, 0.4, 0.5]
   );
   doc.drawRightText(
-    `Total Sold Qty: ${Number(totalSoldUnits.toFixed(3)).toLocaleString()}`,
-    doc.pageWidth - doc.marginRight - 10,
-    y0 - 13,
-    8.8,
-    true,
-    [0.02, 0.52, 0.35]
-  );
-  doc.drawRightText(
     `Total Remained Qty: ${Number(totalRemainedUnits.toFixed(3)).toLocaleString()}`,
     doc.pageWidth - doc.marginRight - 10,
-    y0 - 27,
-    8.2,
+    y0 - 20,
+    8.8,
     true,
     [0.15, 0.38, 0.72]
   );
   doc.advanceY(54);
 
+  const remainedColDividerX = doc.marginLeft + 264;
+  const remainedColTextX = remainedColDividerX + 10;
+  const writeColDividerX = doc.marginLeft + 378;
+  const tableRightX = doc.pageWidth - doc.marginRight;
+
   const drawHeader = () => {
-    doc.drawRect(doc.marginLeft, doc.getY() - 15, doc.contentWidth, 18, [0.12, 0.16, 0.24]);
+    const headerTop = doc.getY() + 3;
+    const headerBottom = doc.getY() - 15;
+    doc.drawRect(doc.marginLeft, headerBottom, doc.contentWidth, 18, [0.12, 0.16, 0.24]);
+    doc.drawLine(remainedColDividerX, headerBottom, remainedColDividerX, headerTop, 0.6, [0.3, 0.36, 0.46]);
+    doc.drawLine(writeColDividerX, headerBottom, writeColDividerX, headerTop, 0.6, [0.3, 0.36, 0.46]);
     const yH = doc.getY() - 9;
     doc.drawText('#', doc.marginLeft + 6, yH, 7.5, true, [1, 1, 1]);
     doc.drawText('PRODUCT NAME', doc.marginLeft + 28, yH, 7.5, true, [1, 1, 1]);
-    doc.drawRightText('TOTAL REMAINED QTY', doc.marginLeft + 390, yH, 7.5, true, [1, 1, 1]);
-    doc.drawRightText('TOTAL SOLD QTY', doc.pageWidth - doc.marginRight - 8, yH, 7.5, true, [1, 1, 1]);
+    doc.drawText('REMAINED QUANTITY', remainedColTextX, yH, 7.5, true, [1, 1, 1]);
     doc.advanceY(22);
   };
 
@@ -1971,37 +1970,54 @@ function buildSoldProductsSummaryDoc(
     rows.forEach((row, idx) => {
       doc.ensureSpace(22, drawHeader);
       const y = doc.getY();
+      const rowTop = y + 9;
       const unitSuffix = row.unit ? ` ${row.unit}` : '';
       const remainedStr = `${Number((Number(row.totalRemained) || 0).toFixed(3))}${unitSuffix}`;
-      const soldStr = `${Number((Number(row.totalSold) || 0).toFixed(3))}${unitSuffix}`;
 
       doc.drawText(String(idx + 1), doc.marginLeft + 6, y, 8, false, [0.4, 0.45, 0.55]);
-      doc.drawText(truncate(row.productName || 'Unnamed Product', 52), doc.marginLeft + 28, y, 8.2, true);
-      doc.drawRightText(
+      doc.drawText(truncate(row.productName || 'Unnamed Product', 42), doc.marginLeft + 28, y, 8.2, true);
+      doc.drawText(
         remainedStr,
-        doc.marginLeft + 390,
+        remainedColTextX,
         y,
-        8.2,
+        8.4,
         true,
         row.totalRemained <= 0 ? [0.75, 0.15, 0.22] : [0.15, 0.38, 0.72]
       );
-      doc.drawRightText(
-        soldStr,
-        doc.pageWidth - doc.marginRight - 8,
-        y,
-        8.5,
-        true,
-        [0.02, 0.52, 0.35]
-      );
 
       doc.advanceY(15);
+      const rowBottom = doc.getY() + 3;
+      doc.drawLine(
+        remainedColDividerX,
+        rowBottom,
+        remainedColDividerX,
+        rowTop,
+        0.5,
+        [0.86, 0.89, 0.93]
+      );
+      doc.drawLine(
+        writeColDividerX,
+        rowBottom,
+        writeColDividerX,
+        rowTop,
+        0.5,
+        [0.86, 0.89, 0.93]
+      );
+      doc.drawLine(
+        tableRightX,
+        rowBottom,
+        tableRightX,
+        rowTop,
+        0.4,
+        [0.88, 0.9, 0.94]
+      );
       doc.drawLine(
         doc.marginLeft,
-        doc.getY() + 3,
-        doc.pageWidth - doc.marginRight,
-        doc.getY() + 3,
-        0.4,
-        [0.9, 0.92, 0.95]
+        rowBottom,
+        tableRightX,
+        rowBottom,
+        0.5,
+        [0.86, 0.89, 0.93]
       );
       doc.advanceY(5);
     });

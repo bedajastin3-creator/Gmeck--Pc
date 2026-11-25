@@ -47,6 +47,7 @@ import {
   isPlatformAdmin,
   isShopAdmin,
 } from '../../utils/permissions';
+import { CustomDateRangeCalendar } from '../common/CustomDateRangeCalendar';
 
 type DatePreset = 'TODAY' | 'WEEK' | 'MONTH' | 'YEAR' | 'CUSTOM';
 type EditListPreset = 'ALL' | DatePreset;
@@ -123,6 +124,8 @@ export const AdminSales: React.FC = () => {
   const [editListStartDate, setEditListStartDate] = useState('');
   const [editListEndDate, setEditListEndDate] = useState('');
   const [editListVisibleCount, setEditListVisibleCount] = useState(SALES_PAGE_SIZE);
+  const [customCalendarOpenTrigger, setCustomCalendarOpenTrigger] = useState(0);
+  const [editListCalendarOpenTrigger, setEditListCalendarOpenTrigger] = useState(0);
 
   // Void Dialog
   const [voidingSale, setVoidingSale] = useState<Sale | null>(null);
@@ -696,31 +699,18 @@ export const AdminSales: React.FC = () => {
     }
   };
 
-  // Unique Sold Products Summary (strictly products sold in the currently selected period)
+  // Unique Sold Products Summary (strictly shop-floor products sold in the currently selected period)
   const soldProductsSummaryRows: SoldProductSummaryRow[] = (() => {
-    const floorStoreIdSet = new Set(
-      (dbState.stores || []).filter(st => st.isShopFloor).map(st => st.id)
-    );
     const productById = new Map<string, Product>(products.map(p => [p.id, p]));
-    const getRemainingQty = (productId?: string): number => {
+    const getRemainingShopQty = (productId?: string): number => {
       if (!productId) return 0;
       const p = productById.get(productId);
       if (!p) return 0;
-      const floorQty = Math.max(0, Number(p.currentStock) || 0);
-      const storeQty =
-        typeof p.storeStock === 'number' && Number.isFinite(p.storeStock)
-          ? Math.max(0, p.storeStock)
-          : p.storeStocks
-            ? Object.entries(p.storeStocks).reduce(
-                (sum, [sid, q]) =>
-                  floorStoreIdSet.has(sid) ? sum : sum + Math.max(0, Number(q || 0)),
-                0
-              )
-            : 0;
-      return floorQty + storeQty;
+      // Only count shop-floor remaining quantity (never include store/warehouse stock)
+      return Math.max(0, Number(p.currentStock) || 0);
     };
 
-    const agg = new Map<string, SoldProductSummaryRow>();
+    const agg = new Map<string, SoldProductSummaryRow & { _soldOrder: number }>();
     for (const sale of sales) {
       if (sale.status !== 'COMPLETED') continue;
       for (const item of sale.items || []) {
@@ -732,7 +722,7 @@ export const AdminSales: React.FC = () => {
           `${sale.shopId || ''}::${(item.productName || '').trim().toLowerCase()}`;
         const existing = agg.get(key);
         if (existing) {
-          existing.totalSold += qty;
+          existing._soldOrder += qty;
         } else {
           const baseName = (matchedProd?.name || item.productName || 'Unnamed Product').trim();
           const fullName =
@@ -741,17 +731,17 @@ export const AdminSales: React.FC = () => {
               : baseName;
           agg.set(key, {
             productName: fullName,
-            totalRemained: getRemainingQty(item.productId),
-            totalSold: qty,
+            totalRemained: getRemainingShopQty(item.productId),
             unit: matchedProd?.unit,
+            _soldOrder: qty,
           });
         }
       }
     }
 
-    return Array.from(agg.values()).sort(
-      (a, b) => b.totalSold - a.totalSold || a.productName.localeCompare(b.productName)
-    );
+    return Array.from(agg.values())
+      .sort((a, b) => b._soldOrder - a._soldOrder || a.productName.localeCompare(b.productName))
+      .map(({ _soldOrder: _ignored, ...row }) => row);
   })();
 
   const buildSoldProductsPdfMeta = () => ({
@@ -779,7 +769,7 @@ export const AdminSales: React.FC = () => {
         addToast({
           type: 'success',
           title: `Sold Products PDF Downloaded (${isSearchingAllDates ? 'Search' : activePeriodMeta.shortLabel})`,
-          description: `Exported ${soldProductsSummaryRows.length} unique sold product(s) with remaining and sold quantities.`,
+          description: `Exported ${soldProductsSummaryRows.length} unique sold product(s) with remaining shop quantities.`,
         });
       } else {
         addToast({
@@ -1162,7 +1152,12 @@ export const AdminSales: React.FC = () => {
                 <button
                   key={p.id}
                   type="button"
-                  onClick={() => setEditListPreset(p.id)}
+                  onClick={() => {
+                    setEditListPreset(p.id);
+                    if (p.id === 'CUSTOM') {
+                      setEditListCalendarOpenTrigger(c => c + 1);
+                    }
+                  }}
                   className={`py-2 rounded-lg border text-[11px] font-semibold transition ${
                     isActive ? p.activeClass : p.idleClass
                   }`}
@@ -1174,26 +1169,14 @@ export const AdminSales: React.FC = () => {
           </div>
 
           {editListPreset === 'CUSTOM' && (
-            <div className="grid grid-cols-2 gap-2 pt-1">
-              <div>
-                <label className="text-[10px] text-slate-500 block mb-1">From</label>
-                <input
-                  type="date"
-                  value={editListStartDate}
-                  onChange={e => setEditListStartDate(e.target.value)}
-                  className="bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-2 text-xs text-white w-full focus:outline-none focus:ring-1 focus:ring-amber-500"
-                />
-              </div>
-              <div>
-                <label className="text-[10px] text-slate-500 block mb-1">To</label>
-                <input
-                  type="date"
-                  value={editListEndDate}
-                  onChange={e => setEditListEndDate(e.target.value)}
-                  className="bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-2 text-xs text-white w-full focus:outline-none focus:ring-1 focus:ring-amber-500"
-                />
-              </div>
-            </div>
+            <CustomDateRangeCalendar
+              startDate={editListStartDate}
+              endDate={editListEndDate}
+              onChangeStartDate={setEditListStartDate}
+              onChangeEndDate={setEditListEndDate}
+              openTrigger={editListCalendarOpenTrigger}
+              accent="violet"
+            />
           )}
 
           <div className="flex flex-wrap items-center gap-2">
@@ -1562,7 +1545,7 @@ export const AdminSales: React.FC = () => {
           </button>
         </div>
 
-        {/* Separate Sold Products Summary PDF & Print (Product Name, Total Remained Qty, Total Sold Qty ONLY) */}
+        {/* Separate Sold Products Summary PDF & Print (Product Name & Remained Shop Qty) */}
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
           <button
             id="sales-sold-products-pdf-btn"
@@ -1769,7 +1752,12 @@ export const AdminSales: React.FC = () => {
                 <button
                   key={p.id}
                   type="button"
-                  onClick={() => setDatePreset(p.id)}
+                  onClick={() => {
+                    setDatePreset(p.id);
+                    if (p.id === 'CUSTOM') {
+                      setCustomCalendarOpenTrigger(c => c + 1);
+                    }
+                  }}
                   className={`py-2 rounded-lg border text-[11px] font-semibold transition active:scale-95 ${
                     isActive ? p.activeClass : p.idleClass
                   }`}
@@ -1781,28 +1769,16 @@ export const AdminSales: React.FC = () => {
           </div>
         </div>
 
-        {/* Custom date range inputs — only when CUSTOM */}
+        {/* Custom date range inputs + interactive calendar — shown immediately when CUSTOM is clicked */}
         {datePreset === 'CUSTOM' && (
-          <div className="grid grid-cols-2 gap-2 pt-1 animate-in fade-in duration-150">
-            <div>
-              <label className="text-[10px] text-slate-500 block mb-1">From</label>
-              <input
-                type="date"
-                value={startDate}
-                onChange={e => setStartDate(e.target.value)}
-                className="bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-2 text-xs text-white w-full focus:outline-none focus:ring-1 focus:ring-amber-500"
-              />
-            </div>
-            <div>
-              <label className="text-[10px] text-slate-500 block mb-1">To</label>
-              <input
-                type="date"
-                value={endDate}
-                onChange={e => setEndDate(e.target.value)}
-                className="bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-2 text-xs text-white w-full focus:outline-none focus:ring-1 focus:ring-amber-500"
-              />
-            </div>
-          </div>
+          <CustomDateRangeCalendar
+            startDate={startDate}
+            endDate={endDate}
+            onChangeStartDate={setStartDate}
+            onChangeEndDate={setEndDate}
+            openTrigger={customCalendarOpenTrigger}
+            accent="amber"
+          />
         )}
 
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">

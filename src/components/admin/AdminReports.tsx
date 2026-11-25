@@ -43,6 +43,7 @@ import {
   isPlatformAdmin,
   isShopAdmin,
 } from '../../utils/permissions';
+import { CustomDateRangeCalendar } from '../common/CustomDateRangeCalendar';
 
 // ─────────────────────────────────────────────────────────────
 // Types
@@ -138,6 +139,7 @@ const ReportSectionHeader: React.FC<{
   actions,
   accent = 'blue',
 }) => {
+  const [calendarOpenTrigger, setCalendarOpenTrigger] = useState(0);
   const accents: Record<string, string> = {
     blue: 'from-blue-950/20 via-slate-900 to-slate-900',
     rose: 'from-rose-950/20 via-slate-900 to-slate-900',
@@ -187,7 +189,12 @@ const ReportSectionHeader: React.FC<{
             <button
               key={p.id}
               type="button"
-              onClick={() => onPeriodChange(p.id as ReportPeriod)}
+              onClick={() => {
+                onPeriodChange(p.id as ReportPeriod);
+                if (p.id === 'custom') {
+                  setCalendarOpenTrigger(c => c + 1);
+                }
+              }}
               className={`flex-1 px-2 py-1.5 rounded-lg transition active:scale-95 ${
                 period === p.id ? pillActive[accent] : 'text-slate-400 hover:text-slate-200'
               }`}
@@ -199,26 +206,14 @@ const ReportSectionHeader: React.FC<{
       )}
 
       {period === 'custom' && !collapsed && (
-        <div className="grid grid-cols-2 gap-2">
-          <div>
-            <label className="block text-[10px] text-slate-500 mb-1">From</label>
-            <input
-              type="date"
-              value={customStart}
-              onChange={e => onCustomStartChange(e.target.value)}
-              className="w-full bg-slate-950 border border-slate-800 rounded-lg px-2 py-1.5 text-xs text-white"
-            />
-          </div>
-          <div>
-            <label className="block text-[10px] text-slate-500 mb-1">To</label>
-            <input
-              type="date"
-              value={customEnd}
-              onChange={e => onCustomEndChange(e.target.value)}
-              className="w-full bg-slate-950 border border-slate-800 rounded-lg px-2 py-1.5 text-xs text-white"
-            />
-          </div>
-        </div>
+        <CustomDateRangeCalendar
+          startDate={customStart}
+          endDate={customEnd}
+          onChangeStartDate={onCustomStartChange}
+          onChangeEndDate={onCustomEndChange}
+          openTrigger={calendarOpenTrigger}
+          accent={accent === 'rose' ? 'amber' : accent}
+        />
       )}
     </div>
   );
@@ -257,6 +252,8 @@ export const AdminReports: React.FC = () => {
   const [pnlPeriod, setPnlPeriod] = useState<ProfitLossPeriod>('day');
   const [pnlStart, setPnlStart] = useState('');
   const [pnlEnd, setPnlEnd] = useState('');
+  const [pnlCalendarTrigger, setPnlCalendarTrigger] = useState(0);
+  const [rankCalendarTrigger, setRankCalendarTrigger] = useState(0);
   const [pnlCollapsed, setPnlCollapsed] = useState(false);
   const [pnlSort, setPnlSort] = useState<'NET_DESC' | 'CAPITAL_DESC' | 'LOSS_DESC' | 'NAME_ASC'>('NET_DESC');
   const [pnlOutcomeFilter, setPnlOutcomeFilter] = useState<'ALL' | 'PROFIT' | 'LOSS'>('ALL');
@@ -1311,7 +1308,12 @@ export const AdminReports: React.FC = () => {
                   <button
                     key={p.id}
                     type="button"
-                    onClick={() => setRankPeriod(p.id)}
+                    onClick={() => {
+                      setRankPeriod(p.id);
+                      if (p.id === 'custom') {
+                        setRankCalendarTrigger(c => c + 1);
+                      }
+                    }}
                     className={`py-2 rounded-lg transition ${
                       rankPeriod === p.id
                         ? 'bg-amber-500 text-slate-950 font-bold shadow-sm'
@@ -1326,28 +1328,14 @@ export const AdminReports: React.FC = () => {
           </div>
 
           {rankPeriod === 'custom' && (
-            <div className="grid grid-cols-2 gap-2">
-              <div className="flex items-center gap-1.5 bg-slate-900 border border-slate-800 rounded-xl px-2.5 py-2">
-                <Calendar className="w-3.5 h-3.5 text-amber-400 shrink-0" />
-                <input
-                  type="date"
-                  value={rankStart}
-                  onChange={e => setRankStart(e.target.value)}
-                  className="bg-transparent text-[11px] text-white w-full focus:outline-none font-mono"
-                  aria-label="Custom start date"
-                />
-              </div>
-              <div className="flex items-center gap-1.5 bg-slate-900 border border-slate-800 rounded-xl px-2.5 py-2">
-                <Calendar className="w-3.5 h-3.5 text-amber-400 shrink-0" />
-                <input
-                  type="date"
-                  value={rankEnd}
-                  onChange={e => setRankEnd(e.target.value)}
-                  className="bg-transparent text-[11px] text-white w-full focus:outline-none font-mono"
-                  aria-label="Custom end date"
-                />
-              </div>
-            </div>
+            <CustomDateRangeCalendar
+              startDate={rankStart}
+              endDate={rankEnd}
+              onChangeStartDate={setRankStart}
+              onChangeEndDate={setRankEnd}
+              openTrigger={rankCalendarTrigger}
+              accent="amber"
+            />
           )}
         </div>
 
@@ -1976,7 +1964,12 @@ export const AdminReports: React.FC = () => {
                     <button
                       key={p.id}
                       type="button"
-                      onClick={() => setPnlPeriod(p.id)}
+                      onClick={() => {
+                        setPnlPeriod(p.id);
+                        if (p.id === 'custom') {
+                          setPnlCalendarTrigger(c => c + 1);
+                        }
+                      }}
                       className={`py-1.5 px-2.5 rounded-lg border text-[11px] font-semibold transition active:scale-95 ${
                         pnlPeriod === p.id ? p.activeClass : p.idleClass
                       }`}
@@ -1988,26 +1981,14 @@ export const AdminReports: React.FC = () => {
               </div>
 
               {pnlPeriod === 'custom' && (
-                <div className="grid grid-cols-2 gap-2 pt-1">
-                  <div>
-                    <label className="block text-[10px] text-slate-400 mb-1">From</label>
-                    <input
-                      type="date"
-                      value={pnlStart}
-                      onChange={e => setPnlStart(e.target.value)}
-                      className="w-full bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1.5 text-xs text-white focus:outline-none focus:ring-1 focus:ring-amber-500"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-[10px] text-slate-400 mb-1">To</label>
-                    <input
-                      type="date"
-                      value={pnlEnd}
-                      onChange={e => setPnlEnd(e.target.value)}
-                      className="w-full bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1.5 text-xs text-white focus:outline-none focus:ring-1 focus:ring-amber-500"
-                    />
-                  </div>
-                </div>
+                <CustomDateRangeCalendar
+                  startDate={pnlStart}
+                  endDate={pnlEnd}
+                  onChangeStartDate={setPnlStart}
+                  onChangeEndDate={setPnlEnd}
+                  openTrigger={pnlCalendarTrigger}
+                  accent="amber"
+                />
               )}
             </div>
           )}
