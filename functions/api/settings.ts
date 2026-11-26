@@ -20,9 +20,11 @@ function jsonResponse(data: any, status: number = 200): Response {
 async function ensureSettingsFeatureColumns(db: any): Promise<{
   hasAssistant: boolean;
   hasCustomerDetails: boolean;
+  hasCustomerDetailsByShop: boolean;
 }> {
   let hasAssistant = false;
   let hasCustomerDetails = false;
+  let hasCustomerDetailsByShop = false;
   try {
     const info = await db.prepare('PRAGMA table_info(settings)').all();
     const cols = new Set(
@@ -41,10 +43,45 @@ async function ensureSettingsFeatureColumns(db: any): Promise<{
         .run();
     }
     hasCustomerDetails = true;
+
+    if (!cols.has('customer_details_by_shop')) {
+      await db
+        .prepare("ALTER TABLE settings ADD COLUMN customer_details_by_shop TEXT NOT NULL DEFAULT '{}'")
+        .run();
+    }
+    hasCustomerDetailsByShop = true;
   } catch {
     // Fallback gracefully if ALTER TABLE is unavailable
   }
-  return { hasAssistant, hasCustomerDetails };
+  return { hasAssistant, hasCustomerDetails, hasCustomerDetailsByShop };
+}
+
+function sanitizeCustomerDetailsByShop(input: unknown): Record<string, boolean> {
+  const clean: Record<string, boolean> = {};
+  if (!input) return clean;
+  let obj: any = input;
+  if (typeof input === 'string') {
+    try {
+      obj = JSON.parse(input);
+    } catch {
+      return clean;
+    }
+  }
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return clean;
+  let count = 0;
+  for (const [k, v] of Object.entries(obj)) {
+    if (count >= 200) break;
+    const key = String(k || '').trim();
+    if (!key || key.length > 128) continue;
+    if (typeof v === 'boolean') {
+      clean[key] = v;
+      count += 1;
+    } else if (v === 1 || v === 0) {
+      clean[key] = v === 1;
+      count += 1;
+    }
+  }
+  return clean;
 }
 
 function validateRequestHeaders(request: Request): Response | null {
@@ -94,7 +131,9 @@ export async function onRequestPut(context: any) {
       return jsonResponse({ success: false, error: 'Invalid settings payload' }, 400);
     }
 
-    const { hasAssistant, hasCustomerDetails } = await ensureSettingsFeatureColumns(env.DB);
+    const { hasAssistant, hasCustomerDetails, hasCustomerDetailsByShop } =
+      await ensureSettingsFeatureColumns(env.DB);
+    const existingRow = await env.DB.prepare("SELECT * FROM settings WHERE id = 'global'").first();
     const now = new Date().toISOString();
 
     const setClauses = [
@@ -114,29 +153,73 @@ export async function onRequestPut(context: any) {
       'updated_at = ?',
     ];
     const params: any[] = [
-      String(settings.businessName || 'Diocres Hardware&Retail Solutions'),
-      settings.tagline || null,
-      settings.address || null,
-      settings.phone || null,
-      settings.email || null,
-      String(settings.currencySymbol || 'TSh'),
-      String(settings.currencyCode || 'TZS'),
-      Number(settings.taxRatePercent) || 0,
-      settings.enableTax ? 1 : 0,
-      settings.receiptHeaderNote || null,
-      settings.receiptFooterNote || null,
-      String(settings.receiptPaperWidth || '80mm'),
-      Number(settings.lowStockThresholdDefault) || 5,
+      String(settings.businessName || existingRow?.business_name || 'Diocres Hardware&Retail Solutions'),
+      settings.tagline !== undefined ? settings.tagline || null : existingRow?.tagline || null,
+      settings.address !== undefined ? settings.address || null : existingRow?.address || null,
+      settings.phone !== undefined ? settings.phone || null : existingRow?.phone || null,
+      settings.email !== undefined ? settings.email || null : existingRow?.email || null,
+      String(settings.currencySymbol || existingRow?.currency_symbol || 'TSh'),
+      String(settings.currencyCode || existingRow?.currency_code || 'TZS'),
+      settings.taxRatePercent !== undefined
+        ? Number(settings.taxRatePercent) || 0
+        : Number(existingRow?.tax_rate_percent) || 0,
+      settings.enableTax !== undefined
+        ? settings.enableTax
+          ? 1
+          : 0
+        : existingRow?.enable_tax
+          ? 1
+          : 0,
+      settings.receiptHeaderNote !== undefined
+        ? settings.receiptHeaderNote || null
+        : existingRow?.receipt_header_note || null,
+      settings.receiptFooterNote !== undefined
+        ? settings.receiptFooterNote || null
+        : existingRow?.receipt_footer_note || null,
+      String(settings.receiptPaperWidth || existingRow?.receipt_paper_width || '80mm'),
+      settings.lowStockThresholdDefault !== undefined
+        ? Number(settings.lowStockThresholdDefault) || 5
+        : Number(existingRow?.low_stock_threshold_default) || 5,
       now,
     ];
 
     if (hasAssistant) {
       setClauses.push('enable_sales_assistant = ?');
-      params.push(settings.enableSalesAssistant ? 1 : 0);
+      params.push(
+        settings.enableSalesAssistant !== undefined
+          ? settings.enableSalesAssistant
+            ? 1
+            : 0
+          : existingRow?.enable_sales_assistant
+            ? 1
+            : 0
+      );
     }
     if (hasCustomerDetails) {
       setClauses.push('enable_customer_details = ?');
-      params.push(settings.enableCustomerDetails ? 1 : 0);
+      params.push(
+        settings.enableCustomerDetails !== undefined
+          ? settings.enableCustomerDetails
+            ? 1
+            : 0
+          : existingRow?.enable_customer_details
+            ? 1
+            : 0
+      );
+    }
+    if (hasCustomerDetailsByShop) {
+      const existingMap = sanitizeCustomerDetailsByShop(existingRow?.customer_details_by_shop);
+      const incomingPatch = sanitizeCustomerDetailsByShop(
+        settings.customerDetailsByShopPatch ?? settings.customerDetailsByShop
+      );
+      const mergedMap =
+        settings.customerDetailsByShopPatch !== undefined
+          ? { ...existingMap, ...incomingPatch }
+          : settings.customerDetailsByShop !== undefined
+            ? { ...existingMap, ...incomingPatch }
+            : existingMap;
+      setClauses.push('customer_details_by_shop = ?');
+      params.push(JSON.stringify(mergedMap));
     }
 
     await env.DB.prepare(`UPDATE settings SET ${setClauses.join(', ')} WHERE id = 'global'`)
