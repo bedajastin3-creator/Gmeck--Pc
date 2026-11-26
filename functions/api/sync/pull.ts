@@ -277,6 +277,22 @@ export async function onRequestGet(context: any) {
     state.debtPayments = debtPaymentsResult.results;
 
     // ═══════════════════════════════════════════════════════
+    // CUSTOMER RECORDS (safe fallback if table not yet created)
+    // ═══════════════════════════════════════════════════════
+    try {
+      const customerRecordsResult = hasSince
+        ? await env.DB.prepare(
+            'SELECT * FROM customer_records WHERE updated_at > ? OR created_at > ? ORDER BY created_at DESC'
+          )
+            .bind(since, since)
+            .all()
+        : await env.DB.prepare('SELECT * FROM customer_records ORDER BY created_at DESC').all();
+      state.customerRecords = customerRecordsResult.results || [];
+    } catch {
+      state.customerRecords = [];
+    }
+
+    // ═══════════════════════════════════════════════════════
     // SETTINGS
     // ═══════════════════════════════════════════════════════
     const settingsResult = await env.DB.prepare(
