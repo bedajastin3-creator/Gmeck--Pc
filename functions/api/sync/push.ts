@@ -196,6 +196,14 @@ async function processOperation(db: any, op: any) {
       await deleteStockTransfer(db, payload);
       break;
 
+    // ── CUSTOMER RECORDS ──
+    case 'CREATE_CUSTOMER_RECORD':
+      await upsertCustomerRecord(db, payload);
+      break;
+    case 'DELETE_CUSTOMER_RECORD':
+      await deleteCustomerRecord(db, payload);
+      break;
+
     default:
       throw new Error(`Unknown operation: ${operation}`);
   }
@@ -2058,12 +2066,21 @@ async function recordStockAdjustment(db: any, movement: any) {
   }
 }
 
-let settingsAssistantColChecked = false;
+let settingsFeatureColsChecked = false;
 let hasSettingsAssistantCol = false;
+let hasSettingsCustomerDetailsCol = false;
 
-async function ensureSettingsAssistantColumn(db: any): Promise<boolean> {
-  if (settingsAssistantColChecked) return hasSettingsAssistantCol;
-  settingsAssistantColChecked = true;
+async function ensureSettingsFeatureColumns(db: any): Promise<{
+  hasAssistant: boolean;
+  hasCustomerDetails: boolean;
+}> {
+  if (settingsFeatureColsChecked) {
+    return {
+      hasAssistant: hasSettingsAssistantCol,
+      hasCustomerDetails: hasSettingsCustomerDetailsCol,
+    };
+  }
+  settingsFeatureColsChecked = true;
   try {
     const info = await db.prepare('PRAGMA table_info(settings)').all();
     const cols = new Set(
@@ -2071,79 +2088,198 @@ async function ensureSettingsAssistantColumn(db: any): Promise<boolean> {
     );
     if (!cols.has('enable_sales_assistant')) {
       await db
-        .prepare('ALTER TABLE settings ADD COLUMN enable_sales_assistant INTEGER DEFAULT 0')
+        .prepare('ALTER TABLE settings ADD COLUMN enable_sales_assistant INTEGER NOT NULL DEFAULT 0')
         .run();
     }
     hasSettingsAssistantCol = true;
+
+    if (!cols.has('enable_customer_details')) {
+      await db
+        .prepare('ALTER TABLE settings ADD COLUMN enable_customer_details INTEGER NOT NULL DEFAULT 0')
+        .run();
+    }
+    hasSettingsCustomerDetailsCol = true;
   } catch {
-    hasSettingsAssistantCol = false;
+    // Keep partial flags as detected
   }
-  return hasSettingsAssistantCol;
+  return {
+    hasAssistant: hasSettingsAssistantCol,
+    hasCustomerDetails: hasSettingsCustomerDetailsCol,
+  };
 }
 
 async function updateSettings(db: any, settings: any) {
-  const assistantColOk = await ensureSettingsAssistantColumn(db);
-  if (assistantColOk) {
+  const { hasAssistant, hasCustomerDetails } = await ensureSettingsFeatureColumns(db);
+  const setClauses = [
+    'business_name = ?',
+    'tagline = ?',
+    'address = ?',
+    'phone = ?',
+    'email = ?',
+    'currency_symbol = ?',
+    'currency_code = ?',
+    'tax_rate_percent = ?',
+    'enable_tax = ?',
+    'receipt_header_note = ?',
+    'receipt_footer_note = ?',
+    'receipt_paper_width = ?',
+    'low_stock_threshold_default = ?',
+    'updated_at = ?',
+  ];
+  const params: any[] = [
+    settings.businessName || 'Diocres Hardware&Retail Solutions',
+    settings.tagline || null,
+    settings.address || null,
+    settings.phone || null,
+    settings.email || null,
+    settings.currencySymbol || 'TSh',
+    settings.currencyCode || 'TZS',
+    settings.taxRatePercent || 0,
+    settings.enableTax ? 1 : 0,
+    settings.receiptHeaderNote || null,
+    settings.receiptFooterNote || null,
+    settings.receiptPaperWidth || '80mm',
+    settings.lowStockThresholdDefault || 5,
+    new Date().toISOString(),
+  ];
+
+  if (hasAssistant) {
+    setClauses.push('enable_sales_assistant = ?');
+    params.push(settings.enableSalesAssistant ? 1 : 0);
+  }
+  if (hasCustomerDetails) {
+    setClauses.push('enable_customer_details = ?');
+    params.push(settings.enableCustomerDetails ? 1 : 0);
+  }
+
+  await db
+    .prepare(`UPDATE settings SET ${setClauses.join(', ')} WHERE id = 'global'`)
+    .bind(...params)
+    .run();
+}
+
+async function upsertCustomerRecord(db: any, payload: any) {
+  await db
+    .prepare(
+      `
+      CREATE TABLE IF NOT EXISTS customer_records (
+        id TEXT PRIMARY KEY,
+        customer_name TEXT NOT NULL,
+        phone_number TEXT NOT NULL,
+        image_urls TEXT NOT NULL DEFAULT '[]',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      )
+    `
+    )
+    .run();
+
+  let hasExtended = false;
+  try {
+    const info = await db.prepare('PRAGMA table_info(customer_records)').all();
+    const cols = new Set(
+      (info?.results || []).map((c: any) => String(c.name || '').toLowerCase())
+    );
+    const migrations: [string, string][] = [
+      ['sale_id', 'ALTER TABLE customer_records ADD COLUMN sale_id TEXT'],
+      ['receipt_number', 'ALTER TABLE customer_records ADD COLUMN receipt_number TEXT'],
+      ['shop_id', 'ALTER TABLE customer_records ADD COLUMN shop_id TEXT'],
+      ['shop_name', 'ALTER TABLE customer_records ADD COLUMN shop_name TEXT'],
+      ['sale_date', 'ALTER TABLE customer_records ADD COLUMN sale_date TEXT'],
+      ['items_json', "ALTER TABLE customer_records ADD COLUMN items_json TEXT NOT NULL DEFAULT '[]'"],
+    ];
+    for (const [col, ddl] of migrations) {
+      if (!cols.has(col)) {
+        await db.prepare(ddl).run();
+      }
+    }
+    hasExtended = true;
+  } catch {
+    hasExtended = false;
+  }
+
+  const id = String(payload?.id || crypto.randomUUID()).trim();
+  const customerName = String(payload?.customerName ?? payload?.customer_name ?? '').trim();
+  const phoneNumber = String(payload?.phoneNumber ?? payload?.phone_number ?? '').trim();
+  if (!customerName || !phoneNumber) {
+    throw new Error('Customer name and phone number are required');
+  }
+
+  const rawUrls = Array.isArray(payload?.imageUrls)
+    ? payload.imageUrls
+    : Array.isArray(payload?.image_urls)
+      ? payload.image_urls
+      : [];
+  const safeUrls = rawUrls
+    .filter((u: unknown) => typeof u === 'string' && /^https?:\/\//i.test(u.trim()))
+    .slice(0, 24);
+
+  const items = Array.isArray(payload?.items) ? payload.items : [];
+  const now = new Date().toISOString();
+  const createdAt = String(payload?.createdAt ?? payload?.created_at ?? now);
+
+  if (hasExtended) {
     await db
       .prepare(
         `
-      UPDATE settings SET
-        business_name = ?, tagline = ?, address = ?, phone = ?, email = ?,
-        currency_symbol = ?, currency_code = ?, tax_rate_percent = ?, enable_tax = ?,
-        enable_sales_assistant = ?,
-        receipt_header_note = ?, receipt_footer_note = ?, receipt_paper_width = ?,
-        low_stock_threshold_default = ?, updated_at = ?
-      WHERE id = 'global'
-    `
+        INSERT INTO customer_records (
+          id, customer_name, phone_number, image_urls,
+          sale_id, receipt_number, shop_id, shop_name, sale_date, items_json,
+          created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          customer_name = excluded.customer_name,
+          phone_number = excluded.phone_number,
+          image_urls = excluded.image_urls,
+          sale_id = excluded.sale_id,
+          receipt_number = excluded.receipt_number,
+          shop_id = excluded.shop_id,
+          shop_name = excluded.shop_name,
+          sale_date = excluded.sale_date,
+          items_json = excluded.items_json,
+          updated_at = excluded.updated_at
+      `
       )
       .bind(
-        settings.businessName || 'Diocres Hardware&Retail Solutions',
-        settings.tagline || null,
-        settings.address || null,
-        settings.phone || null,
-        settings.email || null,
-        settings.currencySymbol || 'TSh',
-        settings.currencyCode || 'TZS',
-        settings.taxRatePercent || 0,
-        settings.enableTax ? 1 : 0,
-        settings.enableSalesAssistant ? 1 : 0,
-        settings.receiptHeaderNote || null,
-        settings.receiptFooterNote || null,
-        settings.receiptPaperWidth || '80mm',
-        settings.lowStockThresholdDefault || 5,
-        new Date().toISOString()
+        id,
+        customerName,
+        phoneNumber,
+        JSON.stringify(safeUrls),
+        payload?.saleId || payload?.sale_id || null,
+        payload?.receiptNumber || payload?.receipt_number || null,
+        payload?.shopId || payload?.shop_id || null,
+        payload?.shopName || payload?.shop_name || null,
+        payload?.saleDate || payload?.sale_date || createdAt,
+        JSON.stringify(items),
+        createdAt,
+        now
       )
       .run();
   } else {
     await db
       .prepare(
         `
-      UPDATE settings SET
-        business_name = ?, tagline = ?, address = ?, phone = ?, email = ?,
-        currency_symbol = ?, currency_code = ?, tax_rate_percent = ?, enable_tax = ?,
-        receipt_header_note = ?, receipt_footer_note = ?, receipt_paper_width = ?,
-        low_stock_threshold_default = ?, updated_at = ?
-      WHERE id = 'global'
-    `
+        INSERT INTO customer_records (
+          id, customer_name, phone_number, image_urls, created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          customer_name = excluded.customer_name,
+          phone_number = excluded.phone_number,
+          image_urls = excluded.image_urls,
+          updated_at = excluded.updated_at
+      `
       )
-      .bind(
-        settings.businessName || 'Diocres Hardware&Retail Solutions',
-        settings.tagline || null,
-        settings.address || null,
-        settings.phone || null,
-        settings.email || null,
-        settings.currencySymbol || 'TSh',
-        settings.currencyCode || 'TZS',
-        settings.taxRatePercent || 0,
-        settings.enableTax ? 1 : 0,
-        settings.receiptHeaderNote || null,
-        settings.receiptFooterNote || null,
-        settings.receiptPaperWidth || '80mm',
-        settings.lowStockThresholdDefault || 5,
-        new Date().toISOString()
-      )
+      .bind(id, customerName, phoneNumber, JSON.stringify(safeUrls), createdAt, now)
       .run();
   }
+}
+
+async function deleteCustomerRecord(db: any, payload: any) {
+  const id = String(payload?.id || payload || '').trim();
+  if (!id) return;
+  await db.prepare('DELETE FROM customer_records WHERE id = ?').bind(id).run();
 }
 
 async function createDebt(db: any, debt: any) {
