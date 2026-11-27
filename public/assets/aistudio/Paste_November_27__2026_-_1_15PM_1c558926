@@ -1,0 +1,808 @@
+import React, { useEffect, useMemo, useState } from 'react';
+import {
+  ClipboardList,
+  Search,
+  Calendar,
+  Printer,
+  Download,
+  SlidersHorizontal,
+  TrendingUp,
+  TrendingDown,
+  DollarSign,
+  Store,
+  Warehouse,
+  X,
+  ChevronDown,
+  Loader2,
+} from 'lucide-react';
+import { useApp } from '../../context/AppContext';
+import { formatCurrency, formatDateTime } from '../../utils/formatters';
+import {
+  AdjustmentPdfRow,
+  AdjustmentReportPeriod,
+  downloadAdjustmentsReportPdf,
+  printAdjustmentsReportPdf,
+} from '../../utils/pdfExport';
+import {
+  getAdminManagedShops,
+  hasAdminAccess,
+  isPlatformAdmin,
+  isShopAdmin,
+} from '../../utils/permissions';
+
+const PAGE_SIZE = 15;
+const ADJUSTMENT_TYPES = new Set([
+  'ADJUSTMENT',
+  'CORRECTION',
+  'DAMAGED',
+  'BROKEN',
+  'EXPIRED',
+  'LOST',
+]);
+
+const formatDateYMD = (d: Date): string => {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+};
+
+const computeDateRange = (
+  period: AdjustmentReportPeriod
+): { start: string; end: string } | null => {
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+
+  if (period === 'DAY') {
+    const ymd = formatDateYMD(today);
+    return { start: ymd, end: ymd };
+  }
+  if (period === 'WEEK') {
+    const start = new Date(today);
+    start.setDate(start.getDate() - 6);
+    return { start: formatDateYMD(start), end: formatDateYMD(today) };
+  }
+  if (period === 'MONTH') {
+    const start = new Date(today.getFullYear(), today.getMonth(), 1);
+    return { start: formatDateYMD(start), end: formatDateYMD(today) };
+  }
+  return null;
+};
+
+export const AdminAdjustmentList: React.FC = () => {
+  const { currentUser, dbState, addToast, openInventoryFilter } = useApp();
+
+  const [period, setPeriod] = useState<AdjustmentReportPeriod>('DAY');
+  const [startDate, setStartDate] = useState<string>(() => computeDateRange('DAY')!.start);
+  const [endDate, setEndDate] = useState<string>(() => computeDateRange('DAY')!.end);
+  const [locationFilter, setLocationFilter] = useState<string>('ALL');
+  const [categoryFilter, setCategoryFilter] = useState<string>('ALL');
+  const [directionFilter, setDirectionFilter] = useState<'ALL' | 'IN' | 'OUT'>('ALL');
+  const [searchQuery, setSearchQuery] = useState<string>('');
+  const [visibleCount, setVisibleCount] = useState<number>(PAGE_SIZE);
+  const [isDownloadingPdf, setIsDownloadingPdf] = useState<boolean>(false);
+  const [isPrintingPdf, setIsPrintingPdf] = useState<boolean>(false);
+
+  useEffect(() => {
+    if (period === 'CUSTOM') return;
+    const range = computeDateRange(period);
+    if (range) {
+      setStartDate(range.start);
+      setEndDate(range.end);
+    }
+  }, [period]);
+
+  useEffect(() => {
+    setVisibleCount(PAGE_SIZE);
+  }, [period, startDate, endDate, locationFilter, categoryFilter, directionFilter, searchQuery]);
+
+  const platformAdmin = currentUser ? isPlatformAdmin(currentUser) : false;
+  const shopAdmin = currentUser ? isShopAdmin(currentUser) : false;
+  const settings = dbState.settings;
+  const symbol = settings?.currencySymbol || 'TSh';
+
+  const allShops = dbState.shops || [];
+  const visibleShops = useMemo(() => {
+    if (!currentUser) return [];
+    if (platformAdmin) return allShops;
+    if (shopAdmin) return getAdminManagedShops(currentUser, allShops);
+    return allShops.filter(s => (currentUser.assignedShopIds || []).includes(s.id));
+  }, [currentUser, platformAdmin, shopAdmin, allShops]);
+
+  const visibleShopIdSet = useMemo(() => new Set(visibleShops.map(s => s.id)), [visibleShops]);
+  const shopNameById = useMemo(
+    () => new Map(allShops.map(s => [s.id, s.name])),
+    [allShops]
+  );
+
+  const allStores = dbState.stores || [];
+  const storeById = useMemo(() => new Map(allStores.map(s => [s.id, s])), [allStores]);
+  const floorStoreIdSet = useMemo(
+    () => new Set(allStores.filter(s => s.isShopFloor).map(s => s.id)),
+    [allStores]
+  );
+
+  const productById = useMemo(
+    () => new Map((dbState.products || []).map(p => [p.id, p])),
+    [dbState.products]
+  );
+
+  // Business Location Filter options (Shops + Stores)
+  const locationOptions = useMemo(() => {
+    const opts: { key: string; label: string }[] = [];
+    for (const shop of visibleShops) {
+      opts.push({ key: `SHOP:${shop.id}`, label: `Shop: ${shop.name}` });
+      const stores = allStores
+        .filter(st => !st.isShopFloor && st.shopId === shop.id)
+        .sort((a, b) => a.name.localeCompare(b.name));
+      for (const st of stores) {
+        opts.push({ key: `STORE:${st.id}`, label: `Store: ${st.name} (${shop.name})` });
+      }
+    }
+    return opts;
+  }, [visibleShops, allStores]);
+
+  // Derive normalized adjustment records from inventory movements
+  const adjustmentEntries = useMemo(() => {
+    const movements = dbState.movements || [];
+    const range = period === 'CUSTOM' ? { start: startDate, end: endDate } : computeDateRange(period);
+    const startTs = range?.start ? new Date(`${range.start}T00:00:00`).getTime() : null;
+    const endTs = range?.end ? new Date(`${range.end}T23:59:59.999`).getTime() : null;
+    const q = searchQuery.trim().toLowerCase();
+
+    return movements
+      .filter(m => {
+        if (!ADJUSTMENT_TYPES.has(m.type)) return false;
+
+        // Permission scope check
+        if (!platformAdmin) {
+          const prod = productById.get(m.productId);
+          const resolvedShopId = m.shopId || prod?.shopId;
+          if (!resolvedShopId || !visibleShopIdSet.has(resolvedShopId)) return false;
+        }
+
+        // Date filter
+        const ts = new Date(m.createdAt).getTime();
+        if (startTs !== null && Number.isFinite(ts) && ts < startTs) return false;
+        if (endTs !== null && Number.isFinite(ts) && ts > endTs) return false;
+
+        // Location filter
+        const isStoreMovement = Boolean(m.storeId && !floorStoreIdSet.has(m.storeId));
+        if (locationFilter !== 'ALL') {
+          if (locationFilter.startsWith('SHOP:')) {
+            const targetShopId = locationFilter.slice(5);
+            if (isStoreMovement || m.shopId !== targetShopId) return false;
+          } else if (locationFilter.startsWith('STORE:')) {
+            const targetStoreId = locationFilter.slice(6);
+            if (!isStoreMovement || m.storeId !== targetStoreId) return false;
+          }
+        }
+
+        // Category filter
+        if (categoryFilter !== 'ALL' && m.type !== categoryFilter) return false;
+
+        // Direction filter
+        if (directionFilter === 'IN' && m.changeQty <= 0) return false;
+        if (directionFilter === 'OUT' && m.changeQty >= 0) return false;
+
+        // Search filter
+        if (q) {
+          const prod = productById.get(m.productId);
+          const storeObj = m.storeId ? storeById.get(m.storeId) : undefined;
+          const haystack = [
+            m.productName,
+            prod?.sku || '',
+            prod?.variation || '',
+            m.reason || '',
+            m.userName || '',
+            m.shopName || shopNameById.get(m.shopId) || '',
+            storeObj?.name || '',
+            m.type,
+          ]
+            .join(' ')
+            .toLowerCase();
+          if (!haystack.includes(q)) return false;
+        }
+
+        return true;
+      })
+      .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
+      .map(m => {
+        const prod = productById.get(m.productId);
+        const isStoreMovement = Boolean(m.storeId && !floorStoreIdSet.has(m.storeId));
+        const storeObj = m.storeId ? storeById.get(m.storeId) : undefined;
+        const resolvedShopName = m.shopName || shopNameById.get(m.shopId) || 'Shop';
+        const locationLabel = isStoreMovement
+          ? storeObj?.name || 'Store'
+          : resolvedShopName;
+
+        return {
+          id: m.id,
+          createdAt: m.createdAt,
+          productName: m.productName || prod?.name || 'Product',
+          sku: prod?.sku,
+          unit: prod?.unit || 'pcs',
+          locationType: (isStoreMovement ? 'STORE' : 'SHOP') as 'SHOP' | 'STORE',
+          locationLabel,
+          shopName: resolvedShopName,
+          type: m.type,
+          previousQty: Number(m.previousQty || 0),
+          changeQty: Number(m.changeQty || 0),
+          newQty: Number(m.newQty || 0),
+          costValue: Number(m.costValue || 0),
+          reason: m.reason || '',
+          userName: m.userName || 'Staff',
+        };
+      });
+  }, [
+    dbState.movements,
+    period,
+    startDate,
+    endDate,
+    locationFilter,
+    categoryFilter,
+    directionFilter,
+    searchQuery,
+    platformAdmin,
+    visibleShopIdSet,
+    productById,
+    storeById,
+    floorStoreIdSet,
+    shopNameById,
+  ]);
+
+  const kpis = useMemo(() => {
+    let addedUnits = 0;
+    let deductedUnits = 0;
+    let totalCostImpact = 0;
+    for (const entry of adjustmentEntries) {
+      if (entry.changeQty > 0) addedUnits += entry.changeQty;
+      else deductedUnits += Math.abs(entry.changeQty);
+      totalCostImpact += entry.costValue;
+    }
+    return {
+      count: adjustmentEntries.length,
+      addedUnits,
+      deductedUnits,
+      totalCostImpact,
+    };
+  }, [adjustmentEntries]);
+
+  if (!currentUser) return null;
+  if (!hasAdminAccess(currentUser) && !currentUser.permissions?.canManageInventory) return null;
+
+  const periodActionLabel =
+    period === 'DAY'
+      ? 'Daily'
+      : period === 'WEEK'
+        ? 'Weekly'
+        : period === 'MONTH'
+          ? 'Monthly'
+          : 'Custom';
+
+  const selectedLocationLabel =
+    locationFilter === 'ALL'
+      ? 'All Locations (Shop & Stores)'
+      : locationOptions.find(o => o.key === locationFilter)?.label || 'Selected Location';
+
+  const selectedCategoryLabel =
+    categoryFilter === 'ALL' ? 'All Categories' : categoryFilter;
+
+  const selectedDirectionLabel =
+    directionFilter === 'ALL'
+      ? 'All Directions'
+      : directionFilter === 'IN'
+        ? 'Stock Added (+)'
+        : 'Stock Deducted (-)';
+
+  const buildPdfPayload = (): { rows: AdjustmentPdfRow[]; meta: Parameters<typeof downloadAdjustmentsReportPdf>[2] } => {
+    const activeRange =
+      period === 'CUSTOM' ? { start: startDate, end: endDate } : computeDateRange(period);
+    return {
+      rows: adjustmentEntries.map(e => ({
+        createdAt: e.createdAt,
+        productName: e.productName,
+        sku: e.sku,
+        locationLabel: e.locationLabel,
+        shopName: e.shopName,
+        locationType: e.locationType,
+        type: e.type,
+        previousQty: e.previousQty,
+        changeQty: e.changeQty,
+        newQty: e.newQty,
+        unit: e.unit,
+        costValue: e.costValue,
+        reason: e.reason,
+        userName: e.userName,
+      })),
+      meta: {
+        period,
+        startDate: activeRange?.start || startDate,
+        endDate: activeRange?.end || endDate,
+        locationLabel: selectedLocationLabel,
+        categoryLabel: selectedCategoryLabel,
+        directionLabel: selectedDirectionLabel,
+        searchQuery: searchQuery.trim() || undefined,
+        preparedBy: currentUser.name,
+      },
+    };
+  };
+
+  const handleDownloadPdf = async () => {
+    if (isDownloadingPdf) return;
+    setIsDownloadingPdf(true);
+    try {
+      const { rows, meta } = buildPdfPayload();
+      const ok = await downloadAdjustmentsReportPdf(rows, settings, meta);
+      if (ok) {
+        addToast({
+          type: 'success',
+          title: `${periodActionLabel} Adjustment PDF Downloaded`,
+          description: `Saved ${rows.length} adjustment record(s) (${meta.startDate} to ${meta.endDate}).`,
+        });
+      } else {
+        addToast({
+          type: 'error',
+          title: 'PDF Export Failed',
+          description: 'Could not save the Stock Adjustment PDF on this device.',
+        });
+      }
+    } finally {
+      setIsDownloadingPdf(false);
+    }
+  };
+
+  const handlePrintPdf = async () => {
+    if (isPrintingPdf) return;
+    setIsPrintingPdf(true);
+    try {
+      const { rows, meta } = buildPdfPayload();
+      const res = await printAdjustmentsReportPdf(rows, settings, meta);
+      if (res.ok) {
+        addToast({
+          type: 'success',
+          title:
+            res.mode === 'fallback_download'
+              ? `Opened ${periodActionLabel} Adjustment PDF`
+              : 'Print Dialog Opened',
+          description:
+            res.mode === 'fallback_download'
+              ? 'Use the printer icon in your PDF viewer to print.'
+              : `Ready to print ${periodActionLabel} Stock Adjustment Report (${rows.length} record(s)).`,
+        });
+      } else {
+        addToast({
+          type: 'error',
+          title: 'Print Failed',
+          description: res.error || 'Could not open print dialog on this device.',
+        });
+      }
+    } finally {
+      setIsPrintingPdf(false);
+    }
+  };
+
+  const visibleEntries = adjustmentEntries.slice(0, visibleCount);
+  const hasMore = adjustmentEntries.length > visibleCount;
+
+  const cleanDisplayReason = (raw: string) =>
+    raw.replace(/\s*\[[^\]]+\]\s*$/g, '').trim() || 'Stock adjustment';
+
+  const getTypeBadgeClass = (type: string) => {
+    if (['DAMAGED', 'BROKEN', 'EXPIRED', 'LOST'].includes(type)) {
+      return 'bg-rose-500/15 text-rose-300 border-rose-500/30';
+    }
+    if (type === 'CORRECTION') {
+      return 'bg-amber-500/15 text-amber-300 border-amber-500/30';
+    }
+    return 'bg-cyan-500/15 text-cyan-300 border-cyan-500/30';
+  };
+
+  return (
+    <div id="admin-adjustment-list-view" className="flex-1 overflow-y-auto p-4 lg:p-6 space-y-5">
+      {/* Header & Print / PDF Controls */}
+      <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+        <div>
+          <h1 className="text-xl lg:text-2xl font-bold text-white flex items-center gap-2.5">
+            <ClipboardList className="w-6 h-6 text-cyan-400 shrink-0" />
+            <span>Adjustment List</span>
+          </h1>
+          <p className="text-xs sm:text-sm text-slate-400 mt-0.5">
+            Review, filter, print, and download Daily, Weekly, Monthly, or Custom Stock Adjustment reports.
+          </p>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            onClick={() => openInventoryFilter('ADJUST')}
+            className="px-3 py-2 rounded-xl bg-amber-600 hover:bg-amber-500 text-white text-xs font-bold flex items-center gap-1.5 shadow-sm transition-colors"
+          >
+            <SlidersHorizontal className="w-3.5 h-3.5" />
+            Adjust Inventory
+          </button>
+
+          <button
+            type="button"
+            onClick={handlePrintPdf}
+            disabled={isPrintingPdf}
+            className="px-3.5 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-white border border-slate-700 text-xs font-bold flex items-center gap-1.5 transition-colors"
+          >
+            {isPrintingPdf ? (
+              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+            ) : (
+              <Printer className="w-3.5 h-3.5 text-cyan-400" />
+            )}
+            <span>Print {periodActionLabel}</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={handleDownloadPdf}
+            disabled={isDownloadingPdf}
+            className="px-3.5 py-2 rounded-xl bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white text-xs font-bold flex items-center gap-1.5 shadow-sm transition-colors"
+          >
+            {isDownloadingPdf ? (
+              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+            ) : (
+              <Download className="w-3.5 h-3.5" />
+            )}
+            <span>Download {periodActionLabel} PDF</span>
+          </button>
+        </div>
+      </div>
+
+      {/* Period Preset Selector + Filters */}
+      <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 space-y-3.5 shadow-lg">
+        {/* Period Pills */}
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+          <div className="flex items-center gap-1.5 flex-wrap">
+            {(
+              [
+                { key: 'DAY', label: 'Day (Today)' },
+                { key: 'WEEK', label: 'Week (7 Days)' },
+                { key: 'MONTH', label: 'Month' },
+                { key: 'CUSTOM', label: 'Custom' },
+              ] as { key: AdjustmentReportPeriod; label: string }[]
+            ).map(p => (
+              <button
+                key={p.key}
+                type="button"
+                onClick={() => setPeriod(p.key)}
+                className={`px-3.5 py-2 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 ${
+                  period === p.key
+                    ? 'bg-cyan-600 text-white shadow-md shadow-cyan-900/30'
+                    : 'bg-slate-950 text-slate-400 hover:text-white border border-slate-800'
+                }`}
+              >
+                <Calendar className="w-3.5 h-3.5" />
+                {p.label}
+              </button>
+            ))}
+          </div>
+
+          <div className="text-xs text-slate-400 font-medium">
+            Active Report:{' '}
+            <span className="text-cyan-300 font-bold">
+              {periodActionLabel} ({startDate === endDate ? startDate : `${startDate} to ${endDate}`})
+            </span>
+          </div>
+        </div>
+
+        {/* Custom Date Range Pickers */}
+        {period === 'CUSTOM' && (
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-2 border-t border-slate-800/80">
+            <div>
+              <label className="block text-[11px] font-bold uppercase text-slate-400 mb-1">
+                From Date
+              </label>
+              <input
+                type="date"
+                value={startDate}
+                onChange={e => setStartDate(e.target.value)}
+                className="w-full px-3 py-2 bg-slate-950 border border-slate-700 rounded-xl text-xs text-white focus:outline-none focus:border-cyan-500"
+              />
+            </div>
+            <div>
+              <label className="block text-[11px] font-bold uppercase text-slate-400 mb-1">
+                To Date
+              </label>
+              <input
+                type="date"
+                value={endDate}
+                onChange={e => setEndDate(e.target.value)}
+                className="w-full px-3 py-2 bg-slate-950 border border-slate-700 rounded-xl text-xs text-white focus:outline-none focus:border-cyan-500"
+              />
+            </div>
+          </div>
+        )}
+
+        {/* Search & Filter Selects */}
+        <div className="grid grid-cols-1 md:grid-cols-4 gap-3 pt-2 border-t border-slate-800/80">
+          <div className="relative md:col-span-1">
+            <Search className="w-4 h-4 text-slate-500 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+            <input
+              type="text"
+              value={searchQuery}
+              onChange={e => setSearchQuery(e.target.value)}
+              placeholder="Search product, reason, staff..."
+              className="w-full pl-9 pr-8 py-2 bg-slate-950 border border-slate-800 rounded-xl text-xs text-white placeholder-slate-500 focus:outline-none focus:border-cyan-500"
+            />
+            {searchQuery && (
+              <button
+                type="button"
+                onClick={() => setSearchQuery('')}
+                className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-white"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            )}
+          </div>
+
+          <select
+            value={locationFilter}
+            onChange={e => setLocationFilter(e.target.value)}
+            className="px-3 py-2 bg-slate-950 border border-slate-800 rounded-xl text-xs text-white focus:outline-none focus:border-cyan-500"
+          >
+            <option value="ALL">All Locations (Shop & Stores)</option>
+            {locationOptions.map(opt => (
+              <option key={opt.key} value={opt.key}>
+                {opt.label}
+              </option>
+            ))}
+          </select>
+
+          <select
+            value={categoryFilter}
+            onChange={e => setCategoryFilter(e.target.value)}
+            className="px-3 py-2 bg-slate-950 border border-slate-800 rounded-xl text-xs text-white focus:outline-none focus:border-cyan-500"
+          >
+            <option value="ALL">All Categories</option>
+            <option value="CORRECTION">Correction</option>
+            <option value="ADJUSTMENT">Manual Adjustment</option>
+            <option value="DAMAGED">Damaged</option>
+            <option value="BROKEN">Broken</option>
+            <option value="EXPIRED">Expired</option>
+            <option value="LOST">Lost / Missing</option>
+          </select>
+
+          <select
+            value={directionFilter}
+            onChange={e => setDirectionFilter(e.target.value as 'ALL' | 'IN' | 'OUT')}
+            className="px-3 py-2 bg-slate-950 border border-slate-800 rounded-xl text-xs text-white focus:outline-none focus:border-cyan-500"
+          >
+            <option value="ALL">All Directions (+ & -)</option>
+            <option value="IN">Stock Added (+) Only</option>
+            <option value="OUT">Stock Deducted (-) Only</option>
+          </select>
+        </div>
+      </div>
+
+      {/* KPI Summary Cards */}
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+        <div className="bg-slate-900 border border-slate-800 rounded-2xl p-3.5">
+          <div className="flex items-center justify-between text-slate-400 text-[11px] font-bold uppercase">
+            <span>Adjustments</span>
+            <ClipboardList className="w-4 h-4 text-cyan-400" />
+          </div>
+          <div className="text-xl font-extrabold text-white mt-1.5">
+            {kpis.count.toLocaleString()}
+          </div>
+          <div className="text-[11px] text-slate-500 mt-0.5">{periodActionLabel} period</div>
+        </div>
+
+        <div className="bg-slate-900 border border-slate-800 rounded-2xl p-3.5">
+          <div className="flex items-center justify-between text-slate-400 text-[11px] font-bold uppercase">
+            <span>Stock Added</span>
+            <TrendingUp className="w-4 h-4 text-emerald-400" />
+          </div>
+          <div className="text-xl font-extrabold text-emerald-400 mt-1.5">
+            +{kpis.addedUnits.toLocaleString()}
+          </div>
+          <div className="text-[11px] text-slate-500 mt-0.5">Total units increased</div>
+        </div>
+
+        <div className="bg-slate-900 border border-slate-800 rounded-2xl p-3.5">
+          <div className="flex items-center justify-between text-slate-400 text-[11px] font-bold uppercase">
+            <span>Stock Deducted</span>
+            <TrendingDown className="w-4 h-4 text-rose-400" />
+          </div>
+          <div className="text-xl font-extrabold text-rose-400 mt-1.5">
+            -{kpis.deductedUnits.toLocaleString()}
+          </div>
+          <div className="text-[11px] text-slate-500 mt-0.5">Total units reduced</div>
+        </div>
+
+        <div className="bg-slate-900 border border-slate-800 rounded-2xl p-3.5">
+          <div className="flex items-center justify-between text-slate-400 text-[11px] font-bold uppercase">
+            <span>Cost Impact</span>
+            <DollarSign className="w-4 h-4 text-violet-400" />
+          </div>
+          <div className="text-lg sm:text-xl font-extrabold text-violet-300 mt-1.5 truncate">
+            {formatCurrency(kpis.totalCostImpact, symbol)}
+          </div>
+          <div className="text-[11px] text-slate-500 mt-0.5">Purchase cost valuation</div>
+        </div>
+      </div>
+
+      {/* Adjustment History Table & Mobile Cards */}
+      <div className="bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden shadow-lg">
+        {adjustmentEntries.length === 0 ? (
+          <div className="p-10 text-center space-y-2">
+            <ClipboardList className="w-10 h-10 text-slate-700 mx-auto" />
+            <p className="text-sm font-semibold text-slate-300">
+              No stock adjustments found for this period
+            </p>
+            <p className="text-xs text-slate-500">
+              Try switching to Week, Month, or Custom date range, or record a new adjustment.
+            </p>
+          </div>
+        ) : (
+          <>
+            {/* Desktop Table */}
+            <div className="hidden lg:block overflow-x-auto">
+              <table className="w-full text-left border-collapse">
+                <thead>
+                  <tr className="bg-slate-950/70 border-b border-slate-800 text-[11px] uppercase tracking-wider text-slate-400">
+                    <th className="py-3 px-3 w-10 text-center">#</th>
+                    <th className="py-3 px-3">Date & Time</th>
+                    <th className="py-3 px-3">Product</th>
+                    <th className="py-3 px-3">Location</th>
+                    <th className="py-3 px-3 text-center">Category</th>
+                    <th className="py-3 px-3 text-center">Before → After</th>
+                    <th className="py-3 px-3 text-right">Change</th>
+                    <th className="py-3 px-3 text-right">Cost Impact</th>
+                    <th className="py-3 px-3">Reason & By</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-800/70 text-xs">
+                  {visibleEntries.map((entry, idx) => (
+                    <tr key={entry.id} className="hover:bg-slate-800/30 transition-colors">
+                      <td className="py-3 px-3 text-center text-slate-500 font-semibold">
+                        {idx + 1}
+                      </td>
+                      <td className="py-3 px-3 text-slate-300 whitespace-nowrap">
+                        {formatDateTime(entry.createdAt)}
+                      </td>
+                      <td className="py-3 px-3">
+                        <div className="font-bold text-white">{entry.productName}</div>
+                        {entry.sku && (
+                          <div className="text-[11px] text-slate-500">SKU: {entry.sku}</div>
+                        )}
+                      </td>
+                      <td className="py-3 px-3">
+                        <span
+                          className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-lg text-[11px] font-semibold border ${
+                            entry.locationType === 'STORE'
+                              ? 'bg-indigo-500/15 text-indigo-300 border-indigo-500/30'
+                              : 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
+                          }`}
+                        >
+                          {entry.locationType === 'STORE' ? (
+                            <Warehouse className="w-3 h-3 shrink-0" />
+                          ) : (
+                            <Store className="w-3 h-3 shrink-0" />
+                          )}
+                          <span>{entry.locationLabel}</span>
+                        </span>
+                        {entry.locationType === 'STORE' && (
+                          <div className="text-[10px] text-slate-500 mt-0.5">{entry.shopName}</div>
+                        )}
+                      </td>
+                      <td className="py-3 px-3 text-center">
+                        <span
+                          className={`inline-flex px-2 py-0.5 rounded-lg text-[10px] font-bold border ${getTypeBadgeClass(
+                            entry.type
+                          )}`}
+                        >
+                          {entry.type}
+                        </span>
+                      </td>
+                      <td className="py-3 px-3 text-center text-slate-300 font-medium whitespace-nowrap">
+                        {entry.previousQty} → <strong className="text-white">{entry.newQty}</strong>{' '}
+                        <span className="text-slate-500">{entry.unit}</span>
+                      </td>
+                      <td className="py-3 px-3 text-right whitespace-nowrap">
+                        <span
+                          className={`font-extrabold ${
+                            entry.changeQty > 0 ? 'text-emerald-400' : 'text-rose-400'
+                          }`}
+                        >
+                          {entry.changeQty > 0 ? `+${entry.changeQty}` : entry.changeQty}
+                        </span>
+                      </td>
+                      <td className="py-3 px-3 text-right font-semibold text-slate-200 whitespace-nowrap">
+                        {formatCurrency(entry.costValue, symbol)}
+                      </td>
+                      <td className="py-3 px-3">
+                        <div className="text-slate-200 line-clamp-2">
+                          {cleanDisplayReason(entry.reason)}
+                        </div>
+                        <div className="text-[11px] text-slate-500 mt-0.5">
+                          By: {entry.userName}
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            {/* Mobile / Tablet Cards */}
+            <div className="lg:hidden divide-y divide-slate-800/80">
+              {visibleEntries.map((entry, idx) => (
+                <div key={entry.id} className="p-3.5 space-y-2">
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="min-w-0">
+                      <div className="text-xs font-bold text-white">
+                        {idx + 1}. {entry.productName}
+                      </div>
+                      <div className="text-[11px] text-slate-400">
+                        {formatDateTime(entry.createdAt)} • By {entry.userName}
+                      </div>
+                    </div>
+                    <span
+                      className={`text-sm font-extrabold shrink-0 ${
+                        entry.changeQty > 0 ? 'text-emerald-400' : 'text-rose-400'
+                      }`}
+                    >
+                      {entry.changeQty > 0 ? `+${entry.changeQty}` : entry.changeQty}
+                    </span>
+                  </div>
+
+                  <div className="flex items-center gap-1.5 flex-wrap">
+                    <span
+                      className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-lg text-[10px] font-semibold border ${
+                        entry.locationType === 'STORE'
+                          ? 'bg-indigo-500/15 text-indigo-300 border-indigo-500/30'
+                          : 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
+                      }`}
+                    >
+                      {entry.locationType === 'STORE' ? (
+                        <Warehouse className="w-3 h-3" />
+                      ) : (
+                        <Store className="w-3 h-3" />
+                      )}
+                      {entry.locationLabel}
+                    </span>
+                    <span
+                      className={`px-2 py-0.5 rounded-lg text-[10px] font-bold border ${getTypeBadgeClass(
+                        entry.type
+                      )}`}
+                    >
+                      {entry.type}
+                    </span>
+                    <span className="text-[11px] text-slate-300 font-medium">
+                      {entry.previousQty} → <strong className="text-white">{entry.newQty}</strong>{' '}
+                      {entry.unit}
+                    </span>
+                  </div>
+
+                  <div className="flex items-center justify-between gap-2 text-[11px] text-slate-400 pt-0.5">
+                    <span className="truncate">{cleanDisplayReason(entry.reason)}</span>
+                    <span className="font-semibold text-slate-200 shrink-0">
+                      {formatCurrency(entry.costValue, symbol)}
+                    </span>
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            {hasMore && (
+              <div className="p-3 border-t border-slate-800 bg-slate-950/50 text-center">
+                <button
+                  type="button"
+                  onClick={() => setVisibleCount(c => c + PAGE_SIZE)}
+                  className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-bold inline-flex items-center gap-1.5 transition-colors"
+                >
+                  <ChevronDown className="w-4 h-4" />
+                  Load More ({adjustmentEntries.length - visibleCount} remaining)
+                </button>
+              </div>
+            )}
+          </>
+        )}
+      </div>
+    </div>
+  );
+};

@@ -711,7 +711,7 @@ export const AdminSales: React.FC = () => {
       return Math.max(0, Number(p.currentStock) || 0);
     };
 
-    const agg = new Map<string, SoldProductSummaryRow & { _soldOrder: number }>();
+    const agg = new Map<string, SoldProductSummaryRow>();
     for (const sale of sales) {
       if (sale.status !== 'COMPLETED') continue;
       for (const item of sale.items || []) {
@@ -721,10 +721,7 @@ export const AdminSales: React.FC = () => {
         const key =
           item.productId ||
           `${sale.shopId || ''}::${(item.productName || '').trim().toLowerCase()}`;
-        const existing = agg.get(key);
-        if (existing) {
-          existing._soldOrder += qty;
-        } else {
+        if (!agg.has(key)) {
           const baseName = (matchedProd?.name || item.productName || 'Unnamed Product').trim();
           const fullName =
             matchedProd?.variation && !baseName.toLowerCase().includes(matchedProd.variation.toLowerCase())
@@ -734,15 +731,14 @@ export const AdminSales: React.FC = () => {
             productName: fullName,
             totalRemained: getRemainingShopQty(item.productId),
             unit: matchedProd?.unit,
-            _soldOrder: qty,
           });
         }
       }
     }
 
-    return Array.from(agg.values())
-      .sort((a, b) => b._soldOrder - a._soldOrder || a.productName.localeCompare(b.productName))
-      .map(({ _soldOrder: _ignored, ...row }) => row);
+    return Array.from(agg.values()).sort((a, b) =>
+      a.productName.localeCompare(b.productName, undefined, { sensitivity: 'base' })
+    );
   })();
 
   const buildSoldProductsPdfMeta = () => ({

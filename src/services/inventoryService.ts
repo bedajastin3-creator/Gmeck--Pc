@@ -22,7 +22,7 @@ export class InventoryService {
     reason: string,
     currentUser: User,
     movementType: MovementType = 'ADJUSTMENT',
-    options?: { targetLocation?: 'SHOP' | string }
+    options?: { targetLocation?: 'SHOP' | string } | string
   ): { success: boolean; error?: string; lossValue?: number } {
     if (!hasAdminAccess(currentUser) && !currentUser.permissions?.canManageInventory) {
       return { success: false, error: 'Permission Denied: You do not have permission to adjust stock levels.' };
@@ -48,7 +48,8 @@ export class InventoryService {
     const allStores = db.getStores();
     const shop = db.getShops().find(s => s.id === prod.shopId);
     const floorStoreIds = new Set(allStores.filter(s => s.isShopFloor).map(s => s.id));
-    const requestedLocation = options?.targetLocation?.trim();
+    const requestedLocation =
+      typeof options === 'string' ? options.trim() : options?.targetLocation?.trim();
     const targetStore =
       requestedLocation && requestedLocation !== 'SHOP' && !floorStoreIds.has(requestedLocation)
         ? allStores.find(s => s.id === requestedLocation && s.shopId === prod.shopId && !s.isShopFloor)

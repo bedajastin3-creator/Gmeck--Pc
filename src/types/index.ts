@@ -151,6 +151,7 @@ export type StockTransferStatus = 'COMPLETED' | 'NOT_COMPLETED';
 export interface StockTransferItem {
   id?: string;
   productId: string;
+  destProductId?: string;
   productName: string;
   variation?: string;
   sku?: string;

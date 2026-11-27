@@ -996,7 +996,7 @@ function buildSalesReportDoc(
 
   const productById = new Map<string, Product>((meta.products || []).map(p => [p.id, p]));
 
-  interface ProductSalesRow {
+  interface SoldItemEntryRow {
     productName: string;
     qtySold: number;
     unit?: string;
@@ -1004,7 +1004,7 @@ function buildSalesReportDoc(
     totalProfit: number;
   }
 
-  const productAgg = new Map<string, ProductSalesRow>();
+  const saleItemRows: SoldItemEntryRow[] = [];
   let computedSalesSum = 0;
   let computedProfitSum = 0;
 
@@ -1034,32 +1034,17 @@ function buildSalesReportDoc(
       computedSalesSum += itemRev;
       computedProfitSum += itemProfit;
 
-      const key = item.productId || fullName.toLowerCase();
-      const existing = productAgg.get(key);
-      if (existing) {
-        existing.qtySold += qty;
-        existing.totalSales += itemRev;
-        existing.totalProfit += itemProfit;
-      } else {
-        productAgg.set(key, {
-          productName: fullName,
-          qtySold: qty,
-          unit: matchedProd?.unit,
-          totalSales: itemRev,
-          totalProfit: itemProfit,
-        });
-      }
+      saleItemRows.push({
+        productName: fullName,
+        qtySold: qty,
+        unit: matchedProd?.unit,
+        totalSales: itemRev,
+        totalProfit: itemProfit,
+      });
     }
   }
 
-  const productRows = Array.from(productAgg.values()).sort(
-    (a, b) =>
-      b.totalSales - a.totalSales ||
-      b.qtySold - a.qtySold ||
-      a.productName.localeCompare(b.productName)
-  );
-
-  const totalUnitsSold = productRows.reduce((s, r) => s + r.qtySold, 0);
+  const totalUnitsSold = saleItemRows.reduce((s, r) => s + r.qtySold, 0);
   const displayTotalRevenue =
     Number.isFinite(meta.totalRevenue) && (meta.totalRevenue > 0 || computedSalesSum === 0)
       ? meta.totalRevenue
@@ -1073,7 +1058,7 @@ function buildSalesReportDoc(
   const y0 = doc.getY();
   doc.drawRect(doc.marginLeft, y0 - 40, doc.contentWidth, 44, [0.95, 0.97, 0.99]);
   doc.drawText(
-    `Products Sold: ${productRows.length}   |   Total Qty: ${Number(totalUnitsSold.toFixed(3)).toLocaleString()}`,
+    `Items Sold: ${saleItemRows.length}   |   Total Qty: ${Number(totalUnitsSold.toFixed(3)).toLocaleString()}`,
     doc.marginLeft + 10,
     y0 - 12,
     8.5,
@@ -1139,7 +1124,7 @@ function buildSalesReportDoc(
 
   drawHeader();
 
-  if (productRows.length === 0) {
+  if (saleItemRows.length === 0) {
     doc.drawText(
       'No sold products recorded for the selected period/filters.',
       doc.marginLeft + 10,
@@ -1149,7 +1134,7 @@ function buildSalesReportDoc(
       [0.45, 0.5, 0.6]
     );
   } else {
-    productRows.forEach((row, idx) => {
+    saleItemRows.forEach((row, idx) => {
       doc.ensureSpace(24, drawHeader);
       const y = doc.getY();
       const rowTop = y + 9;
@@ -1189,45 +1174,6 @@ function buildSalesReportDoc(
       doc.drawLine(tableLeftX, rowBottom, tableRightX, rowBottom, 0.5, [0.86, 0.89, 0.93]);
       doc.advanceY(5);
     });
-
-    // Clean Totals Footer Row
-    doc.ensureSpace(26, drawHeader);
-    const totalRowTop = doc.getY() + 8;
-    const totalRowBottom = doc.getY() - 12;
-    doc.drawRect(tableLeftX, totalRowBottom, doc.contentWidth, 20, [0.94, 0.96, 0.99]);
-    for (const dx of colDividers) {
-      doc.drawLine(dx, totalRowBottom, dx, totalRowTop, 0.6, [0.78, 0.82, 0.88]);
-    }
-    doc.drawLine(tableLeftX, totalRowTop, tableRightX, totalRowTop, 0.7, [0.72, 0.78, 0.86]);
-    doc.drawLine(tableLeftX, totalRowBottom, tableRightX, totalRowBottom, 0.7, [0.72, 0.78, 0.86]);
-
-    const yTotal = doc.getY() - 5;
-    doc.drawText('TOTAL', colNumEnd + 8, yTotal, 8.2, true, [0.12, 0.25, 0.5]);
-    doc.drawRightText(
-      Number(totalUnitsSold.toFixed(3)).toLocaleString(),
-      colQtyEnd - 8,
-      yTotal,
-      8.2,
-      true,
-      [0.15, 0.38, 0.72]
-    );
-    doc.drawRightText(
-      formatCurrency(displayTotalRevenue, cur),
-      colSalesEnd - 8,
-      yTotal,
-      8.4,
-      true,
-      [0.12, 0.25, 0.5]
-    );
-    doc.drawRightText(
-      `${displayTotalProfit >= 0 ? '+' : ''}${formatCurrency(displayTotalProfit, cur)}`,
-      tableRightX - 8,
-      yTotal,
-      8.4,
-      true,
-      displayTotalProfit >= 0 ? [0.02, 0.52, 0.35] : [0.75, 0.15, 0.22]
-    );
-    doc.advanceY(20);
   }
 
   const dateTag =
@@ -2090,7 +2036,10 @@ function buildSoldProductsSummaryDoc(
       [0.45, 0.5, 0.6]
     );
   } else {
-    rows.forEach((row, idx) => {
+    const sortedRows = [...rows].sort((a, b) =>
+      (a.productName || '').localeCompare(b.productName || '', undefined, { sensitivity: 'base' })
+    );
+    sortedRows.forEach((row, idx) => {
       doc.ensureSpace(22, drawHeader);
       const y = doc.getY();
       const rowTop = y + 9;
@@ -2184,6 +2133,234 @@ export async function printSoldProductsSummaryPdf(
     return {
       ok: false,
       error: err?.message || 'Failed to prepare sold products summary for printing.',
+    };
+  }
+}
+
+export type AdjustmentReportPeriod = 'DAY' | 'WEEK' | 'MONTH' | 'CUSTOM';
+
+export interface AdjustmentPdfRow {
+  createdAt: string;
+  productName: string;
+  sku?: string;
+  locationLabel: string;
+  shopName?: string;
+  locationType: 'SHOP' | 'STORE';
+  type: string;
+  previousQty: number;
+  changeQty: number;
+  newQty: number;
+  unit?: string;
+  costValue: number;
+  reason: string;
+  userName: string;
+}
+
+export interface AdjustmentReportPdfMeta {
+  period: AdjustmentReportPeriod;
+  startDate: string;
+  endDate: string;
+  locationLabel: string;
+  categoryLabel: string;
+  directionLabel: string;
+  searchQuery?: string;
+  preparedBy?: string;
+}
+
+function buildAdjustmentsReportDoc(
+  rows: AdjustmentPdfRow[],
+  settings: BusinessSettings,
+  meta: AdjustmentReportPdfMeta
+) {
+  const doc = createPdfBuilder();
+  const cur = settings.currencySymbol || 'TSh';
+  const periodTitle =
+    meta.period === 'DAY'
+      ? 'DAILY'
+      : meta.period === 'WEEK'
+        ? 'WEEKLY'
+        : meta.period === 'MONTH'
+          ? 'MONTHLY'
+          : 'CUSTOM';
+  const dateRangeText =
+    meta.startDate === meta.endDate
+      ? meta.startDate
+      : `${meta.startDate || '...'} to ${meta.endDate || '...'}`;
+
+  doc.drawBanner(
+    settings,
+    'STOCK ADJUSTMENTS REPORT',
+    `${periodTitle} | ${meta.locationLabel}`,
+    `Period: ${dateRangeText}`
+  );
+
+  const totalAdded = rows.reduce((s, r) => (r.changeQty > 0 ? s + r.changeQty : s), 0);
+  const totalDeducted = rows.reduce(
+    (s, r) => (r.changeQty < 0 ? s + Math.abs(r.changeQty) : s),
+    0
+  );
+  const totalCost = rows.reduce((s, r) => s + (Number(r.costValue) || 0), 0);
+
+  const y0 = doc.getY();
+  doc.drawRect(doc.marginLeft, y0 - 44, doc.contentWidth, 48, [0.95, 0.97, 0.99]);
+  doc.drawText(
+    `Records: ${rows.length}   |   Added (+): +${totalAdded.toLocaleString()}   |   Deducted (-): -${totalDeducted.toLocaleString()}`,
+    doc.marginLeft + 10,
+    y0 - 13,
+    8.5,
+    true,
+    [0.12, 0.25, 0.5]
+  );
+  const filterParts = [
+    `Location: ${meta.locationLabel}`,
+    `Category: ${meta.categoryLabel}`,
+    `Direction: ${meta.directionLabel}`,
+    meta.searchQuery ? `Search: "${meta.searchQuery}"` : null,
+  ]
+    .filter(Boolean)
+    .join('  |  ');
+  doc.drawText(
+    truncate(filterParts, 78),
+    doc.marginLeft + 10,
+    y0 - 27,
+    7.5,
+    false,
+    [0.35, 0.4, 0.5]
+  );
+  doc.drawText(
+    truncate(`Prepared By: ${meta.preparedBy || 'Admin'}`, 45),
+    doc.marginLeft + 10,
+    y0 - 39,
+    7.3,
+    false,
+    [0.45, 0.5, 0.6]
+  );
+  doc.drawRightText(
+    `Total Cost Impact: ${formatCurrency(totalCost, cur)}`,
+    doc.pageWidth - doc.marginRight - 10,
+    y0 - 20,
+    8.8,
+    true,
+    [0.42, 0.22, 0.65]
+  );
+  doc.advanceY(58);
+
+  const drawHeader = () => {
+    doc.drawRect(doc.marginLeft, doc.getY() - 15, doc.contentWidth, 18, [0.12, 0.16, 0.24]);
+    const yH = doc.getY() - 9;
+    doc.drawText('DATE / BY', doc.marginLeft + 6, yH, 7.2, true, [1, 1, 1]);
+    doc.drawText('PRODUCT', doc.marginLeft + 92, yH, 7.2, true, [1, 1, 1]);
+    doc.drawText('LOCATION', doc.marginLeft + 216, yH, 7.2, true, [1, 1, 1]);
+    doc.drawText('TYPE', doc.marginLeft + 296, yH, 7.2, true, [1, 1, 1]);
+    doc.drawText('BEFORE -> AFTER', doc.marginLeft + 356, yH, 7.2, true, [1, 1, 1]);
+    doc.drawRightText('COST IMPACT', doc.pageWidth - doc.marginRight - 6, yH, 7.2, true, [1, 1, 1]);
+    doc.advanceY(22);
+  };
+
+  drawHeader();
+
+  if (rows.length === 0) {
+    doc.drawText(
+      'No stock adjustments matched the selected period and filters.',
+      doc.marginLeft + 10,
+      doc.getY(),
+      9,
+      false,
+      [0.45, 0.5, 0.6]
+    );
+  } else {
+    rows.forEach(row => {
+      doc.ensureSpace(32, drawHeader);
+      const y = doc.getY();
+      const dateStr = formatDateTime(row.createdAt);
+      const cleanReason =
+        (row.reason || '').replace(/\s*\[[^\]]+\]\s*$/g, '').trim() || 'Stock adjustment';
+      const deltaStr = row.changeQty > 0 ? `+${row.changeQty}` : `${row.changeQty}`;
+      const qtyLine = `${row.previousQty} -> ${row.newQty} (${deltaStr})`;
+      const isPositive = row.changeQty > 0;
+
+      doc.drawText(truncate(dateStr, 17), doc.marginLeft + 6, y, 7.3, false, [0.35, 0.4, 0.5]);
+      doc.drawText(truncate(row.userName || 'Staff', 17), doc.marginLeft + 6, y - 10, 7, false, [0.5, 0.55, 0.65]);
+
+      doc.drawText(truncate(row.productName || 'Product', 24), doc.marginLeft + 92, y, 8, true);
+      doc.drawText(truncate(cleanReason, 28), doc.marginLeft + 92, y - 10, 6.8, false, [0.45, 0.5, 0.6]);
+
+      doc.drawText(truncate(row.locationLabel || 'Shop', 16), doc.marginLeft + 216, y, 7.6, true);
+      if (row.locationType === 'STORE' && row.shopName) {
+        doc.drawText(truncate(row.shopName, 16), doc.marginLeft + 216, y - 10, 6.8, false, [0.45, 0.5, 0.6]);
+      } else {
+        doc.drawText(row.locationType, doc.marginLeft + 216, y - 10, 6.8, false, [0.45, 0.5, 0.6]);
+      }
+
+      doc.drawText(truncate(row.type, 11), doc.marginLeft + 296, y, 7.4, true, [0.25, 0.3, 0.4]);
+      doc.drawText(
+        truncate(qtyLine, 20),
+        doc.marginLeft + 356,
+        y,
+        7.8,
+        true,
+        isPositive ? [0.02, 0.52, 0.35] : [0.75, 0.15, 0.22]
+      );
+      doc.drawText(truncate(row.unit || 'pcs', 12), doc.marginLeft + 356, y - 10, 6.8, false, [0.45, 0.5, 0.6]);
+
+      doc.drawRightText(
+        formatCurrency(row.costValue || 0, cur),
+        doc.pageWidth - doc.marginRight - 6,
+        y,
+        8,
+        true
+      );
+
+      doc.advanceY(20);
+      doc.drawLine(
+        doc.marginLeft,
+        doc.getY() + 3,
+        doc.pageWidth - doc.marginRight,
+        doc.getY() + 3,
+        0.4,
+        [0.9, 0.92, 0.95]
+      );
+      doc.advanceY(6);
+    });
+  }
+
+  const dateTag =
+    meta.startDate && meta.endDate
+      ? meta.startDate === meta.endDate
+        ? meta.startDate
+        : `${meta.startDate}_to_${meta.endDate}`
+      : new Date().toISOString().slice(0, 10);
+  const fileName = `stock_adjustments_${meta.period.toLowerCase()}_${dateTag}.pdf`;
+  return { doc, fileName };
+}
+
+export async function downloadAdjustmentsReportPdf(
+  rows: AdjustmentPdfRow[],
+  settings: BusinessSettings,
+  meta: AdjustmentReportPdfMeta
+): Promise<boolean> {
+  try {
+    const { doc, fileName } = buildAdjustmentsReportDoc(rows, settings, meta);
+    return doc.download(fileName);
+  } catch (err) {
+    console.error('[pdfExport] downloadAdjustmentsReportPdf failed:', err);
+    return false;
+  }
+}
+
+export async function printAdjustmentsReportPdf(
+  rows: AdjustmentPdfRow[],
+  settings: BusinessSettings,
+  meta: AdjustmentReportPdfMeta
+): Promise<PdfPrintResult> {
+  try {
+    const { doc, fileName } = buildAdjustmentsReportDoc(rows, settings, meta);
+    return await doc.print(fileName);
+  } catch (err: any) {
+    console.error('[pdfExport] printAdjustmentsReportPdf failed:', err);
+    return {
+      ok: false,
+      error: err?.message || 'Failed to prepare stock adjustment report for printing.',
     };
   }
 }

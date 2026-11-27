@@ -1,0 +1,1316 @@
+import React, { useMemo, useState } from 'react';
+import {
+  SlidersHorizontal,
+  Search,
+  Plus,
+  Trash2,
+  CheckCircle2,
+  AlertTriangle,
+  Store,
+  Warehouse,
+  ClipboardList,
+  Package,
+  X,
+  ArrowRight,
+  RotateCcw,
+} from 'lucide-react';
+import { useApp } from '../../context/AppContext';
+import { InventoryService } from '../../services/inventoryService';
+import { MovementType, Product } from '../../types';
+import { formatCurrency } from '../../utils/formatters';
+import { ProductThumbnail } from '../common/ProductThumbnail';
+import {
+  getAdminManagedShops,
+  hasAdminAccess,
+  isPlatformAdmin,
+  isShopAdmin,
+} from '../../utils/permissions';
+
+type AdjustmentCategory = 'CORRECTION' | 'ADJUSTMENT' | 'DAMAGED' | 'BROKEN' | 'EXPIRED' | 'LOST';
+type AdjustmentMode = 'SET' | 'IN' | 'OUT';
+
+interface LocationChoice {
+  key: string; // 'SHOP:<shopId>' or 'STORE:<storeId>'
+  type: 'SHOP' | 'STORE';
+  shopId: string;
+  shopName: string;
+  storeId?: string;
+  storeName?: string;
+  label: string;
+  shortLabel: string;
+  currentQty: number;
+}
+
+interface BatchAdjustmentRow {
+  rowKey: string; // `${productId}::${locationKey}`
+  productId: string;
+  locationKey: string;
+  mode: AdjustmentMode;
+  qtyInput: string;
+  category: AdjustmentCategory;
+  note: string;
+}
+
+const CATEGORY_OPTIONS: { value: AdjustmentCategory; label: string; short: string; isLoss: boolean }[] = [
+  { value: 'CORRECTION', label: 'Physical Count / Stock Correction', short: 'Correction', isLoss: false },
+  { value: 'ADJUSTMENT', label: 'Manual Stock Adjustment', short: 'Adjustment', isLoss: false },
+  { value: 'DAMAGED', label: 'Damaged Stock', short: 'Damaged', isLoss: true },
+  { value: 'BROKEN', label: 'Broken / Spoiled', short: 'Broken', isLoss: true },
+  { value: 'EXPIRED', label: 'Expired Stock', short: 'Expired', isLoss: true },
+  { value: 'LOST', label: 'Lost / Missing / Theft', short: 'Lost', isLoss: true },
+];
+
+export const AdminAdjustInventory: React.FC = () => {
+  const { currentUser, dbState, addToast, openInventoryFilter } = useApp();
+
+  const [selectedLocationFilter, setSelectedLocationFilter] = useState<string>('ALL');
+  const [batchCategory, setBatchCategory] = useState<AdjustmentCategory>('CORRECTION');
+  const [batchReason, setBatchReason] = useState<string>('');
+  const [searchQuery, setSearchQuery] = useState<string>('');
+  const [rows, setRows] = useState<BatchAdjustmentRow[]>([]);
+  const [formError, setFormError] = useState<string>('');
+  const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
+
+  const platformAdmin = currentUser ? isPlatformAdmin(currentUser) : false;
+  const shopAdmin = currentUser ? isShopAdmin(currentUser) : false;
+  const settings = dbState.settings;
+  const symbol = settings?.currencySymbol || 'TSh';
+
+  const allShops = dbState.shops || [];
+  const visibleShops = useMemo(() => {
+    if (!currentUser) return [];
+    if (platformAdmin) return allShops;
+    if (shopAdmin) return getAdminManagedShops(currentUser, allShops);
+    return allShops.filter(s => (currentUser.assignedShopIds || []).includes(s.id));
+  }, [currentUser, platformAdmin, shopAdmin, allShops]);
+
+  const visibleShopIdSet = useMemo(() => new Set(visibleShops.map(s => s.id)), [visibleShops]);
+  const shopNameById = useMemo(
+    () => new Map(visibleShops.map(s => [s.id, s.name])),
+    [visibleShops]
+  );
+
+  const categoryNameById = useMemo(
+    () => new Map((dbState.categories || []).map(c => [c.id, c.name])),
+    [dbState.categories]
+  );
+
+  const allStores = dbState.stores || [];
+  const warehouseStoresByShop = useMemo(() => {
+    const map = new Map<string, typeof allStores>();
+    for (const st of allStores) {
+      if (st.isShopFloor) continue;
+      if (!platformAdmin && !visibleShopIdSet.has(st.shopId)) continue;
+      const arr = map.get(st.shopId) || [];
+      arr.push(st);
+      map.set(st.shopId, arr);
+    }
+    for (const arr of map.values()) {
+      arr.sort((a, b) => {
+        if (a.status !== b.status) return a.status === 'ACTIVE' ? -1 : 1;
+        return (a.createdAt || '').localeCompare(b.createdAt || '') || a.name.localeCompare(b.name);
+      });
+    }
+    return map;
+  }, [allStores, platformAdmin, visibleShopIdSet]);
+
+  // Unified Business Location filter dropdown (Shop + Stores mixed cleanly per shop)
+  const businessLocationOptions = useMemo(() => {
+    const opts: { key: string; type: 'SHOP' | 'STORE'; shopId: string; storeId?: string; label: string }[] = [];
+    for (const shop of visibleShops) {
+      opts.push({
+        key: `SHOP:${shop.id}`,
+        type: 'SHOP',
+        shopId: shop.id,
+        label: `Shop: ${shop.name}`,
+      });
+      const stores = warehouseStoresByShop.get(shop.id) || [];
+      for (const st of stores) {
+        opts.push({
+          key: `STORE:${st.id}`,
+          type: 'STORE',
+          shopId: shop.id,
+          storeId: st.id,
+          label: `Store: ${st.name} (${shop.name})`,
+        });
+      }
+    }
+    return opts;
+  }, [visibleShops, warehouseStoresByShop]);
+
+  const visibleProducts = useMemo(() => {
+    return (dbState.products || []).filter(
+      p => p.status !== 'INACTIVE' && (platformAdmin || (!!p.shopId && visibleShopIdSet.has(p.shopId)))
+    );
+  }, [dbState.products, platformAdmin, visibleShopIdSet]);
+
+  const productById = useMemo(
+    () => new Map(visibleProducts.map(p => [p.id, p])),
+    [visibleProducts]
+  );
+
+  const floorStoreIdSet = useMemo(
+    () => new Set(allStores.filter(st => st.isShopFloor).map(st => st.id)),
+    [allStores]
+  );
+
+  // Track historical shop-floor & warehouse-store presence so 0-qty products still appear in their actual locations
+  const { shopFloorHistoryProductIds, warehouseHistoryStoreIdsByProduct } = useMemo(() => {
+    const shopHistory = new Set<string>();
+    const storeHistory = new Map<string, Set<string>>();
+
+    const addStoreHist = (pid: string, sid: string) => {
+      let set = storeHistory.get(pid);
+      if (!set) {
+        set = new Set<string>();
+        storeHistory.set(pid, set);
+      }
+      set.add(sid);
+    };
+
+    for (const m of dbState.movements || []) {
+      if (!m.productId) continue;
+      if (m.storeId && !floorStoreIdSet.has(m.storeId)) {
+        if (
+          m.type === 'STORE_TRANSFER' ||
+          m.type === 'INITIAL_STOCK' ||
+          m.type === 'PURCHASE' ||
+          m.type === 'ADJUSTMENT' ||
+          m.type === 'CORRECTION'
+        ) {
+          addStoreHist(m.productId, m.storeId);
+        }
+      } else {
+        shopHistory.add(m.productId);
+      }
+    }
+
+    for (const pur of dbState.purchases || []) {
+      for (const item of pur.items || []) {
+        if (!item.productId) continue;
+        if (pur.storeId && !floorStoreIdSet.has(pur.storeId)) {
+          addStoreHist(item.productId, pur.storeId);
+        } else {
+          shopHistory.add(item.productId);
+        }
+      }
+    }
+
+    for (const tr of dbState.stockTransfers || []) {
+      if (tr.status !== 'COMPLETED') continue;
+      for (const item of tr.items || []) {
+        if (tr.destType === 'SHOP') shopHistory.add(item.destProductId || item.productId);
+        if (tr.sourceType === 'SHOP') shopHistory.add(item.productId);
+        if (tr.destType === 'STORE' && tr.destId && !floorStoreIdSet.has(tr.destId)) {
+          addStoreHist(item.destProductId || item.productId, tr.destId);
+        }
+        if (tr.sourceType === 'STORE' && tr.sourceId && !floorStoreIdSet.has(tr.sourceId)) {
+          addStoreHist(item.productId, tr.sourceId);
+        }
+      }
+    }
+
+    return {
+      shopFloorHistoryProductIds: shopHistory,
+      warehouseHistoryStoreIdsByProduct: storeHistory,
+    };
+  }, [dbState.movements, dbState.purchases, dbState.stockTransfers, floorStoreIdSet]);
+
+  // Resolve exact locations where a product exists (Shop Floor and/or Warehouse Stores, including 0-stock locations)
+  const getLocationsForProduct = (p: Product): LocationChoice[] => {
+    const shopName = shopNameById.get(p.shopId) || 'Shop';
+    const shopStores = warehouseStoresByShop.get(p.shopId) || [];
+    const shopWarehouseIdSet = new Set(shopStores.map(s => s.id));
+
+    const mappedWarehouseSum = Object.entries(p.storeStocks || {}).reduce(
+      (sum, [sid, q]) => (shopWarehouseIdSet.has(sid) ? sum + Math.max(0, Number(q || 0)) : sum),
+      0
+    );
+    const rawStoreStock = Math.max(0, Number(p.storeStock || 0));
+    const historyStores = warehouseHistoryStoreIdsByProduct.get(p.id);
+
+    const warehouseLocations: LocationChoice[] = [];
+    for (const st of shopStores) {
+      const hasStockKey = Boolean(p.storeStocks && st.id in p.storeStocks);
+      const hasDetailKey = Boolean(p.storeDetails && st.id in p.storeDetails);
+      const isPrimaryStore = p.storeId === st.id;
+      const isLegacyFallback =
+        mappedWarehouseSum === 0 &&
+        rawStoreStock > 0 &&
+        ((p.storeId && shopWarehouseIdSet.has(p.storeId) && p.storeId === st.id) ||
+          (!p.storeId && shopStores[0]?.id === st.id));
+      const hasHistoryHere = Boolean(historyStores?.has(st.id));
+      const isExplicitlySelectedFilter = selectedLocationFilter === `STORE:${st.id}`;
+
+      if (
+        !hasStockKey &&
+        !hasDetailKey &&
+        !isPrimaryStore &&
+        !isLegacyFallback &&
+        !hasHistoryHere &&
+        !isExplicitlySelectedFilter
+      ) {
+        continue;
+      }
+
+      const qty = hasStockKey
+        ? Math.max(0, Number(p.storeStocks?.[st.id] || 0))
+        : hasDetailKey
+          ? Math.max(0, Number(p.storeDetails?.[st.id]?.quantity || 0))
+          : isLegacyFallback
+            ? rawStoreStock
+            : 0;
+
+      warehouseLocations.push({
+        key: `STORE:${st.id}`,
+        type: 'STORE',
+        shopId: p.shopId,
+        shopName,
+        storeId: st.id,
+        storeName: st.name,
+        label: `Store: ${st.name} (${shopName})`,
+        shortLabel: `${st.name} (Store)`,
+        currentQty: qty,
+      });
+    }
+
+    const hasShopFloor =
+      Math.max(0, Number(p.currentStock || 0)) > 0 ||
+      shopFloorHistoryProductIds.has(p.id) ||
+      warehouseLocations.length === 0 ||
+      selectedLocationFilter === `SHOP:${p.shopId}`;
+
+    const locations: LocationChoice[] = [];
+    if (hasShopFloor) {
+      locations.push({
+        key: `SHOP:${p.shopId}`,
+        type: 'SHOP',
+        shopId: p.shopId,
+        shopName,
+        label: `Shop: ${shopName}`,
+        shortLabel: `${shopName} (Shop)`,
+        currentQty: Math.max(0, Number(p.currentStock || 0)),
+      });
+    }
+    for (const wl of warehouseLocations) {
+      locations.push(wl);
+    }
+
+    return locations;
+  };
+
+  // All selectable locations in the product's shop for the staged list dropdown
+  // (starts with actual product locations, then appends any other active shop floor / warehouse stores)
+  const getSelectableLocationsForProduct = (p: Product): LocationChoice[] => {
+    const baseLocations = getLocationsForProduct(p);
+    const seenKeys = new Set(baseLocations.map(l => l.key));
+    const result = [...baseLocations];
+    const shopName = shopNameById.get(p.shopId) || 'Shop';
+
+    const shopFloorKey = `SHOP:${p.shopId}`;
+    if (!seenKeys.has(shopFloorKey)) {
+      result.unshift({
+        key: shopFloorKey,
+        type: 'SHOP',
+        shopId: p.shopId,
+        shopName,
+        label: `Shop: ${shopName}`,
+        shortLabel: `${shopName} (Shop)`,
+        currentQty: Math.max(0, Number(p.currentStock || 0)),
+      });
+      seenKeys.add(shopFloorKey);
+    }
+
+    const shopStores = warehouseStoresByShop.get(p.shopId) || [];
+    for (const st of shopStores) {
+      if (st.status !== 'ACTIVE') continue;
+      const storeKey = `STORE:${st.id}`;
+      if (seenKeys.has(storeKey)) continue;
+      const qty =
+        p.storeStocks && st.id in p.storeStocks
+          ? Math.max(0, Number(p.storeStocks[st.id] || 0))
+          : p.storeDetails && st.id in p.storeDetails
+            ? Math.max(0, Number(p.storeDetails[st.id]?.quantity || 0))
+            : 0;
+      result.push({
+        key: storeKey,
+        type: 'STORE',
+        shopId: p.shopId,
+        shopName,
+        storeId: st.id,
+        storeName: st.name,
+        label: `Store: ${st.name} (${shopName})`,
+        shortLabel: `${st.name} (Store)`,
+        currentQty: qty,
+      });
+      seenKeys.add(storeKey);
+    }
+
+    return result;
+  };
+
+  // Search products — stays hidden until user actually types a search query (includes 0-stock products)
+  const trimmedSearch = searchQuery.trim();
+  const searchResults = useMemo(() => {
+    const q = trimmedSearch.toLowerCase();
+    if (!q) return [];
+
+    const activeFilterOpt =
+      selectedLocationFilter === 'ALL'
+        ? null
+        : businessLocationOptions.find(o => o.key === selectedLocationFilter) || null;
+
+    const filtered = visibleProducts.filter(p => {
+      if (activeFilterOpt && p.shopId !== activeFilterOpt.shopId) {
+        return false;
+      }
+      const catName =
+        categoryNameById.get(p.categoryId) ||
+        (typeof (p as { category?: unknown }).category === 'string'
+          ? String((p as { category?: string }).category)
+          : '');
+      return (
+        p.name.toLowerCase().includes(q) ||
+        (p.sku && p.sku.toLowerCase().includes(q)) ||
+        (p.barcode && p.barcode.toLowerCase().includes(q)) ||
+        (p.variation && p.variation.toLowerCase().includes(q)) ||
+        (catName && catName.toLowerCase().includes(q))
+      );
+    });
+
+    return filtered
+      .sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }))
+      .slice(0, 25);
+  }, [
+    visibleProducts,
+    trimmedSearch,
+    selectedLocationFilter,
+    businessLocationOptions,
+    categoryNameById,
+  ]);
+
+  if (!currentUser) return null;
+  if (!hasAdminAccess(currentUser) && !currentUser.permissions?.canManageInventory) return null;
+
+  const resolvePreferredLocationKey = (product: Product): string => {
+    const locs = getLocationsForProduct(product);
+    if (selectedLocationFilter !== 'ALL') {
+      const match = locs.find(l => l.key === selectedLocationFilter);
+      if (match) return match.key;
+    }
+    const existingKeys = new Set(
+      rows.filter(r => r.productId === product.id).map(r => r.locationKey)
+    );
+    const unused = locs.find(l => !existingKeys.has(l.key));
+    return unused ? unused.key : locs[0]?.key || `SHOP:${product.shopId}`;
+  };
+
+  const handleAddProductToBatch = (product: Product, explicitLocationKey?: string) => {
+    setFormError('');
+    const locs = getLocationsForProduct(product);
+    const chosenKey = explicitLocationKey || resolvePreferredLocationKey(product);
+    const targetLoc = locs.find(l => l.key === chosenKey) || locs[0];
+    if (!targetLoc) return;
+
+    const rowKey = `${product.id}::${targetLoc.key}`;
+    if (rows.some(r => r.rowKey === rowKey)) {
+      addToast({
+        type: 'info',
+        title: 'Already in List',
+        description: `${product.name} (${targetLoc.shortLabel}) is already staged for adjustment.`,
+      });
+      setSearchQuery('');
+      return;
+    }
+
+    const isLossCategory = ['DAMAGED', 'BROKEN', 'EXPIRED', 'LOST'].includes(batchCategory);
+    const defaultMode: AdjustmentMode = isLossCategory ? 'OUT' : 'SET';
+
+    setRows(prev => [
+      ...prev,
+      {
+        rowKey,
+        productId: product.id,
+        locationKey: targetLoc.key,
+        mode: defaultMode,
+        qtyInput: defaultMode === 'SET' ? String(targetLoc.currentQty) : '',
+        category: batchCategory,
+        note: '',
+      },
+    ]);
+    setSearchQuery('');
+  };
+
+  const handleUpdateRow = (
+    rowKey: string,
+    patch: Partial<Omit<BatchAdjustmentRow, 'rowKey' | 'productId'>>
+  ) => {
+    setFormError('');
+    setRows(prev => {
+      const target = prev.find(r => r.rowKey === rowKey);
+      if (!target) return prev;
+
+      const nextLocationKey = patch.locationKey ?? target.locationKey;
+      const nextRowKey = `${target.productId}::${nextLocationKey}`;
+
+      if (nextRowKey !== rowKey && prev.some(r => r.rowKey === nextRowKey)) {
+        addToast({
+          type: 'warning',
+          title: 'Duplicate Location',
+          description: 'That product & location is already in your adjustment list.',
+        });
+        return prev;
+      }
+
+      const product = productById.get(target.productId);
+      const nextLoc = product
+        ? getSelectableLocationsForProduct(product).find(l => l.key === nextLocationKey)
+        : undefined;
+
+      return prev.map(r => {
+        if (r.rowKey !== rowKey) return r;
+        const nextMode = patch.mode ?? r.mode;
+        let nextQtyInput = patch.qtyInput !== undefined ? patch.qtyInput : r.qtyInput;
+        if (patch.locationKey && nextMode === 'SET' && nextLoc) {
+          nextQtyInput = String(nextLoc.currentQty);
+        } else if (patch.mode && patch.mode !== r.mode) {
+          nextQtyInput = patch.mode === 'SET' && nextLoc ? String(nextLoc.currentQty) : '';
+        }
+        return {
+          ...r,
+          ...patch,
+          rowKey: nextRowKey,
+          locationKey: nextLocationKey,
+          mode: nextMode,
+          qtyInput: nextQtyInput,
+        };
+      });
+    });
+  };
+
+  const handleRemoveRow = (rowKey: string) => {
+    setRows(prev => prev.filter(r => r.rowKey !== rowKey));
+  };
+
+  const handleApplyBatchCategoryToAll = (cat: AdjustmentCategory) => {
+    setBatchCategory(cat);
+    const isLoss = ['DAMAGED', 'BROKEN', 'EXPIRED', 'LOST'].includes(cat);
+    setRows(prev =>
+      prev.map(r => ({
+        ...r,
+        category: cat,
+        mode: isLoss && r.mode === 'IN' ? 'OUT' : r.mode,
+      }))
+    );
+  };
+
+  // Evaluate each staged row (newQty, delta, cost impact, validation error)
+  const evaluatedRows = useMemo(() => {
+    return rows.map(row => {
+      const product = productById.get(row.productId);
+      const locations = product ? getSelectableLocationsForProduct(product) : [];
+      const location = locations.find(l => l.key === row.locationKey) || locations[0];
+      const currentQty = location ? location.currentQty : 0;
+      const parsedQty = row.qtyInput.trim() === '' ? NaN : Number(row.qtyInput);
+
+      let newQty = currentQty;
+      let delta = 0;
+      let rowError = '';
+
+      if (!product || !location) {
+        rowError = 'Product or location no longer available.';
+      } else if (!Number.isFinite(parsedQty) || parsedQty < 0) {
+        if (row.qtyInput.trim() !== '') {
+          rowError = 'Enter a valid non-negative number.';
+        }
+      } else if (row.mode === 'SET') {
+        newQty = Math.max(0, parsedQty);
+        delta = newQty - currentQty;
+      } else if (row.mode === 'IN') {
+        newQty = currentQty + parsedQty;
+        delta = parsedQty;
+      } else if (row.mode === 'OUT') {
+        if (parsedQty > currentQty) {
+          rowError = `Exceeds available stock (${currentQty} ${product.unit || 'units'}).`;
+          newQty = currentQty;
+          delta = 0;
+        } else {
+          newQty = currentQty - parsedQty;
+          delta = -parsedQty;
+        }
+      }
+
+      const unitCost = product ? Number(product.purchasePrice || 0) : 0;
+      const costImpact = Number((Math.abs(delta) * unitCost).toFixed(2));
+
+      return {
+        row,
+        product,
+        locations,
+        location,
+        currentQty,
+        newQty,
+        delta,
+        costImpact,
+        rowError,
+      };
+    });
+  }, [rows, productById, warehouseStoresByShop, shopNameById]);
+
+  const summary = useMemo(() => {
+    let changedCount = 0;
+    let totalAdded = 0;
+    let totalDeducted = 0;
+    let totalCostImpact = 0;
+    let errorCount = 0;
+
+    for (const item of evaluatedRows) {
+      if (item.rowError) errorCount += 1;
+      if (item.delta !== 0) {
+        changedCount += 1;
+        if (item.delta > 0) totalAdded += item.delta;
+        else totalDeducted += Math.abs(item.delta);
+        totalCostImpact += item.costImpact;
+      }
+    }
+
+    return {
+      totalRows: evaluatedRows.length,
+      changedCount,
+      totalAdded,
+      totalDeducted,
+      netChange: totalAdded - totalDeducted,
+      totalCostImpact,
+      errorCount,
+    };
+  }, [evaluatedRows]);
+
+  const handleSubmitBatch = (e: React.FormEvent) => {
+    e.preventDefault();
+    setFormError('');
+
+    if (evaluatedRows.length === 0) {
+      setFormError('Please add at least one product to adjust.');
+      return;
+    }
+
+    if (summary.errorCount > 0) {
+      setFormError('Please fix the highlighted quantity errors before applying adjustments.');
+      return;
+    }
+
+    const actionable = evaluatedRows.filter(item => item.delta !== 0 && item.product && item.location);
+    if (actionable.length === 0) {
+      setFormError('No stock quantity changes detected. Update at least one product quantity.');
+      return;
+    }
+
+    if (!batchReason.trim() && actionable.some(a => !a.row.note.trim())) {
+      setFormError('Please enter a reason for this stock adjustment batch.');
+      return;
+    }
+
+    setIsSubmitting(true);
+    let successCount = 0;
+    const failures: string[] = [];
+
+    for (const item of actionable) {
+      if (!item.product || !item.location) continue;
+      const reasonCore = item.row.note.trim() || batchReason.trim();
+      const finalReason = `[${item.row.category}] ${reasonCore}`;
+      const res = InventoryService.adjustStock(
+        item.product.id,
+        item.newQty,
+        finalReason,
+        currentUser,
+        item.row.category as MovementType,
+        item.location.type === 'STORE' ? item.location.storeId : undefined
+      );
+      if (res.success) {
+        successCount += 1;
+      } else {
+        failures.push(`${item.product.name} (${item.location.shortLabel}): ${res.error || 'Failed'}`);
+      }
+    }
+
+    setIsSubmitting(false);
+
+    if (successCount > 0) {
+      addToast({
+        type: 'success',
+        title: `Adjusted ${successCount} Product${successCount === 1 ? '' : 's'}`,
+        description: `Stock levels updated across ${new Set(actionable.map(a => a.location?.key)).size} location(s) and logged to Adjustment List.`,
+      });
+      if (failures.length === 0) {
+        setRows([]);
+        setBatchReason('');
+        setSearchQuery('');
+      } else {
+        setFormError(`Some items failed: ${failures.join(' | ')}`);
+      }
+    } else {
+      setFormError(failures[0] || 'Could not apply stock adjustments.');
+    }
+  };
+
+  return (
+    <div id="admin-adjust-inventory-view" className="flex-1 overflow-y-auto p-4 lg:p-6 space-y-5">
+      {/* Header */}
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+        <div>
+          <h1 className="text-xl lg:text-2xl font-bold text-white flex items-center gap-2.5">
+            <SlidersHorizontal className="w-6 h-6 text-amber-400 shrink-0" />
+            <span>Adjust Inventory</span>
+          </h1>
+          <p className="text-xs sm:text-sm text-slate-400 mt-0.5">
+            Adjust stock quantities for multiple products across Shop Floor & Store locations in one session.
+          </p>
+        </div>
+        <div className="flex items-center gap-2 self-start sm:self-auto">
+          {rows.length > 0 && (
+            <button
+              type="button"
+              onClick={() => {
+                setRows([]);
+                setFormError('');
+              }}
+              className="px-3 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 text-xs font-semibold flex items-center gap-1.5 transition-colors"
+            >
+              <RotateCcw className="w-3.5 h-3.5" />
+              Clear List
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={() => openInventoryFilter('ADJUSTMENT_LIST')}
+            className="px-3.5 py-2 rounded-xl bg-cyan-600/15 hover:bg-cyan-600/25 text-cyan-300 border border-cyan-500/30 text-xs font-bold flex items-center gap-1.5 transition-colors"
+          >
+            <ClipboardList className="w-4 h-4" />
+            Adjustment List
+          </button>
+        </div>
+      </div>
+
+      {/* Batch Configuration Card */}
+      <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 lg:p-5 space-y-4 shadow-lg">
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-3.5">
+          {/* Business Location Filter */}
+          <div>
+            <label className="block text-[11px] font-bold uppercase tracking-wider text-slate-400 mb-1.5">
+              Business Location (Shop & Stores)
+            </label>
+            <select
+              value={selectedLocationFilter}
+              onChange={e => setSelectedLocationFilter(e.target.value)}
+              className="w-full px-3 py-2.5 bg-slate-950 border border-slate-800 rounded-xl text-sm text-white font-medium focus:outline-none focus:ring-2 focus:ring-amber-500/40 focus:border-amber-500"
+            >
+              <option value="ALL">All Locations (Shop & Stores)</option>
+              {businessLocationOptions.map(opt => (
+                <option key={opt.key} value={opt.key}>
+                  {opt.label}
+                </option>
+              ))}
+            </select>
+            <p className="text-[11px] text-slate-500 mt-1">
+              Pre-select a location or adjust products from multiple locations at once.
+            </p>
+          </div>
+
+          {/* Adjustment Category */}
+          <div>
+            <label className="block text-[11px] font-bold uppercase tracking-wider text-slate-400 mb-1.5">
+              Adjustment Category
+            </label>
+            <select
+              value={batchCategory}
+              onChange={e => handleApplyBatchCategoryToAll(e.target.value as AdjustmentCategory)}
+              className="w-full px-3 py-2.5 bg-slate-950 border border-slate-800 rounded-xl text-sm text-white font-medium focus:outline-none focus:ring-2 focus:ring-amber-500/40 focus:border-amber-500"
+            >
+              {CATEGORY_OPTIONS.map(opt => (
+                <option key={opt.value} value={opt.value}>
+                  {opt.label}
+                </option>
+              ))}
+            </select>
+            <p className="text-[11px] text-slate-500 mt-1">
+              Applies to newly added items (can be customized per product below).
+            </p>
+          </div>
+
+          {/* Batch Reason */}
+          <div>
+            <label className="block text-[11px] font-bold uppercase tracking-wider text-slate-400 mb-1.5">
+              Reason / Reference Note <span className="text-rose-400">*</span>
+            </label>
+            <input
+              type="text"
+              value={batchReason}
+              onChange={e => {
+                setBatchReason(e.target.value);
+                setFormError('');
+              }}
+              placeholder="e.g. Monthly stock count, damaged cartons..."
+              className="w-full px-3 py-2.5 bg-slate-950 border border-slate-800 rounded-xl text-sm text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-amber-500/40 focus:border-amber-500"
+            />
+            <p className="text-[11px] text-slate-500 mt-1">
+              Recorded in audit trail and Adjustment List PDF reports.
+            </p>
+          </div>
+        </div>
+
+        {/* Product Search & Quick Add */}
+        <div className="pt-3 border-t border-slate-800/80 space-y-3">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+            <label className="text-xs font-bold uppercase tracking-wider text-amber-400 flex items-center gap-1.5">
+              <Search className="w-3.5 h-3.5" />
+              Search & Add Products to Adjust (Includes 0-Stock Products)
+            </label>
+            <span className="text-[11px] text-slate-400">
+              Type a product name or SKU to search and add it below
+            </span>
+          </div>
+
+          <div className="relative">
+            <Search className="w-4 h-4 text-slate-500 absolute left-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+            <input
+              type="text"
+              value={searchQuery}
+              onChange={e => setSearchQuery(e.target.value)}
+              placeholder="Search product name, SKU, barcode, variation, or category..."
+              className="w-full pl-10 pr-9 py-2.5 bg-slate-950 border border-slate-700/80 rounded-xl text-sm text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-amber-500/40 focus:border-amber-500"
+            />
+            {searchQuery && (
+              <button
+                type="button"
+                onClick={() => {
+                  setSearchQuery('');
+                }}
+                className="absolute right-2.5 top-1/2 -translate-y-1/2 p-1 text-slate-400 hover:text-white"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            )}
+          </div>
+
+          {/* Product Picker Results — shown ONLY after user searches */}
+          {trimmedSearch.length > 0 && (
+            <div className="max-h-80 overflow-y-auto rounded-xl border border-slate-800 bg-slate-950/70 divide-y divide-slate-800/70">
+              {searchResults.length === 0 ? (
+                <div className="p-6 text-center text-xs text-slate-500">
+                  No products matched "{trimmedSearch}". Try a different name, SKU, or select All Locations.
+                </div>
+              ) : (
+                searchResults.map(product => {
+                  const locs = getLocationsForProduct(product);
+                  const visibleLocs =
+                    selectedLocationFilter === 'ALL'
+                      ? locs
+                      : locs.filter(l => l.key === selectedLocationFilter);
+                  const addedCountForProduct = visibleLocs.filter(loc =>
+                    rows.some(r => r.rowKey === `${product.id}::${loc.key}`)
+                  ).length;
+                  const allVisibleAdded =
+                    visibleLocs.length > 0 && addedCountForProduct >= visibleLocs.length;
+
+                  return (
+                    <button
+                      key={product.id}
+                      type="button"
+                      onClick={() => handleAddProductToBatch(product)}
+                      className={`w-full text-left p-3 sm:px-4 flex items-center justify-between gap-3 transition-colors ${
+                        allVisibleAdded
+                          ? 'bg-emerald-500/5 hover:bg-emerald-500/10'
+                          : 'hover:bg-slate-900/80'
+                      }`}
+                    >
+                      <div className="flex items-center gap-2.5 min-w-0">
+                        <ProductThumbnail product={product} size="sm" />
+                        <div className="min-w-0">
+                          <div className="flex items-center gap-1.5 flex-wrap">
+                            <span className="text-xs sm:text-sm font-bold text-white truncate">
+                              {product.name}
+                            </span>
+                            {product.variation && (
+                              <span className="px-1.5 py-0.5 rounded bg-violet-500/15 text-violet-300 border border-violet-500/25 text-[10px] font-semibold">
+                                {product.variation}
+                              </span>
+                            )}
+                          </div>
+                          <div className="text-[11px] text-slate-400 flex items-center gap-2 flex-wrap">
+                            <span>SKU: {product.sku || '-'}</span>
+                            <span>•</span>
+                            <span>Buy: {formatCurrency(product.purchasePrice || 0, symbol)}</span>
+                          </div>
+                          {visibleLocs.length > 0 && (
+                            <div className="flex items-center gap-1.5 flex-wrap mt-1">
+                              {visibleLocs.map(loc => (
+                                <span
+                                  key={loc.key}
+                                  className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-semibold border ${
+                                    loc.type === 'STORE'
+                                      ? 'bg-indigo-500/10 text-indigo-300 border-indigo-500/25'
+                                      : 'bg-slate-900 text-slate-300 border-slate-700'
+                                  }`}
+                                >
+                                  {loc.type === 'STORE' ? (
+                                    <Warehouse className="w-2.5 h-2.5 shrink-0" />
+                                  ) : (
+                                    <Store className="w-2.5 h-2.5 shrink-0" />
+                                  )}
+                                  <span className="truncate max-w-[120px]">{loc.shortLabel}:</span>
+                                  <strong
+                                    className={
+                                      loc.currentQty <= 0 ? 'text-rose-300' : 'text-white'
+                                    }
+                                  >
+                                    {loc.currentQty}
+                                  </strong>
+                                </span>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      </div>
+
+                      <div className="flex items-center gap-2 shrink-0">
+                        {addedCountForProduct > 0 && !allVisibleAdded && (
+                          <span className="px-1.5 py-0.5 rounded-md bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 text-[10px] font-bold">
+                            {addedCountForProduct} added
+                          </span>
+                        )}
+                        <span
+                          className={`px-3 py-1.5 rounded-lg text-[11px] font-semibold flex items-center gap-1.5 border transition-all ${
+                            allVisibleAdded
+                              ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
+                              : 'bg-amber-500/15 text-amber-200 border-amber-500/30'
+                          }`}
+                        >
+                          {allVisibleAdded ? (
+                            <>
+                              <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                              <span>Added</span>
+                            </>
+                          ) : (
+                            <>
+                              <Plus className="w-3.5 h-3.5 shrink-0" />
+                              <span>{addedCountForProduct > 0 ? 'Add Next' : 'Add'}</span>
+                            </>
+                          )}
+                        </span>
+                      </div>
+                    </button>
+                  );
+                })
+              )}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Staged Adjustments Form */}
+      <form onSubmit={handleSubmitBatch} className="space-y-4">
+        <div className="bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden shadow-lg">
+          <div className="px-4 py-3 border-b border-slate-800 bg-slate-950/60 flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <Package className="w-4 h-4 text-amber-400" />
+              <h2 className="text-sm font-bold text-white">
+                Products Staged for Adjustment ({rows.length})
+              </h2>
+            </div>
+            {summary.changedCount > 0 && (
+              <div className="flex items-center gap-2 text-xs font-semibold flex-wrap">
+                <span className="px-2 py-0.5 rounded-lg bg-emerald-500/15 text-emerald-300 border border-emerald-500/25">
+                  +{summary.totalAdded} added
+                </span>
+                <span className="px-2 py-0.5 rounded-lg bg-rose-500/15 text-rose-300 border border-rose-500/25">
+                  -{summary.totalDeducted} deducted
+                </span>
+                <span className="px-2 py-0.5 rounded-lg bg-violet-500/15 text-violet-300 border border-violet-500/25">
+                  Cost Impact: {formatCurrency(summary.totalCostImpact, symbol)}
+                </span>
+              </div>
+            )}
+          </div>
+
+          {evaluatedRows.length === 0 ? (
+            <div className="p-10 text-center space-y-2">
+              <SlidersHorizontal className="w-10 h-10 text-slate-700 mx-auto" />
+              <p className="text-sm font-semibold text-slate-300">
+                No products added yet
+              </p>
+              <p className="text-xs text-slate-500 max-w-md mx-auto">
+                Search above and click any product to add it directly to the list, then choose its location and set the new stock count or +/- adjustment.
+              </p>
+            </div>
+          ) : (
+            <>
+              {/* Desktop Table */}
+              <div className="hidden lg:block overflow-x-auto">
+                <table className="w-full text-left border-collapse">
+                  <thead>
+                    <tr className="bg-slate-950/70 border-b border-slate-800 text-[11px] uppercase tracking-wider text-slate-400">
+                      <th className="py-2.5 px-3 w-10 text-center">#</th>
+                      <th className="py-2.5 px-3">Product</th>
+                      <th className="py-2.5 px-3">Location</th>
+                      <th className="py-2.5 px-3 text-center">Current</th>
+                      <th className="py-2.5 px-3">Mode</th>
+                      <th className="py-2.5 px-3 w-28">Quantity</th>
+                      <th className="py-2.5 px-3 text-center">New Stock</th>
+                      <th className="py-2.5 px-3">Category</th>
+                      <th className="py-2.5 px-3 text-right">Cost Impact</th>
+                      <th className="py-2.5 px-3 w-10"></th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-800/70 text-xs">
+                    {evaluatedRows.map((item, idx) => {
+                      const { row, product, locations, location, currentQty, newQty, delta, costImpact, rowError } = item;
+                      if (!product || !location) return null;
+                      return (
+                        <tr
+                          key={row.rowKey}
+                          className={`hover:bg-slate-800/30 transition-colors ${
+                            rowError ? 'bg-rose-950/20' : ''
+                          }`}
+                        >
+                          <td className="py-3 px-3 text-center text-slate-500 font-semibold">
+                            {idx + 1}
+                          </td>
+                          <td className="py-3 px-3">
+                            <div className="flex items-center gap-2.5">
+                              <ProductThumbnail product={product} size="sm" />
+                              <div className="min-w-0">
+                                <div className="font-bold text-white truncate max-w-[200px]">
+                                  {product.name}
+                                  {product.variation ? ` (${product.variation})` : ''}
+                                </div>
+                                <div className="text-[11px] text-slate-400">
+                                  SKU: {product.sku || '-'}
+                                </div>
+                                {rowError && (
+                                  <div className="text-[11px] text-rose-400 font-semibold mt-0.5 flex items-center gap-1">
+                                    <AlertTriangle className="w-3 h-3 shrink-0" />
+                                    {rowError}
+                                  </div>
+                                )}
+                              </div>
+                            </div>
+                          </td>
+                          <td className="py-3 px-3">
+                            {locations.length > 1 ? (
+                              <select
+                                value={row.locationKey}
+                                onChange={e =>
+                                  handleUpdateRow(row.rowKey, { locationKey: e.target.value })
+                                }
+                                className="px-2.5 py-1.5 bg-slate-950 border border-slate-700 rounded-lg text-xs text-white font-medium focus:outline-none focus:border-amber-500 max-w-[190px]"
+                              >
+                                {locations.map(l => (
+                                  <option key={l.key} value={l.key}>
+                                    {l.shortLabel} ({l.currentQty})
+                                  </option>
+                                ))}
+                              </select>
+                            ) : (
+                              <span className="inline-flex items-center gap-1 px-2 py-1 rounded-lg bg-emerald-500/10 text-emerald-300 border border-emerald-500/25 font-semibold">
+                                <Store className="w-3 h-3" />
+                                {location.shortLabel}
+                              </span>
+                            )}
+                          </td>
+                          <td className="py-3 px-3 text-center">
+                            <span
+                              className={`font-bold ${
+                                currentQty <= 0 ? 'text-rose-400' : 'text-slate-200'
+                              }`}
+                            >
+                              {currentQty}
+                            </span>{' '}
+                            <span className="text-slate-500">{product.unit || 'pcs'}</span>
+                          </td>
+                          <td className="py-3 px-3">
+                            <div className="inline-flex rounded-lg bg-slate-950 border border-slate-800 p-0.5">
+                              {(['SET', 'IN', 'OUT'] as AdjustmentMode[]).map(m => (
+                                <button
+                                  key={m}
+                                  type="button"
+                                  onClick={() => handleUpdateRow(row.rowKey, { mode: m })}
+                                  className={`px-2 py-1 rounded-md text-[11px] font-bold transition-colors ${
+                                    row.mode === m
+                                      ? m === 'IN'
+                                        ? 'bg-emerald-600 text-white'
+                                        : m === 'OUT'
+                                          ? 'bg-rose-600 text-white'
+                                          : 'bg-amber-600 text-white'
+                                      : 'text-slate-400 hover:text-white'
+                                  }`}
+                                >
+                                  {m === 'SET' ? 'Set =' : m === 'IN' ? 'Add +' : 'Deduct -'}
+                                </button>
+                              ))}
+                            </div>
+                          </td>
+                          <td className="py-3 px-3">
+                            <input
+                              type="number"
+                              min="0"
+                              step="any"
+                              value={row.qtyInput}
+                              onChange={e =>
+                                handleUpdateRow(row.rowKey, { qtyInput: e.target.value })
+                              }
+                              placeholder={row.mode === 'SET' ? String(currentQty) : '0'}
+                              className={`w-24 px-2.5 py-1.5 bg-slate-950 border rounded-lg text-sm font-bold text-white text-right focus:outline-none ${
+                                rowError
+                                  ? 'border-rose-500 focus:border-rose-400'
+                                  : 'border-slate-700 focus:border-amber-500'
+                              }`}
+                            />
+                          </td>
+                          <td className="py-3 px-3 text-center">
+                            <div className="flex items-center justify-center gap-1.5">
+                              <span className="text-slate-400">{currentQty}</span>
+                              <ArrowRight className="w-3 h-3 text-slate-600" />
+                              <span className="font-bold text-white">{newQty}</span>
+                              {delta !== 0 && (
+                                <span
+                                  className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${
+                                    delta > 0
+                                      ? 'bg-emerald-500/15 text-emerald-300'
+                                      : 'bg-rose-500/15 text-rose-300'
+                                  }`}
+                                >
+                                  {delta > 0 ? `+${delta}` : delta}
+                                </span>
+                              )}
+                            </div>
+                          </td>
+                          <td className="py-3 px-3">
+                            <select
+                              value={row.category}
+                              onChange={e =>
+                                handleUpdateRow(row.rowKey, {
+                                  category: e.target.value as AdjustmentCategory,
+                                })
+                              }
+                              className="px-2 py-1.5 bg-slate-950 border border-slate-700 rounded-lg text-[11px] text-slate-200 font-medium focus:outline-none focus:border-amber-500"
+                            >
+                              {CATEGORY_OPTIONS.map(opt => (
+                                <option key={opt.value} value={opt.value}>
+                                  {opt.short}
+                                </option>
+                              ))}
+                            </select>
+                          </td>
+                          <td className="py-3 px-3 text-right font-semibold text-slate-200">
+                            {formatCurrency(costImpact, symbol)}
+                          </td>
+                          <td className="py-3 px-3 text-center">
+                            <button
+                              type="button"
+                              onClick={() => handleRemoveRow(row.rowKey)}
+                              title="Remove product"
+                              className="p-1.5 rounded-lg text-slate-400 hover:text-rose-400 hover:bg-rose-500/10 transition-colors"
+                            >
+                              <Trash2 className="w-4 h-4" />
+                            </button>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+
+              {/* Mobile / Tablet Stacked Cards */}
+              <div className="lg:hidden divide-y divide-slate-800/80">
+                {evaluatedRows.map((item, idx) => {
+                  const { row, product, locations, location, currentQty, newQty, delta, costImpact, rowError } = item;
+                  if (!product || !location) return null;
+                  return (
+                    <div
+                      key={row.rowKey}
+                      className={`p-3.5 space-y-3 ${rowError ? 'bg-rose-950/20' : ''}`}
+                    >
+                      <div className="flex items-start justify-between gap-2">
+                        <div className="flex items-center gap-2.5 min-w-0">
+                          <span className="text-[11px] font-bold text-slate-500 w-4">
+                            {idx + 1}.
+                          </span>
+                          <ProductThumbnail product={product} size="sm" />
+                          <div className="min-w-0">
+                            <div className="text-xs font-bold text-white truncate">
+                              {product.name}
+                              {product.variation ? ` (${product.variation})` : ''}
+                            </div>
+                            <div className="text-[11px] text-slate-400">
+                              Current: <strong className="text-slate-200">{currentQty}</strong>{' '}
+                              {product.unit || 'pcs'}
+                            </div>
+                          </div>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => handleRemoveRow(row.rowKey)}
+                          className="p-1.5 rounded-lg text-slate-400 hover:text-rose-400 hover:bg-rose-500/10"
+                        >
+                          <Trash2 className="w-4 h-4" />
+                        </button>
+                      </div>
+
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                        <div>
+                          <label className="block text-[10px] font-bold uppercase text-slate-500 mb-1">
+                            Location
+                          </label>
+                          {locations.length > 1 ? (
+                            <select
+                              value={row.locationKey}
+                              onChange={e =>
+                                handleUpdateRow(row.rowKey, { locationKey: e.target.value })
+                              }
+                              className="w-full px-2.5 py-2 bg-slate-950 border border-slate-700 rounded-lg text-xs text-white"
+                            >
+                              {locations.map(l => (
+                                <option key={l.key} value={l.key}>
+                                  {l.shortLabel} (Qty: {l.currentQty})
+                                </option>
+                              ))}
+                            </select>
+                          ) : (
+                            <div className="px-2.5 py-2 bg-slate-950 border border-slate-800 rounded-lg text-xs text-emerald-300 font-semibold">
+                              {location.shortLabel}
+                            </div>
+                          )}
+                        </div>
+                        <div>
+                          <label className="block text-[10px] font-bold uppercase text-slate-500 mb-1">
+                            Category
+                          </label>
+                          <select
+                            value={row.category}
+                            onChange={e =>
+                              handleUpdateRow(row.rowKey, {
+                                category: e.target.value as AdjustmentCategory,
+                              })
+                            }
+                            className="w-full px-2.5 py-2 bg-slate-950 border border-slate-700 rounded-lg text-xs text-white"
+                          >
+                            {CATEGORY_OPTIONS.map(opt => (
+                              <option key={opt.value} value={opt.value}>
+                                {opt.label}
+                              </option>
+                            ))}
+                          </select>
+                        </div>
+                      </div>
+
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <div className="inline-flex rounded-lg bg-slate-950 border border-slate-800 p-0.5">
+                          {(['SET', 'IN', 'OUT'] as AdjustmentMode[]).map(m => (
+                            <button
+                              key={m}
+                              type="button"
+                              onClick={() => handleUpdateRow(row.rowKey, { mode: m })}
+                              className={`px-2.5 py-1.5 rounded-md text-[11px] font-bold ${
+                                row.mode === m
+                                  ? m === 'IN'
+                                    ? 'bg-emerald-600 text-white'
+                                    : m === 'OUT'
+                                      ? 'bg-rose-600 text-white'
+                                      : 'bg-amber-600 text-white'
+                                  : 'text-slate-400'
+                              }`}
+                            >
+                              {m === 'SET' ? 'Set =' : m === 'IN' ? 'Add +' : 'Deduct -'}
+                            </button>
+                          ))}
+                        </div>
+
+                        <div className="flex items-center gap-2">
+                          <input
+                            type="number"
+                            min="0"
+                            step="any"
+                            value={row.qtyInput}
+                            onChange={e =>
+                              handleUpdateRow(row.rowKey, { qtyInput: e.target.value })
+                            }
+                            placeholder={row.mode === 'SET' ? String(currentQty) : '0'}
+                            className={`w-24 px-2.5 py-1.5 bg-slate-950 border rounded-lg text-sm font-bold text-white text-right ${
+                              rowError ? 'border-rose-500' : 'border-slate-700'
+                            }`}
+                          />
+                          <div className="text-xs font-bold whitespace-nowrap">
+                            <span className="text-slate-400">{currentQty} → </span>
+                            <span className="text-white">{newQty}</span>
+                            {delta !== 0 && (
+                              <span
+                                className={`ml-1 ${
+                                  delta > 0 ? 'text-emerald-400' : 'text-rose-400'
+                                }`}
+                              >
+                                ({delta > 0 ? `+${delta}` : delta})
+                              </span>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="flex items-center justify-between text-[11px] text-slate-400">
+                        <span>Cost Impact: {formatCurrency(costImpact, symbol)}</span>
+                        {rowError && (
+                          <span className="text-rose-400 font-semibold flex items-center gap-1">
+                            <AlertTriangle className="w-3 h-3" />
+                            {rowError}
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </>
+          )}
+
+          {/* Error & Submit Bar */}
+          {formError && (
+            <div className="mx-4 my-3 p-3 rounded-xl bg-rose-500/10 border border-rose-500/30 text-rose-300 text-xs font-semibold flex items-center gap-2">
+              <AlertTriangle className="w-4 h-4 shrink-0" />
+              <span>{formError}</span>
+            </div>
+          )}
+
+          <div className="p-4 border-t border-slate-800 bg-slate-950/70 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            <div className="text-xs text-slate-400">
+              <strong className="text-white">{summary.changedCount}</strong> of{' '}
+              <strong className="text-white">{summary.totalRows}</strong> staged item(s) have stock changes • Net:{' '}
+              <strong
+                className={
+                  summary.netChange > 0
+                    ? 'text-emerald-400'
+                    : summary.netChange < 0
+                      ? 'text-rose-400'
+                      : 'text-slate-300'
+                }
+              >
+                {summary.netChange > 0 ? `+${summary.netChange}` : summary.netChange}
+              </strong>{' '}
+              units
+            </div>
+
+            <button
+              type="submit"
+              disabled={isSubmitting || summary.changedCount === 0 || summary.errorCount > 0}
+              className="px-5 py-2.5 rounded-xl bg-amber-600 hover:bg-amber-500 disabled:opacity-45 disabled:cursor-not-allowed text-white font-bold text-sm flex items-center justify-center gap-2 shadow-lg shadow-amber-900/30 transition-all"
+            >
+              <CheckCircle2 className="w-4 h-4" />
+              {isSubmitting
+                ? 'Applying Adjustments...'
+                : `Apply Stock Adjustments (${summary.changedCount})`}
+            </button>
+          </div>
+        </div>
+      </form>
+    </div>
+  );
+};

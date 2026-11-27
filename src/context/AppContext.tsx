@@ -10,7 +10,7 @@ import { hasAdminAccess } from '../utils/permissions';
 
 export type StoresSubTab = 'stores' | 'inventory' | 'transfer' | 'list' | 'transfer_view';
 export type ShopsSubTab = 'list' | 'add';
-export type InventoryFilter = 'ALL' | 'SHOP' | 'STORE';
+export type InventoryFilter = 'ALL' | 'SHOP' | 'STORE' | 'ADJUST' | 'ADJUSTMENT_LIST';
 export type ProductsSubTab = 'product_list' | 'add_product' | 'category_list' | 'add_category';
 export type PurchasesSubTab = 'list' | 'add' | 'returns' | 'suppliers';
 export type ExpensesSubTab = 'list' | 'add';

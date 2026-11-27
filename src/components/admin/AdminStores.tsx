@@ -170,6 +170,7 @@ export const AdminStores: React.FC = () => {
   const [sourceLocationKey, setSourceLocationKey] = useState('');
   const [destLocationKey, setDestLocationKey] = useState('');
   const [selectedTransferMap, setSelectedTransferMap] = useState<Record<string, string>>({});
+  const [selectedTransferOrder, setSelectedTransferOrder] = useState<string[]>([]);
   const [selectedPriceMap, setSelectedPriceMap] = useState<Record<string, string>>({});
   const [productSearch, setProductSearch] = useState('');
   const [transferVisibleLimit, setTransferVisibleLimit] = useState(STORE_PAGE_SIZE);
@@ -759,38 +760,24 @@ export const AdminStores: React.FC = () => {
     return baseAvail;
   };
 
-  // Search-only products belonging to selected Location Source (multi-token match like Purchase search, including 0-qty products)
-  const storeScopedProducts = useMemo(() => {
+  // Search-only products actually in the selected Location From, plus info on matching products stored elsewhere
+  const { storeScopedProducts, otherLocationSearchMatches } = useMemo(() => {
     const q = productSearch.trim().toLowerCase();
-    if (!q || !selectedSourceLocation) return [];
+    if (!q || !selectedSourceLocation) {
+      return {
+        storeScopedProducts: [] as Product[],
+        otherLocationSearchMatches: [] as {
+          product: Product;
+          stockedLocations: { label: string; qty: number; type: StockTransferLocationType }[];
+          zeroLocations: string[];
+          isOtherShop?: boolean;
+          shopName?: string;
+        }[],
+      };
+    }
     const tokens = q.split(/\s+/).filter(Boolean);
 
-    const isAssociatedWithSource = (p: Product): boolean => {
-      if (selectedSourceLocation.type === 'STORE' && selectedSourceStore) {
-        if (getSourceAvailableQty(p) > 0) return true;
-        return Boolean(
-          p.storeId === selectedSourceStore.id ||
-            (p.storeStocks && selectedSourceStore.id in p.storeStocks) ||
-            (p.storeDetails && selectedSourceStore.id in p.storeDetails)
-        );
-      }
-      if (selectedSourceLocation.type === 'SHOP') {
-        if (getSourceAvailableQty(p) > 0) return true;
-        const shopWarehouses = transferableStores.filter(st => st.shopId === p.shopId);
-        const hasWarehouseEntry = shopWarehouses.some(
-          st =>
-            getProductQtyInStore(p, st) > 0 ||
-            Boolean(p.storeDetails?.[st.id]) ||
-            p.storeId === st.id
-        );
-        return !hasWarehouseEntry;
-      }
-      return true;
-    };
-
-    const filtered = accessibleProducts.filter(p => {
-      if (p.shopId !== selectedSourceLocation.shopId) return false;
-
+    const matchesQuery = (p: Product): boolean => {
       const cf = p.customFields;
       const hay = [
         p.name,
@@ -805,22 +792,119 @@ export const AdminStores: React.FC = () => {
         .join(' ')
         .toLowerCase();
       return tokens.every(t => hay.includes(t));
-    });
+    };
 
-    return [...filtered].sort((a, b) => {
+    const inSource: Product[] = [];
+    const sameShopElsewhere: {
+      product: Product;
+      stockedLocations: { label: string; qty: number; type: StockTransferLocationType }[];
+      zeroLocations: string[];
+      isOtherShop?: boolean;
+      shopName?: string;
+    }[] = [];
+    const otherShopMatches: {
+      product: Product;
+      stockedLocations: { label: string; qty: number; type: StockTransferLocationType }[];
+      zeroLocations: string[];
+      isOtherShop?: boolean;
+      shopName?: string;
+    }[] = [];
+
+    const collectOtherLocations = (p: Product) => {
+      const stockedLocations: { label: string; qty: number; type: StockTransferLocationType }[] = [];
+      const zeroLocations: string[] = [];
+      const prodShop = accessibleShops.find(s => s.id === p.shopId);
+      const shopLabel = prodShop ? `Shop (${prodShop.name})` : 'Shop';
+      const isSameShop = p.shopId === selectedSourceLocation.shopId;
+
+      if (!(isSameShop && selectedSourceLocation.type === 'SHOP')) {
+        const floorQty = Math.max(0, Number(p.currentStock || 0));
+        if (floorQty > 0) {
+          stockedLocations.push({ label: shopLabel, qty: floorQty, type: 'SHOP' });
+        }
+      }
+
+      const prodShopStores = transferableStores.filter(st => st.shopId === p.shopId);
+      for (const st of prodShopStores) {
+        if (isSameShop && selectedSourceLocation.type === 'STORE' && selectedSourceLocation.id === st.id) {
+          continue;
+        }
+        const stQty = getProductQtyInStore(p, st);
+        if (stQty > 0) {
+          stockedLocations.push({ label: st.name, qty: stQty, type: 'STORE' });
+        } else if (
+          p.storeId === st.id ||
+          Boolean(p.storeDetails?.[st.id]) ||
+          (p.storeStocks && st.id in p.storeStocks)
+        ) {
+          zeroLocations.push(st.name);
+        }
+      }
+
+      if (
+        stockedLocations.length === 0 &&
+        zeroLocations.length === 0 &&
+        !(isSameShop && selectedSourceLocation.type === 'SHOP')
+      ) {
+        zeroLocations.push(shopLabel);
+      }
+
+      return { stockedLocations, zeroLocations, shopName: prodShop?.name };
+    };
+
+    for (const p of accessibleProducts) {
+      if (!matchesQuery(p)) continue;
+
+      if (p.shopId === selectedSourceLocation.shopId) {
+        const qtyHere = getSourceAvailableQty(p);
+        if (qtyHere > 0) {
+          inSource.push(p);
+        } else {
+          const info = collectOtherLocations(p);
+          sameShopElsewhere.push({
+            product: p,
+            stockedLocations: info.stockedLocations,
+            zeroLocations: info.zeroLocations,
+          });
+        }
+      } else {
+        const info = collectOtherLocations(p);
+        otherShopMatches.push({
+          product: p,
+          stockedLocations: info.stockedLocations,
+          zeroLocations: info.zeroLocations,
+          isOtherShop: true,
+          shopName: info.shopName,
+        });
+      }
+    }
+
+    inSource.sort((a, b) => {
       const aStarts = a.name.toLowerCase().startsWith(q) ? 1 : 0;
       const bStarts = b.name.toLowerCase().startsWith(q) ? 1 : 0;
       if (aStarts !== bStarts) return bStarts - aStarts;
       const aQty = getSourceAvailableQty(a);
       const bQty = getSourceAvailableQty(b);
       if (bQty !== aQty) return bQty - aQty;
-      const aHere = isAssociatedWithSource(a) ? 1 : 0;
-      const bHere = isAssociatedWithSource(b) ? 1 : 0;
-      if (aHere !== bHere) return bHere - aHere;
       return a.name.localeCompare(b.name);
     });
+
+    const elsewhere = (sameShopElsewhere.length > 0 ? sameShopElsewhere : otherShopMatches).sort(
+      (a, b) => {
+        const aHasStock = a.stockedLocations.length > 0 ? 1 : 0;
+        const bHasStock = b.stockedLocations.length > 0 ? 1 : 0;
+        if (aHasStock !== bHasStock) return bHasStock - aHasStock;
+        return a.product.name.localeCompare(b.product.name);
+      }
+    );
+
+    return {
+      storeScopedProducts: inSource,
+      otherLocationSearchMatches: elsewhere,
+    };
   }, [
     accessibleProducts,
+    accessibleShops,
     selectedSourceLocation,
     selectedSourceStore,
     transferableStores,
@@ -843,7 +927,14 @@ export const AdminStores: React.FC = () => {
       isInvalidPrice: boolean;
     }[] = [];
 
-    for (const [productId, rawQty] of Object.entries(selectedTransferMap)) {
+    const orderSet = new Set(selectedTransferOrder);
+    const orderedIds = [
+      ...selectedTransferOrder.filter(id => id in selectedTransferMap),
+      ...Object.keys(selectedTransferMap).filter(id => !orderSet.has(id)),
+    ];
+
+    for (const productId of orderedIds) {
+      const rawQty = selectedTransferMap[productId];
       const qtyStr = typeof rawQty === 'string' ? rawQty : String(rawQty ?? '');
       const product = productByIdMap.get(productId);
       if (!product) continue;
@@ -881,6 +972,7 @@ export const AdminStores: React.FC = () => {
     return entries;
   }, [
     selectedTransferMap,
+    selectedTransferOrder,
     selectedPriceMap,
     productByIdMap,
     selectedSourceLocation,
@@ -1234,6 +1326,7 @@ export const AdminStores: React.FC = () => {
     setSourceLocationKey('');
     setDestLocationKey('');
     setSelectedTransferMap({});
+    setSelectedTransferOrder([]);
     setSelectedPriceMap({});
     setProductSearch('');
     setTransferVisibleLimit(STORE_PAGE_SIZE);
@@ -1378,6 +1471,9 @@ export const AdminStores: React.FC = () => {
       priceMap[item.productId] = String(item.unitPrice);
     }
     setSelectedTransferMap(qtyMap);
+    setSelectedTransferOrder(
+      Array.from(new Set((transfer.items || []).map(item => item.productId)))
+    );
     setSelectedPriceMap(priceMap);
     setProductSearch('');
     setTransferVisibleLimit(STORE_PAGE_SIZE);
@@ -1395,6 +1491,7 @@ export const AdminStores: React.FC = () => {
     setSourceLocationKey(nextKey);
     setDestLocationKey('');
     setSelectedTransferMap({});
+    setSelectedTransferOrder([]);
     setSelectedPriceMap({});
     setProductSearch('');
     setTransferVisibleLimit(STORE_PAGE_SIZE);
@@ -1433,6 +1530,7 @@ export const AdminStores: React.FC = () => {
         ...prev,
         [product.id]: String(nextQty),
       }));
+      setSelectedTransferOrder(prev => [product.id, ...prev.filter(id => id !== product.id)]);
     } else {
       if (Object.keys(selectedTransferMap).length >= MAX_BATCH_TRANSFER_PRODUCTS) {
         addToast({
@@ -1450,6 +1548,7 @@ export const AdminStores: React.FC = () => {
         ...prev,
         [product.id]: available > 0 ? '1' : '0',
       }));
+      setSelectedTransferOrder(prev => [product.id, ...prev.filter(id => id !== product.id)]);
     }
 
     setProductSearch('');
@@ -1595,6 +1694,7 @@ export const AdminStores: React.FC = () => {
       const wasEditing = Boolean(editingTransferId);
       setEditingTransferId(null);
       setSelectedTransferMap({});
+      setSelectedTransferOrder([]);
       setSelectedPriceMap({});
       setProductSearch('');
       setSelectedQueueFilter('');
@@ -2119,6 +2219,7 @@ export const AdminStores: React.FC = () => {
     setSelectedTransferMap({
       [product.id]: availableHere > 0 ? '1' : '0',
     });
+    setSelectedTransferOrder([product.id]);
     setSelectedPriceMap({
       [product.id]: String(Number(product.sellingPrice || product.purchasePrice || 0)),
     });
@@ -2150,6 +2251,7 @@ export const AdminStores: React.FC = () => {
           delete next[deletingProduct.id];
           return next;
         });
+        setSelectedTransferOrder(prev => prev.filter(id => id !== deletingProduct.id));
       }
       setDeletingProduct(null);
     } else {
@@ -3224,6 +3326,7 @@ export const AdminStores: React.FC = () => {
                         type="button"
                         onClick={() => {
                           setSelectedTransferMap({});
+                          setSelectedTransferOrder([]);
                           setSelectedPriceMap({});
                           setSelectedQueueFilter('');
                           setTransferError('');
@@ -3247,21 +3350,108 @@ export const AdminStores: React.FC = () => {
                           <strong className="text-white">
                             {storeScopedProducts.length.toLocaleString()}
                           </strong>{' '}
-                          match{storeScopedProducts.length === 1 ? '' : 'es'} for &ldquo;
-                          {productSearch.trim()}&rdquo; — click a product to add
+                          match{storeScopedProducts.length === 1 ? '' : 'es'} in{' '}
+                          <strong className="text-slate-200">{selectedSourceLocation.name}</strong>{' '}
+                          for &ldquo;{productSearch.trim()}&rdquo;
+                          {storeScopedProducts.length > 0 ? ' — click a product to add' : ''}
                         </span>
                       </div>
 
                       {storeScopedProducts.length === 0 ? (
-                        <div className="py-7 px-4 text-center">
-                          <Package className="w-8 h-8 mx-auto text-slate-600 mb-1.5" />
-                          <p className="text-xs font-medium text-slate-400">
-                            No products match &ldquo;{productSearch.trim()}&rdquo;
-                          </p>
-                          <p className="text-[11px] text-slate-500 mt-0.5">
-                            Try a shorter search or check the SKU in {selectedSourceLocation.name}.
-                          </p>
-                        </div>
+                        otherLocationSearchMatches.length > 0 ? (
+                          (() => {
+                            const uniqueStockedLabels: string[] = [];
+                            for (const m of otherLocationSearchMatches) {
+                              for (const loc of m.stockedLocations) {
+                                if (!uniqueStockedLabels.includes(loc.label)) {
+                                  uniqueStockedLabels.push(loc.label);
+                                }
+                              }
+                            }
+                            const formatOrList = (items: string[]) => {
+                              if (items.length === 0) return '';
+                              if (items.length === 1) return items[0];
+                              if (items.length === 2) return `${items[0]} or ${items[1]}`;
+                              return `${items.slice(0, -1).join(', ')}, or ${items[items.length - 1]}`;
+                            };
+                            const sourceNoun =
+                              selectedSourceLocation.type === 'STORE'
+                                ? `this store (${selectedSourceLocation.name})`
+                                : `this shop (${selectedSourceLocation.name})`;
+
+                            return (
+                              <div className="p-4 space-y-3">
+                                <div className="flex items-start gap-2.5 p-3 rounded-xl bg-amber-500/10 border border-amber-500/30">
+                                  <AlertCircle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                                  <div className="min-w-0 space-y-1">
+                                    <p className="text-xs font-semibold text-amber-200">
+                                      {uniqueStockedLabels.length > 0
+                                        ? `No this product in ${sourceNoun} — it is in ${formatOrList(uniqueStockedLabels)}.`
+                                        : `No this product in ${sourceNoun}.`}
+                                    </p>
+                                    <p className="text-[11px] text-amber-300/80">
+                                      Change <span className="font-semibold">Location From</span> to
+                                      where the product is stocked to transfer it.
+                                    </p>
+                                  </div>
+                                </div>
+
+                                <div className="divide-y divide-slate-800/70 rounded-xl border border-slate-800/80 bg-slate-900/40 max-h-56 overflow-y-auto">
+                                  {otherLocationSearchMatches.slice(0, 8).map(m => (
+                                    <div
+                                      key={m.product.id}
+                                      className="px-3 py-2.5 flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs"
+                                    >
+                                      <div className="min-w-0">
+                                        <div className="font-medium text-slate-200 truncate">
+                                          {m.product.name}
+                                          {m.product.variation ? ` (${m.product.variation})` : ''}
+                                        </div>
+                                        <div className="text-[11px] text-slate-500 font-mono">
+                                          {m.product.sku}
+                                        </div>
+                                      </div>
+
+                                      <div className="flex flex-wrap items-center gap-1.5 shrink-0">
+                                        {m.stockedLocations.length > 0 ? (
+                                          m.stockedLocations.map(loc => (
+                                            <span
+                                              key={`${m.product.id}-${loc.label}`}
+                                              className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-blue-500/15 border border-blue-500/30 text-blue-200 text-[11px] font-medium"
+                                            >
+                                              <MapPin className="w-3 h-3 text-blue-400" />
+                                              <span>
+                                                {loc.label}: {loc.qty.toLocaleString()}{' '}
+                                                {m.product.unit || 'pcs'}
+                                              </span>
+                                            </span>
+                                          ))
+                                        ) : (
+                                          <span className="px-2 py-0.5 rounded-md bg-slate-800 text-slate-400 text-[11px]">
+                                            0 stock
+                                            {m.zeroLocations.length > 0
+                                              ? ` (listed in ${formatOrList(m.zeroLocations)})`
+                                              : ''}
+                                          </span>
+                                        )}
+                                      </div>
+                                    </div>
+                                  ))}
+                                </div>
+                              </div>
+                            );
+                          })()
+                        ) : (
+                          <div className="py-7 px-4 text-center">
+                            <Package className="w-8 h-8 mx-auto text-slate-600 mb-1.5" />
+                            <p className="text-xs font-medium text-slate-400">
+                              No products match &ldquo;{productSearch.trim()}&rdquo;
+                            </p>
+                            <p className="text-[11px] text-slate-500 mt-0.5">
+                              Try a shorter search or check the SKU in {selectedSourceLocation.name}.
+                            </p>
+                          </div>
+                        )
                       ) : (
                         <div className="max-h-72 overflow-y-auto divide-y divide-slate-800/70 overscroll-contain">
                           {storeScopedProducts.slice(0, transferVisibleLimit).map(p => {
@@ -3359,6 +3549,31 @@ export const AdminStores: React.FC = () => {
                                   </span>
                                 </button>
                               )}
+                            </div>
+                          )}
+
+                          {otherLocationSearchMatches.length > 0 && (
+                            <div className="px-3 py-2.5 bg-amber-500/5 border-t border-amber-500/20 text-[11px] text-amber-200/90 space-y-1">
+                              <div className="font-semibold flex items-center gap-1.5 text-amber-300">
+                                <AlertCircle className="w-3.5 h-3.5 shrink-0" />
+                                <span>
+                                  {otherLocationSearchMatches.length} other matching product
+                                  {otherLocationSearchMatches.length === 1 ? '' : 's'} not in{' '}
+                                  {selectedSourceLocation.name}:
+                                </span>
+                              </div>
+                              <div className="flex flex-wrap gap-x-3 gap-y-1 text-slate-300">
+                                {otherLocationSearchMatches.slice(0, 3).map(m => (
+                                  <span key={m.product.id}>
+                                    <strong className="text-white">{m.product.name}</strong>{' '}
+                                    {m.stockedLocations.length > 0
+                                      ? `is in ${m.stockedLocations
+                                          .map(l => `${l.label} (${l.qty})`)
+                                          .join(' or ')}`
+                                      : '(0 stock)'}
+                                  </span>
+                                ))}
+                              </div>
                             </div>
                           )}
                         </div>
@@ -3506,6 +3721,9 @@ export const AdminStores: React.FC = () => {
                                       delete next[entry.product.id];
                                       return next;
                                     });
+                                    setSelectedTransferOrder(prev =>
+                                      prev.filter(id => id !== entry.product.id)
+                                    );
                                     setSelectedPriceMap(prev => {
                                       const next = { ...prev };
                                       delete next[entry.product.id];
