@@ -822,7 +822,6 @@ export class SyncService {
             productName: item.product_name,
             quantity: item.quantity,
             unitCost: item.unit_cost,
-            sellingPrice: item.selling_price ?? item.sellingPrice,
             total: item.total,
           }));
 
@@ -834,7 +833,7 @@ export class SyncService {
           storeId: cloudPurchase.store_id || undefined,
           storeName: cloudPurchase.store_name || undefined,
           supplierName: cloudPurchase.supplier_name,
-          supplierPhone: cloudPurchase.supplier_phone || cloudPurchase.supplierPhone || undefined,
+          supplierPhone: cloudPurchase.supplier_phone || undefined,
           date: cloudPurchase.date,
           totalAmount: cloudPurchase.total_amount,
           paymentStatus: cloudPurchase.payment_status,
@@ -1104,6 +1103,26 @@ export class SyncService {
         mergedSettings.enableTax = !!cloudData.settings.enable_tax;
       if (cloudData.settings.enable_sales_assistant !== undefined)
         mergedSettings.enableSalesAssistant = !!cloudData.settings.enable_sales_assistant;
+      if (cloudData.settings.enable_customer_details !== undefined)
+        mergedSettings.enableCustomerDetails = !!cloudData.settings.enable_customer_details;
+      if (cloudData.settings.customer_details_by_shop !== undefined) {
+        try {
+          const rawMap =
+            typeof cloudData.settings.customer_details_by_shop === 'string'
+              ? JSON.parse(cloudData.settings.customer_details_by_shop)
+              : cloudData.settings.customer_details_by_shop;
+          if (rawMap && typeof rawMap === 'object' && !Array.isArray(rawMap)) {
+            const cleanMap: Record<string, boolean> = {};
+            for (const [k, v] of Object.entries(rawMap)) {
+              if (k && typeof v === 'boolean') cleanMap[k] = v;
+              else if (k && (v === 1 || v === 0)) cleanMap[k] = v === 1;
+            }
+            mergedSettings.customerDetailsByShop = cleanMap;
+          }
+        } catch {
+          // keep local map if malformed
+        }
+      }
       if (cloudData.settings.receipt_header_note)
         mergedSettings.receiptHeaderNote =
           cloudData.settings.receipt_header_note;
@@ -1112,6 +1131,61 @@ export class SyncService {
           cloudData.settings.receipt_footer_note;
 
       db.saveSettings(mergedSettings);
+    }
+
+    // Apply customer records
+    if (Array.isArray(cloudData.customerRecords) && cloudData.customerRecords.length > 0) {
+      const localRecords = db.getCustomerRecords();
+      const mergedMap = new Map(localRecords.map(r => [r.id, r]));
+
+      cloudData.customerRecords.forEach((cr: any) => {
+        if (!cr?.id) return;
+        let parsedUrls: string[] = [];
+        try {
+          parsedUrls =
+            typeof cr.image_urls === 'string'
+              ? JSON.parse(cr.image_urls)
+              : Array.isArray(cr.image_urls)
+                ? cr.image_urls
+                : Array.isArray(cr.imageUrls)
+                  ? cr.imageUrls
+                  : [];
+        } catch {
+          parsedUrls = [];
+        }
+
+        let parsedItems: any[] = [];
+        try {
+          parsedItems =
+            typeof cr.items_json === 'string'
+              ? JSON.parse(cr.items_json)
+              : Array.isArray(cr.items)
+                ? cr.items
+                : [];
+        } catch {
+          parsedItems = [];
+        }
+
+        mergedMap.set(cr.id, {
+          id: cr.id,
+          customerName: cr.customer_name || cr.customerName || '',
+          phoneNumber: cr.phone_number || cr.phoneNumber || '',
+          imageUrls: parsedUrls.filter((u): u is string => typeof u === 'string').slice(0, 24),
+          saleId: cr.sale_id || cr.saleId || undefined,
+          receiptNumber: cr.receipt_number || cr.receiptNumber || undefined,
+          shopId: cr.shop_id || cr.shopId || undefined,
+          shopName: cr.shop_name || cr.shopName || undefined,
+          saleDate: cr.sale_date || cr.saleDate || cr.created_at || cr.createdAt || undefined,
+          items: Array.isArray(parsedItems) ? parsedItems : [],
+          createdAt: cr.created_at || cr.createdAt || new Date().toISOString(),
+          updatedAt: cr.updated_at || cr.updatedAt || new Date().toISOString(),
+        });
+      });
+
+      const mergedList = Array.from(mergedMap.values()).sort((a, b) =>
+        b.createdAt.localeCompare(a.createdAt)
+      );
+      db.saveCustomerRecords(mergedList);
     }
 
     // Apply stock transfers
