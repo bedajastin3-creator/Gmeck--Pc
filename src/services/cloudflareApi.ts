@@ -497,6 +497,52 @@ export class CloudflareApi {
     return this.uploadImage(file, 'product', productId, imageOrder);
   }
 
+  public static async uploadCustomerPhoto(
+    file: Blob | File,
+    recordId: string,
+    imageOrder: number
+  ): Promise<{ success: boolean; key: string; url: string; size?: number; mimeType?: string }> {
+    return this.uploadImage(file, 'customer_record', recordId, imageOrder);
+  }
+
+  // ==========================================
+  // CUSTOMER RECORDS ENDPOINTS
+  // ==========================================
+  public static async getCustomerRecords(search?: string, limit: number = 100): Promise<any[]> {
+    const params = new URLSearchParams();
+    if (search?.trim()) params.set('search', search.trim());
+    params.set('limit', String(limit));
+    const result = await this.request<{ success?: boolean; records?: any[] }>(
+      `/customer-records?${params.toString()}`
+    );
+    return result.records || [];
+  }
+
+  public static async createCustomerRecord(record: {
+    id?: string;
+    customerName: string;
+    phoneNumber: string;
+    imageUrls: string[];
+    saleId?: string;
+    receiptNumber?: string;
+    shopId?: string;
+    shopName?: string;
+    saleDate?: string;
+    items?: any[];
+    createdAt?: string;
+  }): Promise<{ success: boolean; record?: any; error?: string }> {
+    return this.request('/customer-records', {
+      method: 'POST',
+      body: JSON.stringify(record),
+    });
+  }
+
+  public static async deleteCustomerRecord(id: string): Promise<{ success: boolean; id?: string }> {
+    return this.request(`/customer-records/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+    });
+  }
+
   public static async uploadBackup(backupFile: Blob | File): Promise<any> {
     if (!this.isOnline()) {
       throw new Error('OFFLINE: Cannot upload backup');
