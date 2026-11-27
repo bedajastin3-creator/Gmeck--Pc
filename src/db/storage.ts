@@ -18,6 +18,7 @@ import {
   SaleEditRequest,
   StockTransfer,
   PurchaseReturn,
+  CustomerRecord,
 } from '../types';
 import {
   INITIAL_USERS,
@@ -56,6 +57,7 @@ export interface DatabaseState {
   saleEditRequests: SaleEditRequest[];
   stockTransfers: StockTransfer[];
   purchaseReturns: PurchaseReturn[];
+  customerRecords?: CustomerRecord[];
 }
 
 type DBListener = () => void;
@@ -172,6 +174,7 @@ class LocalDatabase {
     const saleEditRequests = this.loadTable<SaleEditRequest[]>('sale_edit_requests', []);
     const stockTransfers = this.loadTable<StockTransfer[]>('stock_transfers', []);
     const purchaseReturns = this.loadTable<PurchaseReturn[]>('purchase_returns', []);
+    const customerRecords = this.loadTable<CustomerRecord[]>('customer_records', []);
 
     // Ensure users have Admin account
     if (!users || users.length === 0) {
@@ -249,6 +252,7 @@ class LocalDatabase {
       saleEditRequests: saleEditRequests || [],
       stockTransfers: stockTransfers || [],
       purchaseReturns: purchaseReturns || [],
+      customerRecords: customerRecords || [],
     };
 
     return this.memoryCache;
@@ -383,6 +387,18 @@ class LocalDatabase {
     if (!this.memoryCache) this.init();
     this.memoryCache!.purchaseReturns = returns;
     this.saveTable('purchase_returns', returns);
+    this.notify();
+  }
+
+  // --- Customer Records ---
+  public getCustomerRecords(): CustomerRecord[] {
+    return this.getState().customerRecords || [];
+  }
+
+  public saveCustomerRecords(records: CustomerRecord[]): void {
+    if (!this.memoryCache) this.init();
+    this.memoryCache!.customerRecords = records;
+    this.saveTable('customer_records', records);
     this.notify();
   }
 
@@ -668,6 +684,7 @@ class LocalDatabase {
       this.saveTable('sale_edit_requests', d.saleEditRequests || []);
       this.saveTable('stock_transfers', d.stockTransfers || []);
       this.saveTable('purchase_returns', d.purchaseReturns || []);
+      this.saveTable('customer_records', d.customerRecords || []);
 
       this.init();
       this.notify();
@@ -827,6 +844,7 @@ class LocalDatabase {
     this.saveTable('sale_edit_requests', []);
     this.saveTable('stock_transfers', []);
     this.saveTable('purchase_returns', []);
+    this.saveTable('customer_records', []);
 
     this.init();
     this.notify();

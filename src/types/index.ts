@@ -417,12 +417,37 @@ export interface BusinessSettings {
   taxRatePercent: number;
   enableTax: boolean;
   enableSalesAssistant?: boolean;
+  enableCustomerDetails?: boolean;
+  customerDetailsByShop?: Record<string, boolean>;
   receiptHeaderNote: string;
   receiptFooterNote: string;
   receiptPaperWidth: '80mm' | '58mm' | 'A4';
   lowStockThresholdDefault: number;
   logoUrl?: string;
   themePrimaryColor?: string;
+}
+
+export interface CustomerRecordItem {
+  productId?: string;
+  productName: string;
+  quantity: number;
+  unitPrice?: number;
+  total?: number;
+}
+
+export interface CustomerRecord {
+  id: string;
+  customerName: string;
+  phoneNumber: string;
+  imageUrls: string[];
+  saleId?: string;
+  receiptNumber?: string;
+  shopId?: string;
+  shopName?: string;
+  saleDate?: string;
+  items?: CustomerRecordItem[];
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface AuditLog {

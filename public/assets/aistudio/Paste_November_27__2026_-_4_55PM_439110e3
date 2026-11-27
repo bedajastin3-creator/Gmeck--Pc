@@ -1,0 +1,1353 @@
+import React, { useState, useMemo, useEffect, useRef } from 'react';
+import {
+  CreditCard,
+  Plus,
+  Search,
+  PieChart,
+  X,
+  TrendingDown,
+  Edit2,
+  Trash2,
+  Tag,
+  FolderPlus,
+  Save,
+  AlertTriangle,
+  Filter,
+  ChevronDown,
+  ArrowLeft,
+  ClipboardList,
+} from 'lucide-react';
+import { useApp } from '../../context/AppContext';
+import { ExpenseService } from '../../services/expenseService';
+import { PaymentMethod, Expense } from '../../types';
+import { formatCurrency, formatDateTime } from '../../utils/formatters';
+import { formatPriceInput, parsePriceInput } from '../../utils/priceInput';
+import {
+  getAdminManagedShops,
+  getShopAdminShopIds,
+  hasAdminAccess,
+  isPlatformAdmin,
+  isShopAdmin,
+} from '../../utils/permissions';
+
+const DEFAULT_EXPENSE_CATEGORIES: { id: string; label: string; isCustom?: boolean }[] = [
+  { id: 'RENT', label: 'Store Rent & Lease' },
+  { id: 'ELECTRICITY', label: 'Electricity & Utilities' },
+  { id: 'SALARIES', label: 'Staff Salaries & Payroll' },
+  { id: 'TRANSPORT', label: 'Transport & Logistics' },
+  { id: 'INTERNET', label: 'Internet & Communications' },
+  { id: 'MAINTENANCE', label: 'Maintenance & Repairs' },
+  { id: 'MARKETING', label: 'Marketing & Advertising' },
+  { id: 'SUPPLIES', label: 'Store Supplies & Consumables' },
+  { id: 'OTHER', label: 'General / Miscellaneous' },
+];
+
+const CUSTOM_CATEGORIES_KEY = 'omnibiz_custom_expense_categories';
+
+type PeriodFilter = 'today' | 'week' | 'month' | 'year' | 'custom' | 'all';
+
+interface CustomCategory {
+  id: string;
+  label: string;
+  isCustom: true;
+}
+
+export const AdminExpenses: React.FC = () => {
+  const {
+    currentUser,
+    dbState,
+    addToast,
+    selectedShopId,
+    expensesSubTab,
+    setExpensesSubTab,
+    expensesNavTick,
+  } = useApp();
+  const [isCategoryModalOpen, setIsCategoryModalOpen] = useState(false);
+  const [isFilterSheetOpen, setIsFilterSheetOpen] = useState(false);
+
+  const [editingExpense, setEditingExpense] = useState<Expense | null>(null);
+  const [deletingExpense, setDeletingExpense] = useState<Expense | null>(null);
+  const [editingCategory, setEditingCategory] = useState<CustomCategory | null>(null);
+  const [deletingCategory, setDeletingCategory] = useState<CustomCategory | null>(null);
+
+  const [searchQuery, setSearchQuery] = useState('');
+  const [categoryFilter, setCategoryFilter] = useState('ALL');
+  const [shopFilter, setShopFilter] = useState('ALL');
+
+  // Period filter — ✅ DEFAULT: TODAY
+  const [periodFilter, setPeriodFilter] = useState<PeriodFilter>('today');
+  const [customStartDate, setCustomStartDate] = useState('');
+  const [customEndDate, setCustomEndDate] = useState('');
+
+  // Custom Categories
+  const [customCategories, setCustomCategories] = useState<CustomCategory[]>(() => {
+    try {
+      const stored = localStorage.getItem(CUSTOM_CATEGORIES_KEY);
+      return stored ? JSON.parse(stored) : [];
+    } catch {
+      return [];
+    }
+  });
+  const [newCategoryName, setNewCategoryName] = useState('');
+  const [categoryError, setCategoryError] = useState('');
+
+  // Form state
+  const [title, setTitle] = useState('');
+  const [shopIdInput, setShopIdInput] = useState('GENERAL');
+  const [category, setCategory] = useState<string>('ELECTRICITY');
+  const [amount, setAmount] = useState('');
+  const [paymentMethod, setPaymentMethod] = useState<PaymentMethod>('CASH');
+  const [reference, setReference] = useState('');
+  const [notes, setNotes] = useState('');
+  const [formError, setFormError] = useState('');
+
+  const allCategories = useMemo(() => {
+    return [...DEFAULT_EXPENSE_CATEGORIES, ...customCategories];
+  }, [customCategories]);
+
+  // Permission check
+  if (!currentUser) return null;
+  if (
+    !hasAdminAccess(currentUser) &&
+    !currentUser.permissions?.canViewExpenses &&
+    !currentUser.permissions?.canRecordExpenses
+  )
+    return null;
+
+  const platformAdmin = isPlatformAdmin(currentUser);
+  const shopAdmin = isShopAdmin(currentUser);
+  const managedShopIds = getShopAdminShopIds(currentUser);
+  const canRecordExpense =
+    hasAdminAccess(currentUser) || currentUser.permissions?.canRecordExpenses;
+  const isAdmin = hasAdminAccess(currentUser);
+
+  const settings = dbState.settings;
+  const allShops = dbState.shops || [];
+  const shops = platformAdmin
+    ? allShops
+    : shopAdmin
+      ? getAdminManagedShops(currentUser, allShops)
+      : allShops.filter(s => (currentUser.assignedShopIds || []).includes(s.id));
+
+  const canManageExpense = (expense: Expense) =>
+    platformAdmin || (shopAdmin && !!expense.shopId && managedShopIds.includes(expense.shopId));
+
+  const saveCustomCategories = (cats: CustomCategory[]) => {
+    setCustomCategories(cats);
+    localStorage.setItem(CUSTOM_CATEGORIES_KEY, JSON.stringify(cats));
+  };
+
+  // Date range
+  const dateRange = useMemo(() => {
+    const now = new Date();
+    switch (periodFilter) {
+      case 'today': {
+        const d = now.toISOString().slice(0, 10);
+        return { from: d, to: d };
+      }
+      case 'week': {
+        const past = new Date(now.getTime() - 7 * 86400000);
+        return {
+          from: past.toISOString().slice(0, 10),
+          to: now.toISOString().slice(0, 10),
+        };
+      }
+      case 'month': {
+        const past = new Date(now.getFullYear(), now.getMonth(), 1);
+        return {
+          from: past.toISOString().slice(0, 10),
+          to: now.toISOString().slice(0, 10),
+        };
+      }
+      case 'year': {
+        const past = new Date(now.getFullYear(), 0, 1);
+        return {
+          from: past.toISOString().slice(0, 10),
+          to: now.toISOString().slice(0, 10),
+        };
+      }
+      case 'custom':
+        return { from: customStartDate || undefined, to: customEndDate || undefined };
+      case 'all':
+      default:
+        return { from: undefined, to: undefined };
+    }
+  }, [periodFilter, customStartDate, customEndDate]);
+
+  // Get expenses
+  const expenses = useMemo(() => {
+    return ExpenseService.getExpenses(
+      {
+        shopId: shopFilter === 'ALL' ? undefined : shopFilter,
+        category: categoryFilter === 'ALL' ? undefined : categoryFilter,
+        search: searchQuery,
+        startDate: dateRange.from,
+        endDate: dateRange.to,
+      },
+      currentUser
+    );
+  }, [shopFilter, categoryFilter, searchQuery, dateRange, currentUser, dbState.expenses]);
+
+  const totalSpent = expenses.reduce((sum, e) => sum + e.amount, 0);
+
+  // Top category
+  const topCategory = useMemo(() => {
+    const totals: Record<string, number> = {};
+    expenses.forEach(e => {
+      totals[e.category] = (totals[e.category] || 0) + e.amount;
+    });
+    let topCat = '';
+    let topAmount = 0;
+    Object.entries(totals).forEach(([cat, amt]) => {
+      if (amt > topAmount) {
+        topAmount = amt;
+        topCat = cat;
+      }
+    });
+    if (topCat) {
+      const found = allCategories.find(c => c.id === topCat);
+      return found ? found.label : topCat;
+    }
+    return 'No data';
+  }, [expenses, allCategories]);
+
+  const getCategoryLabel = (catId: string): string => {
+    const found = allCategories.find(c => c.id === catId);
+    return found ? found.label : catId;
+  };
+
+  const initAddExpenseForm = () => {
+    setEditingExpense(null);
+    const defaultShop = !platformAdmin
+      ? selectedShopId &&
+        selectedShopId !== 'ALL' &&
+        shops.some(s => s.id === selectedShopId)
+        ? selectedShopId
+        : shops[0]?.id || ''
+      : selectedShopId && selectedShopId !== 'ALL'
+        ? selectedShopId
+        : 'GENERAL';
+    setShopIdInput(defaultShop);
+    setTitle('');
+    setCategory('ELECTRICITY');
+    setAmount('');
+    setPaymentMethod('CASH');
+    setReference('');
+    setNotes('');
+    setFormError('');
+  };
+
+  // Initialize fresh Add Expense form when navigating to 'add' from menu
+  useEffect(() => {
+    if (expensesSubTab === 'add' && !editingExpense) {
+      initAddExpenseForm();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [expensesSubTab, expensesNavTick]);
+
+  // Reset form if user clicks "Add Expense" or "List" in menu while editing
+  const prevExpenseNavTickRef = useRef(expensesNavTick);
+  useEffect(() => {
+    if (prevExpenseNavTickRef.current !== expensesNavTick) {
+      prevExpenseNavTickRef.current = expensesNavTick;
+      if (expensesSubTab === 'add') {
+        initAddExpenseForm();
+      } else {
+        setEditingExpense(null);
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [expensesNavTick, expensesSubTab]);
+
+  const openAddPage = () => {
+    initAddExpenseForm();
+    setExpensesSubTab('add');
+  };
+
+  const openEditPage = (expense: Expense) => {
+    setEditingExpense(expense);
+    setShopIdInput(expense.shopId || 'GENERAL');
+    setTitle(expense.title || expense.description);
+    setCategory(expense.category);
+    setAmount(expense.amount.toString());
+    setPaymentMethod(expense.paymentMethod);
+    setReference(expense.reference || '');
+    setNotes(expense.notes || '');
+    setFormError('');
+    setExpensesSubTab('add');
+  };
+
+  const handleCancelForm = () => {
+    setEditingExpense(null);
+    setFormError('');
+    setExpensesSubTab('list');
+  };
+
+  const handleSaveExpense = (e: React.FormEvent) => {
+    e.preventDefault();
+    setFormError('');
+
+    if (!title.trim()) {
+      setFormError('Expense description title is required.');
+      return;
+    }
+
+    if (!platformAdmin && (!shopIdInput || shopIdInput === 'GENERAL')) {
+      setFormError('Please select your shop for this expense.');
+      return;
+    }
+
+    const amt = parsePriceInput(amount);
+    if (isNaN(amt) || amt <= 0) {
+      setFormError('Please enter a valid expense amount.');
+      return;
+    }
+
+    const resolvedShopId = shopIdInput === 'GENERAL' ? null : shopIdInput;
+    const isCompanyExpense = shopIdInput === 'GENERAL';
+
+    if (editingExpense) {
+      const res = ExpenseService.updateExpense(
+        editingExpense.id,
+        {
+          shopId: resolvedShopId,
+          title: title.trim(),
+          category,
+          amount: amt,
+          paymentMethod,
+          reference: reference.trim() || undefined,
+          notes: notes.trim() || undefined,
+        },
+        currentUser
+      );
+
+      if (res.success) {
+        addToast({
+          type: 'success',
+          title: 'Expense Updated',
+          description: `Expense updated successfully.`,
+        });
+        setEditingExpense(null);
+        setExpensesSubTab('list');
+      } else {
+        setFormError(res.error || 'Failed to update expense.');
+      }
+    } else {
+      const res = ExpenseService.createExpense(
+        {
+          shopId: resolvedShopId,
+          isCompanyExpense,
+          title: title.trim(),
+          category,
+          amount: amt,
+          paymentMethod,
+          reference: reference.trim() || undefined,
+          notes: notes.trim() || undefined,
+        },
+        currentUser
+      );
+
+      if (res.success) {
+        addToast({
+          type: 'success',
+          title: 'Expense Recorded',
+          description: `Expense of ${formatCurrency(
+            amt,
+            settings.currencySymbol
+          )} logged under ${getCategoryLabel(category)}.`,
+        });
+        setExpensesSubTab('list');
+      } else {
+        setFormError(res.error || 'Failed to record expense.');
+      }
+    }
+  };
+
+  const handleDeleteExpense = () => {
+    if (!deletingExpense || !currentUser) return;
+    const res = ExpenseService.deleteExpense(deletingExpense.id, currentUser);
+    if (res.success) {
+      addToast({
+        type: 'success',
+        title: 'Expense Deleted',
+        description: `Expense "${deletingExpense.title}" has been deleted.`,
+      });
+    } else {
+      addToast({
+        type: 'error',
+        title: 'Delete Failed',
+        description: res.error || 'Could not delete expense.',
+      });
+    }
+    setDeletingExpense(null);
+  };
+
+  const handleCreateCategory = () => {
+    setCategoryError('');
+    if (!newCategoryName.trim()) {
+      setCategoryError('Category name is required.');
+      return;
+    }
+    const cleanName = newCategoryName.trim();
+    const categoryId = `CUSTOM_${cleanName.toUpperCase().replace(/\s+/g, '_')}`;
+
+    const exists = allCategories.some(
+      c =>
+        c.id.toLowerCase() === categoryId.toLowerCase() ||
+        c.label.toLowerCase() === cleanName.toLowerCase()
+    );
+    if (exists) {
+      setCategoryError('A category with this name already exists.');
+      return;
+    }
+
+    const newCat: CustomCategory = { id: categoryId, label: cleanName, isCustom: true };
+    saveCustomCategories([...customCategories, newCat]);
+    setNewCategoryName('');
+    addToast({
+      type: 'success',
+      title: 'Category Created',
+      description: `Custom category "${cleanName}" added.`,
+    });
+  };
+
+  const handleEditCategory = (cat: CustomCategory) => {
+    setEditingCategory(cat);
+    setNewCategoryName(cat.label);
+    setCategoryError('');
+    setIsCategoryModalOpen(true);
+  };
+
+  const handleSaveEditedCategory = () => {
+    if (!editingCategory) return;
+    if (!newCategoryName.trim()) {
+      setCategoryError('Category name is required.');
+      return;
+    }
+    const cleanName = newCategoryName.trim();
+    const updatedCats = customCategories.map(c =>
+      c.id === editingCategory.id ? { ...c, label: cleanName } : c
+    );
+    saveCustomCategories(updatedCats);
+    setEditingCategory(null);
+    setNewCategoryName('');
+    setCategoryError('');
+    addToast({
+      type: 'success',
+      title: 'Category Updated',
+      description: `Category renamed to "${cleanName}".`,
+    });
+  };
+
+  const handleDeleteCategory = () => {
+    if (!deletingCategory) return;
+    const updatedCats = customCategories.filter(c => c.id !== deletingCategory.id);
+    saveCustomCategories(updatedCats);
+    if (categoryFilter === deletingCategory.id) setCategoryFilter('ALL');
+    if (category === deletingCategory.id) setCategory('ELECTRICITY');
+    addToast({
+      type: 'success',
+      title: 'Category Deleted',
+      description: `Category "${deletingCategory.label}" removed.`,
+    });
+    setDeletingCategory(null);
+  };
+
+  const handleOpenCategoryModal = () => {
+    setEditingCategory(null);
+    setNewCategoryName('');
+    setCategoryError('');
+    setIsCategoryModalOpen(true);
+  };
+
+  const getPeriodLabel = () => {
+    switch (periodFilter) {
+      case 'today':
+        return 'Today';
+      case 'week':
+        return 'Last 7 Days';
+      case 'month':
+        return 'This Month';
+      case 'year':
+        return 'This Year';
+      case 'custom':
+        return 'Custom Range';
+      case 'all':
+        return 'All Time';
+      default:
+        return 'Today';
+    }
+  };
+
+  const resetFilters = () => {
+    setPeriodFilter('today');
+    setSearchQuery('');
+    setCategoryFilter('ALL');
+    setShopFilter('ALL');
+    setCustomStartDate('');
+    setCustomEndDate('');
+  };
+
+  const hasActiveFilters =
+    periodFilter !== 'today' ||
+    !!searchQuery ||
+    categoryFilter !== 'ALL' ||
+    shopFilter !== 'ALL';
+
+  // ─────────────────────────────────────────────────────────────
+  // FULL-PAGE VIEW: ADD / EDIT EXPENSE
+  // ─────────────────────────────────────────────────────────────
+  if (expensesSubTab === 'add' && canRecordExpense) {
+    return (
+      <div
+        id="admin-expenses-add-page"
+        className="flex-1 p-3.5 sm:p-6 bg-slate-950 text-slate-100 overflow-y-auto pb-24 sm:pb-8"
+      >
+        <div className="max-w-2xl mx-auto">
+          {/* Page Header */}
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-5 pb-4 border-b border-slate-800">
+            <div className="flex items-center gap-3 min-w-0">
+              <button
+                type="button"
+                onClick={handleCancelForm}
+                className="p-2 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-800 text-slate-300 hover:text-white transition shrink-0"
+                title="Back to Expense List"
+              >
+                <ArrowLeft className="w-4 h-4" />
+              </button>
+              <div className="min-w-0">
+                <div className="flex items-center gap-2">
+                  <TrendingDown className="w-5 h-5 text-rose-400 shrink-0" />
+                  <h2 className="text-lg sm:text-xl font-bold text-white tracking-tight truncate">
+                    {editingExpense ? 'Edit Expense' : 'Add Expense'}
+                  </h2>
+                </div>
+                <p className="text-xs text-slate-400 mt-0.5">
+                  {editingExpense
+                    ? 'Update expense details and recalculate operating totals'
+                    : 'Record an operating cost, utility bill, salary, or maintenance spend'}
+                </p>
+              </div>
+            </div>
+
+            <button
+              type="button"
+              onClick={handleCancelForm}
+              className="inline-flex items-center justify-center gap-1.5 px-3.5 py-2 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-800 text-slate-300 hover:text-white text-xs font-semibold transition shrink-0"
+            >
+              <ClipboardList className="w-3.5 h-3.5 text-rose-400" />
+              <span>Expense List</span>
+            </button>
+          </div>
+
+          {formError && (
+            <div className="mb-4 p-3.5 rounded-xl bg-rose-500/15 border border-rose-500/30 text-rose-300 text-xs font-medium">
+              {formError}
+            </div>
+          )}
+
+          {/* Full-Page Form Card */}
+          <form
+            onSubmit={handleSaveExpense}
+            className="bg-slate-900 border border-slate-800 rounded-2xl p-4 sm:p-6 shadow-xl space-y-4 text-xs"
+          >
+            <div>
+              <label className="block text-slate-300 font-semibold mb-1.5">
+                Shop / Unit {!platformAdmin ? '*' : ''}
+              </label>
+              <select
+                value={shopIdInput}
+                onChange={e => setShopIdInput(e.target.value)}
+                required={!platformAdmin}
+                className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2.5 text-white focus:outline-none focus:ring-1 focus:ring-blue-500"
+              >
+                {platformAdmin && (
+                  <option value="GENERAL">🏢 General Company (All Shops)</option>
+                )}
+                {shops.map(s => (
+                  <option key={s.id} value={s.id}>
+                    🏪 {s.name}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <div>
+              <label className="block text-slate-300 font-semibold mb-1.5">
+                Expense Description *
+              </label>
+              <input
+                type="text"
+                required
+                value={title}
+                onChange={e => setTitle(e.target.value)}
+                placeholder="e.g. Electricity Bill - July 2026"
+                className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2.5 text-white placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
+              />
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
+              <div>
+                <label className="block text-slate-300 font-semibold mb-1.5">Category</label>
+                <select
+                  value={category}
+                  onChange={e => setCategory(e.target.value)}
+                  className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2.5 text-white focus:outline-none focus:ring-1 focus:ring-blue-500"
+                >
+                  {DEFAULT_EXPENSE_CATEGORIES.map(c => (
+                    <option key={c.id} value={c.id}>
+                      {c.label}
+                    </option>
+                  ))}
+                  {customCategories.length > 0 && (
+                    <optgroup label="Custom Categories">
+                      {customCategories.map(c => (
+                        <option key={c.id} value={c.id}>
+                          {c.label}
+                        </option>
+                      ))}
+                    </optgroup>
+                  )}
+                </select>
+              </div>
+
+              <div>
+                <label className="block text-slate-300 font-semibold mb-1.5">Amount Spent *</label>
+                <div className="relative">
+                  <span className="absolute left-3.5 top-2.5 text-slate-500 font-mono">
+                    {settings.currencySymbol}
+                  </span>
+                  <input
+                    type="text"
+                    inputMode="decimal"
+                    required
+                    value={amount}
+                    onChange={e => setAmount(formatPriceInput(e.target.value))}
+                    placeholder="0"
+                    className="w-full bg-slate-950 border border-slate-800 rounded-xl pl-10 pr-3.5 py-2.5 text-white font-mono placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
+                  />
+                </div>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
+              <div>
+                <label className="block text-slate-300 font-semibold mb-1.5">Payment Method</label>
+                <select
+                  value={paymentMethod}
+                  onChange={e => setPaymentMethod(e.target.value as PaymentMethod)}
+                  className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2.5 text-white focus:outline-none focus:ring-1 focus:ring-blue-500"
+                >
+                  <option value="CASH">Cash</option>
+                  <option value="BANK">Bank Transfer / Check</option>
+                  <option value="CARD">Debit / Credit Card</option>
+                  <option value="MOBILE_MONEY">Mobile Money</option>
+                </select>
+              </div>
+
+              <div>
+                <label className="block text-slate-300 font-semibold mb-1.5">
+                  Receipt / Invoice #
+                </label>
+                <input
+                  type="text"
+                  value={reference}
+                  onChange={e => setReference(e.target.value)}
+                  placeholder="e.g. UTL-9912"
+                  className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2.5 text-white font-mono placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
+                />
+              </div>
+            </div>
+
+            <div>
+              <label className="block text-slate-300 font-semibold mb-1.5">Notes (Optional)</label>
+              <textarea
+                rows={3}
+                value={notes}
+                onChange={e => setNotes(e.target.value)}
+                placeholder="Additional context or account reference..."
+                className="w-full bg-slate-950 border border-slate-800 rounded-xl p-3 text-white placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
+              />
+            </div>
+
+            <div className="pt-4 border-t border-slate-800 flex flex-col sm:flex-row gap-2.5">
+              <button
+                type="button"
+                onClick={handleCancelForm}
+                className="sm:w-40 px-4 py-3 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 font-semibold transition"
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                className="flex-1 px-4 py-3 rounded-xl bg-blue-600 hover:bg-blue-500 active:bg-blue-700 text-white font-bold shadow-lg transition flex items-center justify-center gap-2"
+              >
+                <Save className="w-4 h-4" />
+                <span>{editingExpense ? 'Save Changes' : 'Save Expense'}</span>
+              </button>
+            </div>
+          </form>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div
+      id="admin-expenses-view"
+      className="flex-1 p-3.5 sm:p-6 bg-slate-950 text-slate-100 overflow-y-auto pb-24 sm:pb-6"
+    >
+      {/* Header */}
+      <div className="flex flex-col gap-3 mb-5 pb-4 border-b border-slate-800">
+        <div>
+          <h2 className="text-lg sm:text-xl font-bold text-white tracking-tight">
+            Operating Expenses
+          </h2>
+          <p className="text-xs text-slate-400 mt-0.5">
+            Log overhead operating costs, utility bills, salaries, and maintenance for P&L tracking
+          </p>
+        </div>
+
+        <div className="flex items-center gap-2">
+          {isAdmin && (
+            <button
+              onClick={handleOpenCategoryModal}
+              className="flex-1 flex items-center justify-center gap-2 px-3 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 active:bg-slate-700 text-slate-200 font-semibold text-xs border border-slate-700 transition"
+            >
+              <FolderPlus className="w-4 h-4" />
+              <span>Categories</span>
+            </button>
+          )}
+
+          {canRecordExpense && (
+            <button
+              id="record-expense-btn"
+              onClick={openAddPage}
+              className="flex-1 flex items-center justify-center gap-2 px-3 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-500 active:bg-blue-700 text-white font-semibold text-xs shadow-lg transition"
+            >
+              <Plus className="w-4 h-4" />
+              <span>Add Expense</span>
+            </button>
+          )}
+        </div>
+      </div>
+
+      {/* Summary KPI Row */}
+      <div className="grid grid-cols-1 gap-2.5 mb-5">
+        <div className="p-3.5 bg-slate-900 border border-slate-800 rounded-xl">
+          <div className="flex items-center justify-between text-slate-400 mb-1.5">
+            <span className="text-[10px] font-semibold uppercase tracking-wider">
+              Total Spend ({getPeriodLabel()})
+            </span>
+            <TrendingDown className="w-4 h-4 text-rose-400" />
+          </div>
+          <div className="text-xl font-bold text-rose-300 font-mono">
+            {formatCurrency(totalSpent, settings.currencySymbol)}
+          </div>
+          <p className="text-[10px] text-slate-400 mt-0.5">
+            {expenses.length} expense transactions
+          </p>
+        </div>
+
+        <div className="grid grid-cols-2 gap-2.5">
+          <div className="p-3 bg-slate-900 border border-slate-800 rounded-xl">
+            <div className="flex items-center justify-between text-slate-400 mb-1">
+              <span className="text-[10px] font-semibold uppercase tracking-wider">
+                Top Category
+              </span>
+              <PieChart className="w-3.5 h-3.5 text-blue-400" />
+            </div>
+            <div className="text-sm font-bold text-white truncate">{topCategory}</div>
+            <p className="text-[10px] text-slate-400 mt-0.5">For selected period</p>
+          </div>
+
+          <div className="p-3 bg-slate-900 border border-slate-800 rounded-xl">
+            <div className="flex items-center justify-between text-slate-400 mb-1">
+              <span className="text-[10px] font-semibold uppercase tracking-wider">Categories</span>
+              <Tag className="w-3.5 h-3.5 text-amber-400" />
+            </div>
+            <div className="text-sm font-bold text-amber-300">{allCategories.length}</div>
+            <p className="text-[10px] text-slate-400 mt-0.5">
+              {customCategories.length} custom + {DEFAULT_EXPENSE_CATEGORIES.length} default
+            </p>
+          </div>
+        </div>
+      </div>
+
+      {/* Mobile toolbar: search + filter sheet trigger */}
+      <div className="bg-slate-900 border border-slate-800 rounded-xl p-3 mb-4 space-y-2.5 text-xs">
+        <div className="relative">
+          <Search className="w-4 h-4 text-slate-400 absolute left-3 top-2.5" />
+          <input
+            type="text"
+            value={searchQuery}
+            onChange={e => setSearchQuery(e.target.value)}
+            placeholder="Search expenses, reference #, notes..."
+            className="w-full bg-slate-950 border border-slate-800 rounded-lg pl-9 pr-3 py-2.5 text-xs text-white placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
+          />
+        </div>
+
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => setIsFilterSheetOpen(true)}
+            className="flex-1 flex items-center justify-center gap-2 px-3 py-2.5 rounded-lg bg-slate-950 border border-slate-800 text-slate-200 font-semibold active:bg-slate-800 transition"
+          >
+            <Filter className="w-3.5 h-3.5" />
+            <span>Filters</span>
+            <span className="px-1.5 py-0.5 rounded bg-blue-600 text-[10px] text-white">
+              {getPeriodLabel()}
+            </span>
+            <ChevronDown className="w-3.5 h-3.5 ml-auto" />
+          </button>
+
+          {hasActiveFilters && (
+            <button
+              onClick={resetFilters}
+              className="px-3 py-2.5 rounded-lg bg-slate-800 hover:bg-slate-700 active:bg-slate-700 text-slate-300 font-semibold transition"
+            >
+              Reset
+            </button>
+          )}
+        </div>
+
+        {/* Active filter chips */}
+        <div className="flex flex-wrap items-center gap-1.5">
+          {shopFilter !== 'ALL' && (
+            <span className="px-2 py-0.5 rounded-full bg-blue-500/15 border border-blue-500/30 text-[10px] text-blue-300 flex items-center gap-1">
+              {shopFilter === 'GENERAL'
+                ? 'General Company'
+                : shops.find(s => s.id === shopFilter)?.name || 'Shop'}
+              <button
+                onClick={() => setShopFilter('ALL')}
+                className="text-blue-300 hover:text-white"
+              >
+                <X className="w-3 h-3" />
+              </button>
+            </span>
+          )}
+          {categoryFilter !== 'ALL' && (
+            <span className="px-2 py-0.5 rounded-full bg-slate-800 border border-slate-700 text-[10px] text-slate-300 flex items-center gap-1">
+              {getCategoryLabel(categoryFilter)}
+              <button
+                onClick={() => setCategoryFilter('ALL')}
+                className="text-slate-400 hover:text-white"
+              >
+                <X className="w-3 h-3" />
+              </button>
+            </span>
+          )}
+          {periodFilter === 'custom' && (customStartDate || customEndDate) && (
+            <span className="px-2 py-0.5 rounded-full bg-slate-800 border border-slate-700 text-[10px] text-slate-300 flex items-center gap-1 font-mono">
+              {customStartDate || '…'} → {customEndDate || '…'}
+              <button
+                onClick={() => {
+                  setCustomStartDate('');
+                  setCustomEndDate('');
+                }}
+                className="text-slate-400 hover:text-white"
+              >
+                <X className="w-3 h-3" />
+              </button>
+            </span>
+          )}
+        </div>
+      </div>
+
+      {/* Expenses: Mobile Cards & Tablet/Desktop Table */}
+      <div className="bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden shadow-xl">
+        {expenses.length === 0 ? (
+          <div className="py-12 text-center text-slate-500">
+            <CreditCard className="w-8 h-8 mx-auto mb-2 opacity-40" />
+            <p className="text-xs">No expense records match your filter.</p>
+          </div>
+        ) : (
+          <>
+            {/* Mobile Cards (< md) */}
+            <div className="md:hidden divide-y divide-slate-800/80">
+              {expenses.map(expense => (
+                <div key={expense.id} className="p-3.5 space-y-2">
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="min-w-0 flex-1">
+                      <h4 className="font-bold text-xs text-white truncate">
+                        {expense.title || expense.description}
+                      </h4>
+                      <p className="text-[10px] font-mono text-slate-400">
+                        {formatDateTime(expense.createdAt)}
+                      </p>
+                    </div>
+                    <div className="text-right shrink-0">
+                      <div className="font-mono font-bold text-rose-400 text-sm">
+                        {formatCurrency(expense.amount, settings.currencySymbol)}
+                      </div>
+                      <span className="px-1.5 py-0.5 rounded bg-slate-800 text-slate-300 text-[9px] uppercase font-medium">
+                        {expense.paymentMethod}
+                      </span>
+                    </div>
+                  </div>
+
+                  <div className="flex items-center justify-between text-xs pt-1 gap-2">
+                    <div className="flex items-center gap-1.5 min-w-0 flex-wrap">
+                      <span className="px-2 py-0.5 rounded-full bg-slate-800 text-[10px] font-medium border border-slate-700/60 text-slate-300 truncate">
+                        {getCategoryLabel(expense.category)}
+                      </span>
+                      <span className="px-2 py-0.5 rounded-full bg-blue-950/60 text-[10px] font-medium border border-blue-800/40 text-blue-300 truncate">
+                        🏪 {expense.shopName || 'General Company'}
+                      </span>
+                    </div>
+                    <div className="text-[10px] text-slate-400 truncate shrink-0">
+                      {expense.reference && (
+                        <span className="font-mono mr-2">Ref: {expense.reference}</span>
+                      )}
+                      <span>By {expense.createdByName}</span>
+                    </div>
+                  </div>
+
+                  {canManageExpense(expense) && (
+                    <div className="flex items-center gap-2 pt-1.5 border-t border-slate-800/60">
+                      <button
+                        onClick={() => openEditPage(expense)}
+                        className="flex-1 flex items-center justify-center gap-1.5 py-2 rounded-lg bg-slate-800 hover:bg-blue-600 active:bg-blue-700 text-slate-300 hover:text-white transition text-[11px] font-semibold"
+                      >
+                        <Edit2 className="w-3.5 h-3.5" />
+                        Edit
+                      </button>
+                      <button
+                        onClick={() => setDeletingExpense(expense)}
+                        className="flex-1 flex items-center justify-center gap-1.5 py-2 rounded-lg bg-slate-800 hover:bg-rose-600 active:bg-rose-700 text-slate-300 hover:text-white transition text-[11px] font-semibold"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                        Delete
+                      </button>
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+
+            {/* Tablet / Desktop Table (md+) */}
+            <div className="hidden md:block overflow-x-auto">
+              <table className="w-full text-left text-xs">
+                <thead>
+                  <tr className="border-b border-slate-800 bg-slate-950/60 text-slate-400">
+                    <th className="py-3 px-4 font-semibold">Date</th>
+                    <th className="py-3 px-4 font-semibold">Shop</th>
+                    <th className="py-3 px-4 font-semibold">Expense Title</th>
+                    <th className="py-3 px-4 font-semibold">Category</th>
+                    <th className="py-3 px-4 font-semibold">Payment</th>
+                    <th className="py-3 px-4 font-semibold">Reference</th>
+                    <th className="py-3 px-4 font-semibold">By</th>
+                    <th className="py-3 px-4 text-right font-semibold">Amount</th>
+                    {isAdmin && (
+                      <th className="py-3 px-4 text-right font-semibold">Actions</th>
+                    )}
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-800/60">
+                  {expenses.map(expense => (
+                    <tr key={expense.id} className="hover:bg-slate-850/60 transition">
+                      <td className="py-3.5 px-4 text-slate-400 font-mono">
+                        {formatDateTime(expense.createdAt)}
+                      </td>
+                      <td className="py-3.5 px-4">
+                        <span className="px-2 py-0.5 rounded bg-blue-950/60 text-blue-300 border border-blue-800/40 text-[10px] font-medium">
+                          🏪 {expense.shopName || 'General Company'}
+                        </span>
+                      </td>
+                      <td className="py-3.5 px-4 font-bold text-white">
+                        {expense.title || expense.description}
+                      </td>
+                      <td className="py-3.5 px-4 text-slate-300">
+                        <span className="px-2 py-0.5 rounded-full bg-slate-800 text-[10px] font-medium border border-slate-700/60">
+                          {getCategoryLabel(expense.category)}
+                        </span>
+                      </td>
+                      <td className="py-3.5 px-4">
+                        <span className="px-2 py-0.5 rounded bg-slate-800 text-slate-300 text-[10px] uppercase font-medium">
+                          {expense.paymentMethod}
+                        </span>
+                      </td>
+                      <td className="py-3.5 px-4 font-mono text-slate-400">
+                        {expense.reference || '—'}
+                      </td>
+                      <td className="py-3.5 px-4 text-slate-400">{expense.createdByName}</td>
+                      <td className="py-3.5 px-4 text-right font-mono font-bold text-rose-400 text-sm">
+                        {formatCurrency(expense.amount, settings.currencySymbol)}
+                      </td>
+                      {isAdmin && (
+                        <td className="py-3.5 px-4 text-right space-x-1.5 whitespace-nowrap">
+                          {canManageExpense(expense) && (
+                            <>
+                              <button
+                                onClick={() => openEditPage(expense)}
+                                className="p-1.5 rounded-lg bg-slate-800 hover:bg-blue-600 text-slate-300 hover:text-white transition"
+                                title="Edit expense"
+                              >
+                                <Edit2 className="w-3.5 h-3.5" />
+                              </button>
+                              <button
+                                onClick={() => setDeletingExpense(expense)}
+                                className="p-1.5 rounded-lg bg-slate-800 hover:bg-rose-600 text-slate-300 hover:text-white transition"
+                                title="Delete expense"
+                              >
+                                <Trash2 className="w-3.5 h-3.5" />
+                              </button>
+                            </>
+                          )}
+                        </td>
+                      )}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </>
+        )}
+      </div>
+
+      {/* Mobile Filter Sheet */}
+      {isFilterSheetOpen && (
+        <div
+          className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-slate-950/80 backdrop-blur-sm"
+          onClick={() => setIsFilterSheetOpen(false)}
+        >
+          <div
+            className="bg-slate-900 border border-slate-800 rounded-t-2xl sm:rounded-2xl w-full sm:max-w-md p-4 sm:p-6 shadow-2xl max-h-[85vh] overflow-y-auto"
+            onClick={e => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between pb-3 border-b border-slate-800 mb-4">
+              <div className="flex items-center gap-2">
+                <Filter className="w-5 h-5 text-blue-400" />
+                <h3 className="text-base font-bold text-white">Filter Expenses</h3>
+              </div>
+              <button
+                onClick={() => setIsFilterSheetOpen(false)}
+                className="text-slate-400 hover:text-white p-1"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="space-y-4 text-xs">
+              <div>
+                <label className="block text-slate-300 font-medium mb-1.5">Period</label>
+                <div className="grid grid-cols-3 gap-1.5">
+                  {[
+                    { id: 'today', label: 'Today' },
+                    { id: 'week', label: 'Week' },
+                    { id: 'month', label: 'Month' },
+                    { id: 'year', label: 'Year' },
+                    { id: 'all', label: 'All Time' },
+                    { id: 'custom', label: 'Custom' },
+                  ].map(p => (
+                    <button
+                      key={p.id}
+                      onClick={() => setPeriodFilter(p.id as PeriodFilter)}
+                      className={`py-2.5 rounded-lg font-semibold transition ${
+                        periodFilter === p.id
+                          ? 'bg-blue-600 text-white'
+                          : 'bg-slate-950 border border-slate-800 text-slate-300'
+                      }`}
+                    >
+                      {p.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {periodFilter === 'custom' && (
+                <div className="space-y-2 p-3 rounded-lg bg-slate-950 border border-slate-800">
+                  <div>
+                    <label className="block text-slate-400 text-[11px] mb-1">From</label>
+                    <input
+                      type="date"
+                      value={customStartDate}
+                      onChange={e => setCustomStartDate(e.target.value)}
+                      className="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-xs text-white"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-slate-400 text-[11px] mb-1">To</label>
+                    <input
+                      type="date"
+                      value={customEndDate}
+                      onChange={e => setCustomEndDate(e.target.value)}
+                      className="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-xs text-white"
+                    />
+                  </div>
+                </div>
+              )}
+
+              <div>
+                <label className="block text-slate-300 font-medium mb-1.5">Shop / Unit</label>
+                <select
+                  value={shopFilter}
+                  onChange={e => setShopFilter(e.target.value)}
+                  className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2.5 text-xs text-white focus:outline-none focus:ring-1 focus:ring-blue-500"
+                >
+                  <option value="ALL">
+                    {shopAdmin && !platformAdmin
+                      ? shops.length === 1
+                        ? shops[0].name
+                        : 'All Managed Shops'
+                      : 'All Shops & Company'}
+                  </option>
+                  {platformAdmin && <option value="GENERAL">General Company</option>}
+                  {(platformAdmin || shops.length > 1) &&
+                    shops.map(s => (
+                      <option key={s.id} value={s.id}>
+                        🏪 {s.name}
+                      </option>
+                    ))}
+                </select>
+              </div>
+
+              <div>
+                <label className="block text-slate-300 font-medium mb-1.5">Category</label>
+                <select
+                  value={categoryFilter}
+                  onChange={e => setCategoryFilter(e.target.value)}
+                  className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2.5 text-xs text-white focus:outline-none focus:ring-1 focus:ring-blue-500"
+                >
+                  <option value="ALL">All Categories ({allCategories.length})</option>
+                  {DEFAULT_EXPENSE_CATEGORIES.map(c => (
+                    <option key={c.id} value={c.id}>
+                      {c.label}
+                    </option>
+                  ))}
+                  {customCategories.length > 0 && (
+                    <optgroup label="Custom Categories">
+                      {customCategories.map(c => (
+                        <option key={c.id} value={c.id}>
+                          {c.label}
+                        </option>
+                      ))}
+                    </optgroup>
+                  )}
+                </select>
+              </div>
+
+              <div className="pt-3 border-t border-slate-800 flex justify-between gap-2">
+                <button
+                  onClick={resetFilters}
+                  className="px-4 py-2.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 font-semibold transition"
+                >
+                  Reset
+                </button>
+                <button
+                  onClick={() => setIsFilterSheetOpen(false)}
+                  className="px-4 py-2.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-white font-semibold transition"
+                >
+                  Apply
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+
+
+      {/* Modal: Manage Categories */}
+      {isCategoryModalOpen && isAdmin && (
+        <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-slate-950/80 backdrop-blur-sm sm:p-4">
+          <div className="bg-slate-900 border border-slate-800 rounded-t-2xl sm:rounded-2xl max-w-md w-full p-4 sm:p-6 shadow-2xl max-h-[92vh] overflow-y-auto">
+            <div className="flex items-center justify-between pb-3 border-b border-slate-800 mb-4">
+              <div className="flex items-center gap-2">
+                <Tag className="w-5 h-5 text-amber-400" />
+                <h3 className="text-base font-bold text-white">Manage Expense Categories</h3>
+              </div>
+              <button
+                onClick={() => {
+                  setIsCategoryModalOpen(false);
+                  setEditingCategory(null);
+                  setNewCategoryName('');
+                  setCategoryError('');
+                }}
+                className="text-slate-400 hover:text-white p-1"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="mb-4 p-3 rounded-lg bg-slate-950 border border-slate-800">
+              <label className="block text-slate-300 font-medium mb-1.5 text-xs">
+                {editingCategory ? 'Edit Category Name' : 'Create New Category'}
+              </label>
+              <div className="space-y-2">
+                <input
+                  type="text"
+                  value={newCategoryName}
+                  onChange={e => setNewCategoryName(e.target.value)}
+                  placeholder="e.g. Water Bills, Repairs..."
+                  className="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2.5 text-xs text-white placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-amber-500"
+                />
+                <div className="flex gap-2">
+                  <button
+                    onClick={editingCategory ? handleSaveEditedCategory : handleCreateCategory}
+                    className="flex-1 py-2.5 rounded-lg bg-amber-600 hover:bg-amber-500 active:bg-amber-700 text-white font-semibold text-xs transition flex items-center justify-center gap-1"
+                  >
+                    {editingCategory ? (
+                      <>
+                        <Save className="w-3.5 h-3.5" />
+                        Save Changes
+                      </>
+                    ) : (
+                      <>
+                        <Plus className="w-3.5 h-3.5" />
+                        Add Category
+                      </>
+                    )}
+                  </button>
+                  {editingCategory && (
+                    <button
+                      onClick={() => {
+                        setEditingCategory(null);
+                        setNewCategoryName('');
+                        setCategoryError('');
+                      }}
+                      className="px-3 py-2.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs"
+                    >
+                      Cancel
+                    </button>
+                  )}
+                </div>
+              </div>
+              {categoryError && (
+                <p className="text-rose-400 text-[11px] mt-1.5">{categoryError}</p>
+              )}
+            </div>
+
+            <div className="space-y-2">
+              <div className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider">
+                Custom Categories ({customCategories.length})
+              </div>
+              {customCategories.length === 0 ? (
+                <div className="p-4 text-center text-slate-500 text-xs border border-dashed border-slate-800 rounded-lg">
+                  No custom categories yet. Create one above.
+                </div>
+              ) : (
+                customCategories.map(cat => (
+                  <div
+                    key={cat.id}
+                    className="flex items-center justify-between p-3 rounded-lg bg-slate-950 border border-slate-800"
+                  >
+                    <div className="flex items-center gap-2 min-w-0">
+                      <Tag className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                      <div className="min-w-0">
+                        <div className="text-xs text-white font-medium truncate">{cat.label}</div>
+                        <div className="text-[10px] text-slate-500 font-mono truncate">
+                          {cat.id}
+                        </div>
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-1 shrink-0">
+                      <button
+                        onClick={() => handleEditCategory(cat)}
+                        className="p-2 rounded-lg hover:bg-blue-600 text-slate-400 hover:text-white transition"
+                        title="Edit category"
+                      >
+                        <Edit2 className="w-3.5 h-3.5" />
+                      </button>
+                      <button
+                        onClick={() => setDeletingCategory(cat)}
+                        className="p-2 rounded-lg hover:bg-rose-600 text-slate-400 hover:text-white transition"
+                        title="Delete category"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+
+            <div className="mt-5 space-y-2">
+              <div className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider">
+                Default Categories ({DEFAULT_EXPENSE_CATEGORIES.length}) — Read Only
+              </div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5">
+                {DEFAULT_EXPENSE_CATEGORIES.map(cat => (
+                  <div
+                    key={cat.id}
+                    className="p-2 rounded-lg bg-slate-950/60 border border-slate-800/60 text-[11px] text-slate-400"
+                  >
+                    {cat.label}
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Delete Expense Confirmation */}
+      {deletingExpense && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 backdrop-blur-sm p-4">
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl max-w-md w-full p-5 sm:p-6 shadow-2xl">
+            <div className="flex items-center gap-2 mb-3 text-rose-400">
+              <AlertTriangle className="w-5 h-5" />
+              <h3 className="text-base font-bold text-white">Delete Expense?</h3>
+            </div>
+            <div className="p-3 bg-rose-500/10 border border-rose-500/30 rounded-xl text-rose-200 text-xs mb-4">
+              <strong>Warning:</strong> This action cannot be undone.
+            </div>
+            <p className="text-xs text-slate-400 mb-4">
+              Delete expense <strong className="text-white">"{deletingExpense.title}"</strong> of{' '}
+              <strong className="text-white">
+                {formatCurrency(deletingExpense.amount, settings.currencySymbol)}
+              </strong>
+              ?
+            </p>
+            <div className="flex justify-end gap-2 pt-3 border-t border-slate-800">
+              <button
+                onClick={() => setDeletingExpense(null)}
+                className="px-4 py-2.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleDeleteExpense}
+                className="px-4 py-2.5 rounded-lg bg-rose-600 hover:bg-rose-500 text-white text-xs font-bold"
+              >
+                Delete Expense
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Delete Category Confirmation */}
+      {deletingCategory && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 backdrop-blur-sm p-4">
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl max-w-md w-full p-5 sm:p-6 shadow-2xl">
+            <div className="flex items-center gap-2 mb-3 text-rose-400">
+              <AlertTriangle className="w-5 h-5" />
+              <h3 className="text-base font-bold text-white">Delete Category?</h3>
+            </div>
+            <div className="p-3 bg-rose-500/10 border border-rose-500/30 rounded-xl text-rose-200 text-xs mb-4">
+              <strong>Warning:</strong> This only removes the category option. Existing expenses will
+              keep their category label.
+            </div>
+            <p className="text-xs text-slate-400 mb-4">
+              Delete category <strong className="text-white">"{deletingCategory.label}"</strong>?
+            </p>
+            <div className="flex justify-end gap-2 pt-3 border-t border-slate-800">
+              <button
+                onClick={() => setDeletingCategory(null)}
+                className="px-4 py-2.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleDeleteCategory}
+                className="px-4 py-2.5 rounded-lg bg-rose-600 hover:bg-rose-500 text-white text-xs font-bold"
+              >
+                Delete Category
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};

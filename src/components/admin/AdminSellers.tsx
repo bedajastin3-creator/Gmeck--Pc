@@ -26,7 +26,7 @@ import { CloudflareApi } from '../../services/cloudflareApi';
 import { User, SellerPermissions } from '../../types';
 import { SELLER_COLORS, getSellerColorById } from '../../utils/colors';
 import { formatCurrency, formatDateTime } from '../../utils/formatters';
-import { getShopAdminShopIds, hasAdminAccess } from '../../utils/permissions';
+import { getShopAdminShopIds, hasAdminAccess, isPlatformAdmin, isShopAdmin } from '../../utils/permissions';
 
 export const AdminSellers: React.FC = () => {
   const { currentUser, dbState, addToast, refreshUser, sellersSubTab, setSellersSubTab, sellersNavTick } = useApp();
@@ -60,8 +60,25 @@ export const AdminSellers: React.FC = () => {
   if (!currentUser) return null;
   if (!hasAdminAccess(currentUser) && !currentUser.permissions?.canManageSellers) return null;
 
-  const sellers = dbState.users.filter(u => u.role === 'SELLER');
+  const platformAdmin = isPlatformAdmin(currentUser);
+  const shopAdm = isShopAdmin(currentUser);
+  const managedShopIds = getShopAdminShopIds(currentUser);
+  const allowedShopIds = platformAdmin
+    ? null
+    : shopAdm
+      ? managedShopIds
+      : currentUser.assignedShopIds || [];
+
   const allShops = dbState.shops || [];
+  const manageableShops = allowedShopIds
+    ? allShops.filter(sh => allowedShopIds.includes(sh.id))
+    : allShops;
+
+  const sellers = dbState.users.filter(u => {
+    if (u.role !== 'SELLER') return false;
+    if (!allowedShopIds) return true;
+    return (u.assignedShopIds || []).some(id => allowedShopIds.includes(id));
+  });
 
   // Helper to compress image
   const compressImage = (file: File, maxWidth: number, maxHeight: number): Promise<Blob> => {
@@ -161,8 +178,14 @@ export const AdminSellers: React.FC = () => {
     setUsername('');
     setPassword('');
     setSelectedColor('blue');
-    const activeShopIds = allShops.filter(s => s.status === 'ACTIVE').map(s => s.id);
-    setAssignedShopIds(activeShopIds.length > 0 ? [activeShopIds[0]] : []);
+    const activeShopIds = manageableShops.filter(s => s.status === 'ACTIVE').map(s => s.id);
+    if (activeShopIds.length > 0) {
+      setAssignedShopIds(platformAdmin ? [activeShopIds[0]] : activeShopIds);
+    } else if (manageableShops.length > 0) {
+      setAssignedShopIds([manageableShops[0].id]);
+    } else {
+      setAssignedShopIds([]);
+    }
     setSellerPermissions({});
     setFormError('');
     setIsAddModalOpen(true);
@@ -182,8 +205,11 @@ export const AdminSellers: React.FC = () => {
     setSelectedSeller(s);
     setName(s.name);
     setSelectedColor(s.color || 'blue');
-    setAssignedShopIds(s.assignedShopIds || []);
-    setSellerPermissions(s.permissions || {});
+    const scopedSelection = allowedShopIds
+      ? (s.assignedShopIds || []).filter(id => allowedShopIds.includes(id))
+      : s.assignedShopIds || [];
+    setAssignedShopIds(scopedSelection);
+    setSellerPermissions(platformAdmin || shopAdm ? { ...(s.permissions || {}) } : {});
     setFormError('');
     setIsEditModalOpen(true);
   };
@@ -208,6 +234,35 @@ export const AdminSellers: React.FC = () => {
     }));
   };
 
+  const handleQuickToggleSellerExpenses = (seller: User) => {
+    const nextAllowed = !seller.permissions?.canRecordExpenses;
+    const res = SellerService.updateSeller(
+      seller.id,
+      {
+        permissions: {
+          ...(seller.permissions || {}),
+          canRecordExpenses: nextAllowed,
+        },
+      },
+      currentUser
+    );
+    if (res.success) {
+      addToast({
+        type: 'success',
+        title: nextAllowed ? 'Expense Access Granted' : 'Expense Access Revoked',
+        description: nextAllowed
+          ? `${seller.name} can now add expenses for their assigned shop.`
+          : `${seller.name} can no longer add shop expenses.`,
+      });
+    } else {
+      addToast({
+        type: 'error',
+        title: 'Update Failed',
+        description: res.error || 'Could not update expense permission.',
+      });
+    }
+  };
+
   const handleCreateSeller = async (e: React.FormEvent) => {
     e.preventDefault();
     setFormError('');
@@ -229,7 +284,11 @@ export const AdminSellers: React.FC = () => {
         password,
         color: selectedColor,
         assignedShopIds,
-        permissions: sellerPermissions,
+        ...(platformAdmin
+          ? { permissions: sellerPermissions }
+          : shopAdm
+            ? { permissions: { canRecordExpenses: !!sellerPermissions.canRecordExpenses } }
+            : {}),
       },
       currentUser
     );
@@ -262,7 +321,11 @@ export const AdminSellers: React.FC = () => {
         name: name.trim(),
         color: selectedColor,
         assignedShopIds,
-        permissions: sellerPermissions,
+        ...(platformAdmin
+          ? { permissions: sellerPermissions }
+          : shopAdm
+            ? { permissions: { canRecordExpenses: !!sellerPermissions.canRecordExpenses } }
+            : {}),
       },
       currentUser
     );
@@ -271,7 +334,9 @@ export const AdminSellers: React.FC = () => {
       addToast({
         type: 'success',
         title: 'Seller Updated',
-        description: `Profile, shop assignments, and permissions for '${name}' updated.`,
+        description: platformAdmin
+          ? `Profile, shop assignments, and permissions for '${name}' updated.`
+          : `Profile, shop assignments, and expense access for '${name}' updated.`,
       });
       setIsEditModalOpen(false);
     } else {
@@ -316,6 +381,12 @@ export const AdminSellers: React.FC = () => {
         title: `Seller ${newStatus === 'ACTIVE' ? 'Activated' : 'Deactivated'}`,
         description: `${s.name} is now ${newStatus}. Historical data preserved.`,
       });
+    } else {
+      addToast({
+        type: 'error',
+        title: 'Status Change Blocked',
+        description: res.error || 'Could not change seller status.',
+      });
     }
   };
 
@@ -356,7 +427,9 @@ export const AdminSellers: React.FC = () => {
         <div>
           <h2 className="text-xl font-bold text-white tracking-tight">Seller Account & Shop Assignments</h2>
           <p className="text-xs text-slate-400 mt-0.5">
-            Create cashier logins, assign specific shop units, override passwords, customize UI color signatures, and manage access
+            {platformAdmin
+              ? 'Create cashier logins, assign specific shop units, override passwords, customize UI color signatures, and manage access'
+              : 'Create cashier logins for your shop, override passwords, and manage staff expense access'}
           </p>
         </div>
 
@@ -476,77 +549,106 @@ export const AdminSellers: React.FC = () => {
                   </div>
                 </div>
 
-                {/* Permissions Badges */}
-                {permissionCount > 0 && (
-                  <div className="mb-3">
-                    <span className="text-[10px] text-slate-400 font-medium uppercase tracking-wider block mb-1.5 flex items-center gap-1">
-                      <Shield className="w-3 h-3 text-blue-400" />
-                      Granted Permissions:
-                    </span>
-                    <div className="flex flex-wrap gap-1">
-                      {seller.permissions?.canEditProducts && (
-                        <span className="text-[10px] px-1.5 py-0.5 rounded bg-blue-950/50 text-blue-300 border border-blue-800/40">
-                          Edit Products
-                        </span>
-                      )}
-                      {seller.permissions?.canDeleteProducts && (
-                        <span className="text-[10px] px-1.5 py-0.5 rounded bg-rose-950/50 text-rose-300 border border-rose-800/40">
-                          Delete Products
-                        </span>
-                      )}
-                      {seller.permissions?.canManageInventory && (
-                        <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-950/50 text-amber-300 border border-amber-800/40">
-                          Inventory
-                        </span>
-                      )}
-                      {seller.permissions?.canEditSales && (
-                        <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-950/50 text-emerald-300 border border-emerald-800/40">
-                          Edit Sales
-                        </span>
-                      )}
-                      {seller.permissions?.canDeleteSales && (
-                        <span className="text-[10px] px-1.5 py-0.5 rounded bg-purple-950/50 text-purple-300 border border-purple-800/40">
-                          Void Sales
-                        </span>
-                      )}
-                      {seller.permissions?.canManageDebts && (
-                        <span className="text-[10px] px-1.5 py-0.5 rounded bg-cyan-950/50 text-cyan-300 border border-cyan-800/40">
-                          All Debts
-                        </span>
-                      )}
-                      {seller.permissions?.canViewReports && (
-                        <span className="text-[10px] px-1.5 py-0.5 rounded bg-indigo-950/50 text-indigo-300 border border-indigo-800/40">
-                          Reports
-                        </span>
-                      )}
-                      {seller.permissions?.canRecordPurchases && (
-                        <span className="text-[10px] px-1.5 py-0.5 rounded bg-orange-950/50 text-orange-300 border border-orange-800/40">
-                          Purchases
-                        </span>
-                      )}
-                      {seller.permissions?.canViewExpenses && (
-                        <span className="text-[10px] px-1.5 py-0.5 rounded bg-teal-950/50 text-teal-300 border border-teal-800/40">
-                          Expenses
-                        </span>
-                      )}
-                      {seller.permissions?.canRecordExpenses && (
-                        <span className="text-[10px] px-1.5 py-0.5 rounded bg-lime-950/50 text-lime-300 border border-lime-800/40">
-                          Record Expenses
-                        </span>
-                      )}
-                      {seller.permissions?.canManageShops && (
-                        <span className="text-[10px] px-1.5 py-0.5 rounded bg-pink-950/50 text-pink-300 border border-pink-800/40">
-                          Manage Shops
-                        </span>
-                      )}
-                      {seller.permissions?.canManageSellers && (
-                        <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-700/50 text-slate-300 border border-slate-600/40">
-                          Manage Sellers
-                        </span>
-                      )}
+                {/* Permissions Badges — Full list for Platform Admin, Add Expenses toggle for Shop Admin */}
+                {platformAdmin ? (
+                  permissionCount > 0 && (
+                    <div className="mb-3">
+                      <span className="text-[10px] text-slate-400 font-medium uppercase tracking-wider block mb-1.5 flex items-center gap-1">
+                        <Shield className="w-3 h-3 text-blue-400" />
+                        Granted Permissions:
+                      </span>
+                      <div className="flex flex-wrap gap-1">
+                        {seller.permissions?.canEditProducts && (
+                          <span className="text-[10px] px-1.5 py-0.5 rounded bg-blue-950/50 text-blue-300 border border-blue-800/40">
+                            Edit Products
+                          </span>
+                        )}
+                        {seller.permissions?.canDeleteProducts && (
+                          <span className="text-[10px] px-1.5 py-0.5 rounded bg-rose-950/50 text-rose-300 border border-rose-800/40">
+                            Delete Products
+                          </span>
+                        )}
+                        {seller.permissions?.canManageInventory && (
+                          <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-950/50 text-amber-300 border border-amber-800/40">
+                            Inventory
+                          </span>
+                        )}
+                        {seller.permissions?.canEditSales && (
+                          <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-950/50 text-emerald-300 border border-emerald-800/40">
+                            Edit Sales
+                          </span>
+                        )}
+                        {seller.permissions?.canDeleteSales && (
+                          <span className="text-[10px] px-1.5 py-0.5 rounded bg-purple-950/50 text-purple-300 border border-purple-800/40">
+                            Void Sales
+                          </span>
+                        )}
+                        {seller.permissions?.canManageDebts && (
+                          <span className="text-[10px] px-1.5 py-0.5 rounded bg-cyan-950/50 text-cyan-300 border border-cyan-800/40">
+                            All Debts
+                          </span>
+                        )}
+                        {seller.permissions?.canViewReports && (
+                          <span className="text-[10px] px-1.5 py-0.5 rounded bg-indigo-950/50 text-indigo-300 border border-indigo-800/40">
+                            Reports
+                          </span>
+                        )}
+                        {seller.permissions?.canRecordPurchases && (
+                          <span className="text-[10px] px-1.5 py-0.5 rounded bg-orange-950/50 text-orange-300 border border-orange-800/40">
+                            Purchases
+                          </span>
+                        )}
+                        {seller.permissions?.canViewExpenses && (
+                          <span className="text-[10px] px-1.5 py-0.5 rounded bg-teal-950/50 text-teal-300 border border-teal-800/40">
+                            List Shop Expenses
+                          </span>
+                        )}
+                        {seller.permissions?.canRecordExpenses && (
+                          <span className="text-[10px] px-1.5 py-0.5 rounded bg-lime-950/50 text-lime-300 border border-lime-800/40">
+                            Record Expenses
+                          </span>
+                        )}
+                        {seller.permissions?.canManageShops && (
+                          <span className="text-[10px] px-1.5 py-0.5 rounded bg-pink-950/50 text-pink-300 border border-pink-800/40">
+                            Manage Shops
+                          </span>
+                        )}
+                        {seller.permissions?.canManageSellers && (
+                          <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-700/50 text-slate-300 border border-slate-600/40">
+                            Manage Sellers
+                          </span>
+                        )}
+                      </div>
                     </div>
+                  )
+                ) : shopAdm && !isShopAdmin(seller) ? (
+                  <div className="mb-3 flex items-center justify-between gap-2 px-3 py-2 rounded-xl bg-slate-950 border border-slate-800/90">
+                    <div className="min-w-0">
+                      <span className="block text-[11px] font-semibold text-slate-200 leading-tight">
+                        Add Shop Expenses
+                      </span>
+                      <span className="block text-[10px] text-slate-500 leading-tight mt-0.5">
+                        {seller.permissions?.canRecordExpenses
+                          ? 'Allowed to record shop expenses'
+                          : 'POS & Settings only'}
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => handleQuickToggleSellerExpenses(seller)}
+                      aria-label={`Toggle expense access for ${seller.name}`}
+                      className={`relative shrink-0 w-10 h-5 rounded-full transition-colors ${
+                        seller.permissions?.canRecordExpenses ? 'bg-emerald-600' : 'bg-slate-700'
+                      }`}
+                    >
+                      <span
+                        className={`absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white shadow transition-transform ${
+                          seller.permissions?.canRecordExpenses ? 'translate-x-5' : 'translate-x-0'
+                        }`}
+                      />
+                    </button>
                   </div>
-                )}
+                ) : null}
 
                 <div className="p-3 rounded-lg bg-slate-950 border border-slate-800/80 space-y-1.5 text-xs mb-4">
                   <div className="flex justify-between text-slate-400">
@@ -565,13 +667,15 @@ export const AdminSellers: React.FC = () => {
                       {formatCurrency(totalSalesVolume, dbState.settings?.currencySymbol || 'TSh')} ({sellerSales.length})
                     </span>
                   </div>
-                  <div className="flex justify-between text-slate-400">
-                    <span>Permissions Granted</span>
-                    <span className="font-mono text-blue-400 font-semibold flex items-center gap-1">
-                      <Shield className="w-3 h-3" />
-                      {permissionCount}
-                    </span>
-                  </div>
+                  {platformAdmin && (
+                    <div className="flex justify-between text-slate-400">
+                      <span>Permissions Granted</span>
+                      <span className="font-mono text-blue-400 font-semibold flex items-center gap-1">
+                        <Shield className="w-3 h-3" />
+                        {permissionCount}
+                      </span>
+                    </div>
+                  )}
                   <div className="flex justify-between text-slate-400">
                     <span>Registered</span>
                     <span className="font-mono text-slate-400">{seller.createdAt.slice(0, 10)}</span>
@@ -731,10 +835,12 @@ export const AdminSellers: React.FC = () => {
               <div>
                 <label className="block text-slate-300 font-semibold mb-1.5 flex items-center justify-between">
                   <span>Assigned Shop Units *</span>
-                  <span className="text-[10px] text-slate-400 font-normal">Select one or more</span>
+                  <span className="text-[10px] text-slate-400 font-normal">
+                    {platformAdmin ? 'Select one or more' : 'Auto-scoped to your shop'}
+                  </span>
                 </label>
                 <div className="space-y-1.5 max-h-36 overflow-y-auto p-2 rounded-lg bg-slate-950 border border-slate-800">
-                  {allShops.map(sh => (
+                  {manageableShops.map(sh => (
                     <label
                       key={sh.id}
                       className="flex items-center gap-2.5 p-1.5 rounded hover:bg-slate-900 cursor-pointer"
@@ -754,134 +860,164 @@ export const AdminSellers: React.FC = () => {
                 </div>
               </div>
 
-              {/* Permissions Section */}
-              <div>
-                <label className="block text-slate-300 font-semibold mb-1.5 flex items-center gap-1">
-                  <Shield className="w-3.5 h-3.5 text-blue-400" />
-                  <span>Permissions Granted</span>
-                </label>
-                <div className="space-y-1.5 max-h-48 overflow-y-auto p-2 rounded-lg bg-slate-950 border border-slate-800">
-                  <label className="flex items-center justify-between cursor-pointer p-1.5 rounded hover:bg-slate-900">
-                    <span className="text-xs text-slate-200">Edit Products (Modify existing)</span>
-                    <input
-                      type="checkbox"
-                      checked={sellerPermissions.canEditProducts || false}
-                      onChange={() => togglePermission('canEditProducts')}
-                      className="rounded border-slate-700 bg-slate-900 text-blue-600 focus:ring-blue-500"
-                    />
+              {/* Permissions Section — Full selector for Platform Admin, Expense-only toggle for Shop Admin */}
+              {platformAdmin ? (
+                <div>
+                  <label className="block text-slate-300 font-semibold mb-1.5 flex items-center gap-1">
+                    <Shield className="w-3.5 h-3.5 text-blue-400" />
+                    <span>Permissions Granted</span>
                   </label>
-                  
-                  <label className="flex items-center justify-between cursor-pointer p-1.5 rounded hover:bg-slate-900">
-                    <span className="text-xs text-slate-200">Delete Products</span>
-                    <input
-                      type="checkbox"
-                      checked={sellerPermissions.canDeleteProducts || false}
-                      onChange={() => togglePermission('canDeleteProducts')}
-                      className="rounded border-slate-700 bg-slate-900 text-blue-600 focus:ring-blue-500"
-                    />
-                  </label>
-                  
-                  <label className="flex items-center justify-between cursor-pointer p-1.5 rounded hover:bg-slate-900">
-                    <span className="text-xs text-slate-200">Manage Inventory (Stock adjustments)</span>
-                    <input
-                      type="checkbox"
-                      checked={sellerPermissions.canManageInventory || false}
-                      onChange={() => togglePermission('canManageInventory')}
-                      className="rounded border-slate-700 bg-slate-900 text-blue-600 focus:ring-blue-500"
-                    />
-                  </label>
-                  
-                  <label className="flex items-center justify-between cursor-pointer p-1.5 rounded hover:bg-slate-900">
-                    <span className="text-xs text-slate-200">Edit Sales (No approval needed)</span>
-                    <input
-                      type="checkbox"
-                      checked={sellerPermissions.canEditSales || false}
-                      onChange={() => togglePermission('canEditSales')}
-                      className="rounded border-slate-700 bg-slate-900 text-blue-600 focus:ring-blue-500"
-                    />
-                  </label>
-                  
-                  <label className="flex items-center justify-between cursor-pointer p-1.5 rounded hover:bg-slate-900">
-                    <span className="text-xs text-slate-200">Void Sales</span>
-                    <input
-                      type="checkbox"
-                      checked={sellerPermissions.canDeleteSales || false}
-                      onChange={() => togglePermission('canDeleteSales')}
-                      className="rounded border-slate-700 bg-slate-900 text-blue-600 focus:ring-blue-500"
-                    />
-                  </label>
-                  
-                  <label className="flex items-center justify-between cursor-pointer p-1.5 rounded hover:bg-slate-900">
-                    <span className="text-xs text-slate-200">Manage All Debts (Not just own)</span>
-                    <input
-                      type="checkbox"
-                      checked={sellerPermissions.canManageDebts || false}
-                      onChange={() => togglePermission('canManageDebts')}
-                      className="rounded border-slate-700 bg-slate-900 text-blue-600 focus:ring-blue-500"
-                    />
-                  </label>
-                  
-                  <label className="flex items-center justify-between cursor-pointer p-1.5 rounded hover:bg-slate-900">
-                    <span className="text-xs text-slate-200">View Financial Reports</span>
-                    <input
-                      type="checkbox"
-                      checked={sellerPermissions.canViewReports || false}
-                      onChange={() => togglePermission('canViewReports')}
-                      className="rounded border-slate-700 bg-slate-900 text-blue-600 focus:ring-blue-500"
-                    />
-                  </label>
-                  
-                  <label className="flex items-center justify-between cursor-pointer p-1.5 rounded hover:bg-slate-900">
-                    <span className="text-xs text-slate-200">Record Purchases</span>
-                    <input
-                      type="checkbox"
-                      checked={sellerPermissions.canRecordPurchases || false}
-                      onChange={() => togglePermission('canRecordPurchases')}
-                      className="rounded border-slate-700 bg-slate-900 text-blue-600 focus:ring-blue-500"
-                    />
-                  </label>
-                  
-                  <label className="flex items-center justify-between cursor-pointer p-1.5 rounded hover:bg-slate-900">
-                    <span className="text-xs text-slate-200">View Expenses</span>
-                    <input
-                      type="checkbox"
-                      checked={sellerPermissions.canViewExpenses || false}
-                      onChange={() => togglePermission('canViewExpenses')}
-                      className="rounded border-slate-700 bg-slate-900 text-blue-600 focus:ring-blue-500"
-                    />
-                  </label>
-                  
-                  <label className="flex items-center justify-between cursor-pointer p-1.5 rounded hover:bg-slate-900">
-                    <span className="text-xs text-slate-200">Record Expenses</span>
-                    <input
-                      type="checkbox"
-                      checked={sellerPermissions.canRecordExpenses || false}
-                      onChange={() => togglePermission('canRecordExpenses')}
-                      className="rounded border-slate-700 bg-slate-900 text-blue-600 focus:ring-blue-500"
-                    />
-                  </label>
-                  
-                  <label className="flex items-center justify-between cursor-pointer p-1.5 rounded hover:bg-slate-900">
-                    <span className="text-xs text-slate-200">Manage Shops</span>
-                    <input
-                      type="checkbox"
-                      checked={sellerPermissions.canManageShops || false}
-                      onChange={() => togglePermission('canManageShops')}
-                      className="rounded border-slate-700 bg-slate-900 text-blue-600 focus:ring-blue-500"
-                    />
-                  </label>
-                  
-                  <label className="flex items-center justify-between cursor-pointer p-1.5 rounded hover:bg-slate-900">
-                    <span className="text-xs text-slate-200">Manage Sellers</span>
-                    <input
-                      type="checkbox"
-                      checked={sellerPermissions.canManageSellers || false}
-                      onChange={() => togglePermission('canManageSellers')}
-                      className="rounded border-slate-700 bg-slate-900 text-blue-600 focus:ring-blue-500"
-                    />
-                  </label>
+                  <div className="space-y-1.5 max-h-48 overflow-y-auto p-2 rounded-lg bg-slate-950 border border-slate-800">
+                    <label className="flex items-center justify-between cursor-pointer p-1.5 rounded hover:bg-slate-900">
+                      <span className="text-xs text-slate-200">Edit Products (Modify existing)</span>
+                      <input
+                        type="checkbox"
+                        checked={sellerPermissions.canEditProducts || false}
+                        onChange={() => togglePermission('canEditProducts')}
+                        className="rounded border-slate-700 bg-slate-900 text-blue-600 focus:ring-blue-500"
+                      />
+                    </label>
+                    
+                    <label className="flex items-center justify-between cursor-pointer p-1.5 rounded hover:bg-slate-900">
+                      <span className="text-xs text-slate-200">Delete Products</span>
+                      <input
+                        type="checkbox"
+                        checked={sellerPermissions.canDeleteProducts || false}
+                        onChange={() => togglePermission('canDeleteProducts')}
+                        className="rounded border-slate-700 bg-slate-900 text-blue-600 focus:ring-blue-500"
+                      />
+                    </label>
+                    
+                    <label className="flex items-center justify-between cursor-pointer p-1.5 rounded hover:bg-slate-900">
+                      <span className="text-xs text-slate-200">Manage Inventory (Stock adjustments)</span>
+                      <input
+                        type="checkbox"
+                        checked={sellerPermissions.canManageInventory || false}
+                        onChange={() => togglePermission('canManageInventory')}
+                        className="rounded border-slate-700 bg-slate-900 text-blue-600 focus:ring-blue-500"
+                      />
+                    </label>
+                    
+                    <label className="flex items-center justify-between cursor-pointer p-1.5 rounded hover:bg-slate-900">
+                      <span className="text-xs text-slate-200">Edit Sales (No approval needed)</span>
+                      <input
+                        type="checkbox"
+                        checked={sellerPermissions.canEditSales || false}
+                        onChange={() => togglePermission('canEditSales')}
+                        className="rounded border-slate-700 bg-slate-900 text-blue-600 focus:ring-blue-500"
+                      />
+                    </label>
+                    
+                    <label className="flex items-center justify-between cursor-pointer p-1.5 rounded hover:bg-slate-900">
+                      <span className="text-xs text-slate-200">Void Sales</span>
+                      <input
+                        type="checkbox"
+                        checked={sellerPermissions.canDeleteSales || false}
+                        onChange={() => togglePermission('canDeleteSales')}
+                        className="rounded border-slate-700 bg-slate-900 text-blue-600 focus:ring-blue-500"
+                      />
+                    </label>
+                    
+                    <label className="flex items-center justify-between cursor-pointer p-1.5 rounded hover:bg-slate-900">
+                      <span className="text-xs text-slate-200">Manage All Debts (Not just own)</span>
+                      <input
+                        type="checkbox"
+                        checked={sellerPermissions.canManageDebts || false}
+                        onChange={() => togglePermission('canManageDebts')}
+                        className="rounded border-slate-700 bg-slate-900 text-blue-600 focus:ring-blue-500"
+                      />
+                    </label>
+                    
+                    <label className="flex items-center justify-between cursor-pointer p-1.5 rounded hover:bg-slate-900">
+                      <span className="text-xs text-slate-200">View Financial Reports</span>
+                      <input
+                        type="checkbox"
+                        checked={sellerPermissions.canViewReports || false}
+                        onChange={() => togglePermission('canViewReports')}
+                        className="rounded border-slate-700 bg-slate-900 text-blue-600 focus:ring-blue-500"
+                      />
+                    </label>
+                    
+                    <label className="flex items-center justify-between cursor-pointer p-1.5 rounded hover:bg-slate-900">
+                      <span className="text-xs text-slate-200">Record Purchases</span>
+                      <input
+                        type="checkbox"
+                        checked={sellerPermissions.canRecordPurchases || false}
+                        onChange={() => togglePermission('canRecordPurchases')}
+                        className="rounded border-slate-700 bg-slate-900 text-blue-600 focus:ring-blue-500"
+                      />
+                    </label>
+                    
+                    <label className="flex items-center justify-between cursor-pointer p-1.5 rounded hover:bg-slate-900">
+                      <span className="text-xs text-slate-200">View / List Shop Expenses</span>
+                      <input
+                        type="checkbox"
+                        checked={sellerPermissions.canViewExpenses || false}
+                        onChange={() => togglePermission('canViewExpenses')}
+                        className="rounded border-slate-700 bg-slate-900 text-blue-600 focus:ring-blue-500"
+                      />
+                    </label>
+                    
+                    <label className="flex items-center justify-between cursor-pointer p-1.5 rounded hover:bg-slate-900">
+                      <span className="text-xs text-slate-200">Record Shop Expenses</span>
+                      <input
+                        type="checkbox"
+                        checked={sellerPermissions.canRecordExpenses || false}
+                        onChange={() => togglePermission('canRecordExpenses')}
+                        className="rounded border-slate-700 bg-slate-900 text-blue-600 focus:ring-blue-500"
+                      />
+                    </label>
+
+                    <label className="flex items-center justify-between cursor-pointer p-1.5 rounded hover:bg-slate-900">
+                      <span className="text-xs text-slate-200">Manage Shops</span>
+                      <input
+                        type="checkbox"
+                        checked={sellerPermissions.canManageShops || false}
+                        onChange={() => togglePermission('canManageShops')}
+                        className="rounded border-slate-700 bg-slate-900 text-blue-600 focus:ring-blue-500"
+                      />
+                    </label>
+                    
+                    <label className="flex items-center justify-between cursor-pointer p-1.5 rounded hover:bg-slate-900">
+                      <span className="text-xs text-slate-200">Manage Sellers</span>
+                      <input
+                        type="checkbox"
+                        checked={sellerPermissions.canManageSellers || false}
+                        onChange={() => togglePermission('canManageSellers')}
+                        className="rounded border-slate-700 bg-slate-900 text-blue-600 focus:ring-blue-500"
+                      />
+                    </label>
+                  </div>
                 </div>
-              </div>
+              ) : shopAdm ? (
+                <label className="flex items-center justify-between gap-3 p-3 rounded-xl bg-slate-950 border border-slate-800 hover:border-emerald-500/40 cursor-pointer transition">
+                  <span className="flex-1 min-w-0">
+                    <span className="block text-xs font-semibold text-slate-100">
+                      Allow Adding Shop Expenses
+                    </span>
+                    <span className="block text-[10px] text-slate-400 mt-0.5">
+                      Grants this seller access to record expenses for their assigned shop.
+                    </span>
+                  </span>
+                  <span
+                    className={`relative shrink-0 w-10 h-5 rounded-full transition-colors ${
+                      sellerPermissions.canRecordExpenses ? 'bg-emerald-600' : 'bg-slate-700'
+                    }`}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={!!sellerPermissions.canRecordExpenses}
+                      onChange={() => togglePermission('canRecordExpenses')}
+                      className="sr-only"
+                    />
+                    <span
+                      className={`absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white shadow transition-transform ${
+                        sellerPermissions.canRecordExpenses ? 'translate-x-5' : 'translate-x-0'
+                      }`}
+                    />
+                  </span>
+                </label>
+              ) : null}
 
               <div>
                 <label className="block text-slate-300 font-medium mb-1.5">Signature Color Theme</label>
@@ -968,10 +1104,12 @@ export const AdminSellers: React.FC = () => {
               <div>
                 <label className="block text-slate-300 font-semibold mb-1.5 flex items-center justify-between">
                   <span>Assigned Shop Units *</span>
-                  <span className="text-[10px] text-slate-400 font-normal">Check all shops seller can access</span>
+                  <span className="text-[10px] text-slate-400 font-normal">
+                    {platformAdmin ? 'Check all shops seller can access' : 'Managed shop assignment'}
+                  </span>
                 </label>
                 <div className="space-y-1.5 max-h-36 overflow-y-auto p-2 rounded-lg bg-slate-950 border border-slate-800">
-                  {allShops.map(sh => (
+                  {manageableShops.map(sh => (
                     <label
                       key={sh.id}
                       className="flex items-center gap-2.5 p-1.5 rounded hover:bg-slate-900 cursor-pointer"
@@ -989,136 +1127,172 @@ export const AdminSellers: React.FC = () => {
                     </label>
                   ))}
                 </div>
+                {!platformAdmin &&
+                  (selectedSeller.assignedShopIds || []).some(id => allowedShopIds && !allowedShopIds.includes(id)) && (
+                    <p className="text-[10px] text-amber-300/90 mt-1">
+                      Note: This seller is also assigned to other platform shops (preserved automatically).
+                    </p>
+                  )}
               </div>
 
-              {/* Permissions Section */}
-              <div>
-                <label className="block text-slate-300 font-semibold mb-1.5 flex items-center gap-1">
-                  <Shield className="w-3.5 h-3.5 text-blue-400" />
-                  <span>Permissions Granted</span>
-                </label>
-                <div className="space-y-1.5 max-h-48 overflow-y-auto p-2 rounded-lg bg-slate-950 border border-slate-800">
-                  <label className="flex items-center justify-between cursor-pointer p-1.5 rounded hover:bg-slate-900">
-                    <span className="text-xs text-slate-200">Edit Products (Modify existing)</span>
-                    <input
-                      type="checkbox"
-                      checked={sellerPermissions.canEditProducts || false}
-                      onChange={() => togglePermission('canEditProducts')}
-                      className="rounded border-slate-700 bg-slate-900 text-blue-600 focus:ring-blue-500"
-                    />
+              {/* Permissions Section — Full selector for Platform Admin, Expense-only toggle for Shop Admin */}
+              {platformAdmin ? (
+                <div>
+                  <label className="block text-slate-300 font-semibold mb-1.5 flex items-center gap-1">
+                    <Shield className="w-3.5 h-3.5 text-blue-400" />
+                    <span>Permissions Granted</span>
                   </label>
-                  
-                  <label className="flex items-center justify-between cursor-pointer p-1.5 rounded hover:bg-slate-900">
-                    <span className="text-xs text-slate-200">Delete Products</span>
-                    <input
-                      type="checkbox"
-                      checked={sellerPermissions.canDeleteProducts || false}
-                      onChange={() => togglePermission('canDeleteProducts')}
-                      className="rounded border-slate-700 bg-slate-900 text-blue-600 focus:ring-blue-500"
-                    />
-                  </label>
-                  
-                  <label className="flex items-center justify-between cursor-pointer p-1.5 rounded hover:bg-slate-900">
-                    <span className="text-xs text-slate-200">Manage Inventory (Stock adjustments)</span>
-                    <input
-                      type="checkbox"
-                      checked={sellerPermissions.canManageInventory || false}
-                      onChange={() => togglePermission('canManageInventory')}
-                      className="rounded border-slate-700 bg-slate-900 text-blue-600 focus:ring-blue-500"
-                    />
-                  </label>
-                  
-                  <label className="flex items-center justify-between cursor-pointer p-1.5 rounded hover:bg-slate-900">
-                    <span className="text-xs text-slate-200">Edit Sales (No approval needed)</span>
-                    <input
-                      type="checkbox"
-                      checked={sellerPermissions.canEditSales || false}
-                      onChange={() => togglePermission('canEditSales')}
-                      className="rounded border-slate-700 bg-slate-900 text-blue-600 focus:ring-blue-500"
-                    />
-                  </label>
-                  
-                  <label className="flex items-center justify-between cursor-pointer p-1.5 rounded hover:bg-slate-900">
-                    <span className="text-xs text-slate-200">Void Sales</span>
-                    <input
-                      type="checkbox"
-                      checked={sellerPermissions.canDeleteSales || false}
-                      onChange={() => togglePermission('canDeleteSales')}
-                      className="rounded border-slate-700 bg-slate-900 text-blue-600 focus:ring-blue-500"
-                    />
-                  </label>
-                  
-                  <label className="flex items-center justify-between cursor-pointer p-1.5 rounded hover:bg-slate-900">
-                    <span className="text-xs text-slate-200">Manage All Debts (Not just own)</span>
-                    <input
-                      type="checkbox"
-                      checked={sellerPermissions.canManageDebts || false}
-                      onChange={() => togglePermission('canManageDebts')}
-                      className="rounded border-slate-700 bg-slate-900 text-blue-600 focus:ring-blue-500"
-                    />
-                  </label>
-                  
-                  <label className="flex items-center justify-between cursor-pointer p-1.5 rounded hover:bg-slate-900">
-                    <span className="text-xs text-slate-200">View Financial Reports</span>
-                    <input
-                      type="checkbox"
-                      checked={sellerPermissions.canViewReports || false}
-                      onChange={() => togglePermission('canViewReports')}
-                      className="rounded border-slate-700 bg-slate-900 text-blue-600 focus:ring-blue-500"
-                    />
-                  </label>
-                  
-                  <label className="flex items-center justify-between cursor-pointer p-1.5 rounded hover:bg-slate-900">
-                    <span className="text-xs text-slate-200">Record Purchases</span>
-                    <input
-                      type="checkbox"
-                      checked={sellerPermissions.canRecordPurchases || false}
-                      onChange={() => togglePermission('canRecordPurchases')}
-                      className="rounded border-slate-700 bg-slate-900 text-blue-600 focus:ring-blue-500"
-                    />
-                  </label>
-                  
-                  <label className="flex items-center justify-between cursor-pointer p-1.5 rounded hover:bg-slate-900">
-                    <span className="text-xs text-slate-200">View Expenses</span>
-                    <input
-                      type="checkbox"
-                      checked={sellerPermissions.canViewExpenses || false}
-                      onChange={() => togglePermission('canViewExpenses')}
-                      className="rounded border-slate-700 bg-slate-900 text-blue-600 focus:ring-blue-500"
-                    />
-                  </label>
-                  
-                  <label className="flex items-center justify-between cursor-pointer p-1.5 rounded hover:bg-slate-900">
-                    <span className="text-xs text-slate-200">Record Expenses</span>
-                    <input
-                      type="checkbox"
-                      checked={sellerPermissions.canRecordExpenses || false}
-                      onChange={() => togglePermission('canRecordExpenses')}
-                      className="rounded border-slate-700 bg-slate-900 text-blue-600 focus:ring-blue-500"
-                    />
-                  </label>
-                  
-                  <label className="flex items-center justify-between cursor-pointer p-1.5 rounded hover:bg-slate-900">
-                    <span className="text-xs text-slate-200">Manage Shops</span>
-                    <input
-                      type="checkbox"
-                      checked={sellerPermissions.canManageShops || false}
-                      onChange={() => togglePermission('canManageShops')}
-                      className="rounded border-slate-700 bg-slate-900 text-blue-600 focus:ring-blue-500"
-                    />
-                  </label>
-                  
-                  <label className="flex items-center justify-between cursor-pointer p-1.5 rounded hover:bg-slate-900">
-                    <span className="text-xs text-slate-200">Manage Sellers</span>
-                    <input
-                      type="checkbox"
-                      checked={sellerPermissions.canManageSellers || false}
-                      onChange={() => togglePermission('canManageSellers')}
-                      className="rounded border-slate-700 bg-slate-900 text-blue-600 focus:ring-blue-500"
-                    />
-                  </label>
+                  <div className="space-y-1.5 max-h-48 overflow-y-auto p-2 rounded-lg bg-slate-950 border border-slate-800">
+                    <label className="flex items-center justify-between cursor-pointer p-1.5 rounded hover:bg-slate-900">
+                      <span className="text-xs text-slate-200">Edit Products (Modify existing)</span>
+                      <input
+                        type="checkbox"
+                        checked={sellerPermissions.canEditProducts || false}
+                        onChange={() => togglePermission('canEditProducts')}
+                        className="rounded border-slate-700 bg-slate-900 text-blue-600 focus:ring-blue-500"
+                      />
+                    </label>
+                    
+                    <label className="flex items-center justify-between cursor-pointer p-1.5 rounded hover:bg-slate-900">
+                      <span className="text-xs text-slate-200">Delete Products</span>
+                      <input
+                        type="checkbox"
+                        checked={sellerPermissions.canDeleteProducts || false}
+                        onChange={() => togglePermission('canDeleteProducts')}
+                        className="rounded border-slate-700 bg-slate-900 text-blue-600 focus:ring-blue-500"
+                      />
+                    </label>
+                    
+                    <label className="flex items-center justify-between cursor-pointer p-1.5 rounded hover:bg-slate-900">
+                      <span className="text-xs text-slate-200">Manage Inventory (Stock adjustments)</span>
+                      <input
+                        type="checkbox"
+                        checked={sellerPermissions.canManageInventory || false}
+                        onChange={() => togglePermission('canManageInventory')}
+                        className="rounded border-slate-700 bg-slate-900 text-blue-600 focus:ring-blue-500"
+                      />
+                    </label>
+                    
+                    <label className="flex items-center justify-between cursor-pointer p-1.5 rounded hover:bg-slate-900">
+                      <span className="text-xs text-slate-200">Edit Sales (No approval needed)</span>
+                      <input
+                        type="checkbox"
+                        checked={sellerPermissions.canEditSales || false}
+                        onChange={() => togglePermission('canEditSales')}
+                        className="rounded border-slate-700 bg-slate-900 text-blue-600 focus:ring-blue-500"
+                      />
+                    </label>
+                    
+                    <label className="flex items-center justify-between cursor-pointer p-1.5 rounded hover:bg-slate-900">
+                      <span className="text-xs text-slate-200">Void Sales</span>
+                      <input
+                        type="checkbox"
+                        checked={sellerPermissions.canDeleteSales || false}
+                        onChange={() => togglePermission('canDeleteSales')}
+                        className="rounded border-slate-700 bg-slate-900 text-blue-600 focus:ring-blue-500"
+                      />
+                    </label>
+                    
+                    <label className="flex items-center justify-between cursor-pointer p-1.5 rounded hover:bg-slate-900">
+                      <span className="text-xs text-slate-200">Manage All Debts (Not just own)</span>
+                      <input
+                        type="checkbox"
+                        checked={sellerPermissions.canManageDebts || false}
+                        onChange={() => togglePermission('canManageDebts')}
+                        className="rounded border-slate-700 bg-slate-900 text-blue-600 focus:ring-blue-500"
+                      />
+                    </label>
+                    
+                    <label className="flex items-center justify-between cursor-pointer p-1.5 rounded hover:bg-slate-900">
+                      <span className="text-xs text-slate-200">View Financial Reports</span>
+                      <input
+                        type="checkbox"
+                        checked={sellerPermissions.canViewReports || false}
+                        onChange={() => togglePermission('canViewReports')}
+                        className="rounded border-slate-700 bg-slate-900 text-blue-600 focus:ring-blue-500"
+                      />
+                    </label>
+                    
+                    <label className="flex items-center justify-between cursor-pointer p-1.5 rounded hover:bg-slate-900">
+                      <span className="text-xs text-slate-200">Record Purchases</span>
+                      <input
+                        type="checkbox"
+                        checked={sellerPermissions.canRecordPurchases || false}
+                        onChange={() => togglePermission('canRecordPurchases')}
+                        className="rounded border-slate-700 bg-slate-900 text-blue-600 focus:ring-blue-500"
+                      />
+                    </label>
+                    
+                    <label className="flex items-center justify-between cursor-pointer p-1.5 rounded hover:bg-slate-900">
+                      <span className="text-xs text-slate-200">View / List Shop Expenses</span>
+                      <input
+                        type="checkbox"
+                        checked={sellerPermissions.canViewExpenses || false}
+                        onChange={() => togglePermission('canViewExpenses')}
+                        className="rounded border-slate-700 bg-slate-900 text-blue-600 focus:ring-blue-500"
+                      />
+                    </label>
+                    
+                    <label className="flex items-center justify-between cursor-pointer p-1.5 rounded hover:bg-slate-900">
+                      <span className="text-xs text-slate-200">Record Shop Expenses</span>
+                      <input
+                        type="checkbox"
+                        checked={sellerPermissions.canRecordExpenses || false}
+                        onChange={() => togglePermission('canRecordExpenses')}
+                        className="rounded border-slate-700 bg-slate-900 text-blue-600 focus:ring-blue-500"
+                      />
+                    </label>
+
+                    <label className="flex items-center justify-between cursor-pointer p-1.5 rounded hover:bg-slate-900">
+                      <span className="text-xs text-slate-200">Manage Shops</span>
+                      <input
+                        type="checkbox"
+                        checked={sellerPermissions.canManageShops || false}
+                        onChange={() => togglePermission('canManageShops')}
+                        className="rounded border-slate-700 bg-slate-900 text-blue-600 focus:ring-blue-500"
+                      />
+                    </label>
+                    
+                    <label className="flex items-center justify-between cursor-pointer p-1.5 rounded hover:bg-slate-900">
+                      <span className="text-xs text-slate-200">Manage Sellers</span>
+                      <input
+                        type="checkbox"
+                        checked={sellerPermissions.canManageSellers || false}
+                        onChange={() => togglePermission('canManageSellers')}
+                        className="rounded border-slate-700 bg-slate-900 text-blue-600 focus:ring-blue-500"
+                      />
+                    </label>
+                  </div>
                 </div>
-              </div>
+              ) : shopAdm ? (
+                <label className="flex items-center justify-between gap-3 p-3 rounded-xl bg-slate-950 border border-slate-800 hover:border-emerald-500/40 cursor-pointer transition">
+                  <span className="flex-1 min-w-0">
+                    <span className="block text-xs font-semibold text-slate-100">
+                      Allow Adding Shop Expenses
+                    </span>
+                    <span className="block text-[10px] text-slate-400 mt-0.5">
+                      Grants this seller access to record expenses for their assigned shop.
+                    </span>
+                  </span>
+                  <span
+                    className={`relative shrink-0 w-10 h-5 rounded-full transition-colors ${
+                      sellerPermissions.canRecordExpenses ? 'bg-emerald-600' : 'bg-slate-700'
+                    }`}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={!!sellerPermissions.canRecordExpenses}
+                      onChange={() => togglePermission('canRecordExpenses')}
+                      className="sr-only"
+                    />
+                    <span
+                      className={`absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white shadow transition-transform ${
+                        sellerPermissions.canRecordExpenses ? 'translate-x-5' : 'translate-x-0'
+                      }`}
+                    />
+                  </span>
+                </label>
+              ) : null}
 
               <div>
                 <label className="block text-slate-300 font-medium mb-1.5">Signature Color Theme</label>

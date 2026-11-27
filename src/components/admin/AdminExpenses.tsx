@@ -22,7 +22,14 @@ import { ExpenseCategory, PaymentMethod, Expense } from '../../types';
 import { formatCurrency, formatDateTime } from '../../utils/formatters';
 import { formatPriceInput, parsePriceInput } from '../../utils/priceInput';
 import { generateUUID } from '../../utils/crypto';
-import { hasAdminAccess } from '../../utils/permissions';
+import {
+  canAccessShopAsAdmin,
+  getAdminManagedShops,
+  getEffectiveSellerPermissions,
+  hasAdminAccess,
+  isPlatformAdmin,
+  isShopAdmin,
+} from '../../utils/permissions';
 
 const DEFAULT_EXPENSE_CATEGORIES: { id: string; label: string; isCustom?: boolean }[] = [
   { id: 'RENT', label: 'Store Rent & Lease' },
@@ -47,7 +54,15 @@ interface CustomCategory {
 }
 
 export const AdminExpenses: React.FC = () => {
-  const { currentUser, dbState, addToast, expensesSubTab, setExpensesSubTab, expensesNavTick } = useApp();
+  const {
+    currentUser,
+    dbState,
+    addToast,
+    selectedShopId,
+    expensesSubTab,
+    setExpensesSubTab,
+    expensesNavTick,
+  } = useApp();
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [isCategoryModalOpen, setIsCategoryModalOpen] = useState(false);
   const [editingExpense, setEditingExpense] = useState<Expense | null>(null);
@@ -82,6 +97,7 @@ export const AdminExpenses: React.FC = () => {
   const [paymentMethod, setPaymentMethod] = useState<PaymentMethod>('CASH');
   const [reference, setReference] = useState('');
   const [notes, setNotes] = useState('');
+  const [expenseShopId, setExpenseShopId] = useState<string>('GENERAL');
   const [formError, setFormError] = useState('');
 
   // All categories = default + custom
@@ -89,18 +105,38 @@ export const AdminExpenses: React.FC = () => {
     return [...DEFAULT_EXPENSE_CATEGORIES, ...customCategories];
   }, [customCategories]);
 
-  // Permission check
-  if (!currentUser) return null;
-  if (
-    !hasAdminAccess(currentUser) &&
-    !currentUser.permissions?.canViewExpenses &&
-    !currentUser.permissions?.canRecordExpenses
-  )
-    return null;
+  const platformAdmin = currentUser ? isPlatformAdmin(currentUser) : false;
+  const shopAdmin = currentUser ? isShopAdmin(currentUser) : false;
+  const effectivePerms = currentUser ? getEffectiveSellerPermissions(currentUser) : {};
+  const canAccessExpenses = Boolean(
+    currentUser &&
+      (hasAdminAccess(currentUser) ||
+        effectivePerms.canViewExpenses ||
+        effectivePerms.canRecordExpenses)
+  );
+  const canRecordExpense = Boolean(
+    currentUser && (hasAdminAccess(currentUser) || effectivePerms.canRecordExpenses)
+  );
+  const canManageExpenseAdmin = Boolean(currentUser && hasAdminAccess(currentUser));
+  const accessibleShops = platformAdmin
+    ? dbState.shops || []
+    : shopAdmin && currentUser
+      ? getAdminManagedShops(currentUser, dbState.shops || [])
+      : currentUser
+        ? (dbState.shops || []).filter(s => (currentUser.assignedShopIds || []).includes(s.id))
+        : [];
 
-  const canRecordExpense =
-    hasAdminAccess(currentUser) || currentUser.permissions?.canRecordExpenses;
-  const isAdmin = currentUser.role === 'ADMIN';
+  const getDefaultExpenseShopId = (): string => {
+    if (
+      selectedShopId &&
+      selectedShopId !== 'ALL' &&
+      (platformAdmin || accessibleShops.some(s => s.id === selectedShopId))
+    ) {
+      return selectedShopId;
+    }
+    if (platformAdmin) return 'GENERAL';
+    return accessibleShops[0]?.id || '';
+  };
 
   const settings = dbState.settings;
 
@@ -151,8 +187,10 @@ export const AdminExpenses: React.FC = () => {
 
   // Get expenses
   const expenses = useMemo(() => {
+    if (!currentUser || !canAccessExpenses) return [];
     return ExpenseService.getExpenses(
       {
+        shopId: selectedShopId,
         category: categoryFilter === 'ALL' ? undefined : categoryFilter,
         search: searchQuery,
         startDate: dateRange.from,
@@ -160,7 +198,7 @@ export const AdminExpenses: React.FC = () => {
       },
       currentUser
     );
-  }, [categoryFilter, searchQuery, dateRange, currentUser, dbState.expenses]);
+  }, [selectedShopId, categoryFilter, searchQuery, dateRange, currentUser, canAccessExpenses, dbState.expenses]);
 
   const totalSpent = expenses.reduce((sum, e) => sum + e.amount, 0);
 
@@ -201,6 +239,7 @@ export const AdminExpenses: React.FC = () => {
     setPaymentMethod('CASH');
     setReference('');
     setNotes('');
+    setExpenseShopId(getDefaultExpenseShopId());
     setFormError('');
     setIsModalOpen(true);
   };
@@ -216,6 +255,8 @@ export const AdminExpenses: React.FC = () => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [expensesNavTick, expensesSubTab]);
 
+  if (!currentUser || !canAccessExpenses) return null;
+
   const openEditModal = (expense: Expense) => {
     setEditingExpense(expense);
     setTitle(expense.title || expense.description);
@@ -224,6 +265,7 @@ export const AdminExpenses: React.FC = () => {
     setPaymentMethod(expense.paymentMethod);
     setReference(expense.reference || '');
     setNotes(expense.notes || '');
+    setExpenseShopId(expense.shopId || (platformAdmin ? 'GENERAL' : accessibleShops[0]?.id || ''));
     setFormError('');
     setIsModalOpen(true);
   };
@@ -237,11 +279,19 @@ export const AdminExpenses: React.FC = () => {
       return;
     }
 
+    if (!platformAdmin && (!expenseShopId || expenseShopId === 'GENERAL')) {
+      setFormError('Please select your shop for this expense.');
+      return;
+    }
+
     const amt = parsePriceInput(amount);
     if (isNaN(amt) || amt <= 0) {
       setFormError('Please enter a valid expense amount.');
       return;
     }
+
+    const isCompany = expenseShopId === 'GENERAL' || !expenseShopId;
+    const targetShopId = isCompany ? null : expenseShopId;
 
     if (editingExpense) {
       const res = ExpenseService.updateExpense(
@@ -253,6 +303,8 @@ export const AdminExpenses: React.FC = () => {
           paymentMethod,
           reference: reference.trim() || undefined,
           notes: notes.trim() || undefined,
+          shopId: targetShopId,
+          isCompanyExpense: isCompany,
         },
         currentUser
       );
@@ -271,6 +323,8 @@ export const AdminExpenses: React.FC = () => {
     } else {
       const res = ExpenseService.createExpense(
         {
+          shopId: targetShopId,
+          isCompanyExpense: isCompany,
           title: title.trim(),
           category,
           amount: amt,
@@ -447,7 +501,7 @@ export const AdminExpenses: React.FC = () => {
         </div>
 
         <div className="flex items-center gap-2">
-          {isAdmin && (
+          {canManageExpenseAdmin && (
             <button
               onClick={handleOpenCategoryModal}
               className="flex items-center gap-2 px-3.5 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 font-semibold text-xs border border-slate-700 transition"
@@ -627,12 +681,13 @@ export const AdminExpenses: React.FC = () => {
               <tr className="border-b border-slate-800 bg-slate-950/60 text-slate-400">
                 <th className="py-3 px-4 font-semibold">Date</th>
                 <th className="py-3 px-4 font-semibold">Expense Title</th>
+                <th className="py-3 px-4 font-semibold">Shop / Unit</th>
                 <th className="py-3 px-4 font-semibold">Category</th>
                 <th className="py-3 px-4 font-semibold">Payment Method</th>
                 <th className="py-3 px-4 font-semibold">Reference</th>
                 <th className="py-3 px-4 font-semibold">Recorded By</th>
                 <th className="py-3 px-4 text-right font-semibold">Amount</th>
-                {isAdmin && (
+                {canManageExpenseAdmin && (
                   <th className="py-3 px-4 text-right font-semibold">Actions</th>
                 )}
               </tr>
@@ -640,57 +695,76 @@ export const AdminExpenses: React.FC = () => {
             <tbody className="divide-y divide-slate-800/60">
               {expenses.length === 0 ? (
                 <tr>
-                  <td colSpan={isAdmin ? 8 : 7} className="py-10 text-center text-slate-500">
+                  <td
+                    colSpan={canManageExpenseAdmin ? 9 : 8}
+                    className="py-10 text-center text-slate-500"
+                  >
                     <CreditCard className="w-8 h-8 mx-auto mb-2 opacity-40" />
                     <p>No expense records match your filter.</p>
                   </td>
                 </tr>
               ) : (
-                expenses.map(expense => (
-                  <tr key={expense.id} className="hover:bg-slate-850/60 transition">
-                    <td className="py-3.5 px-4 text-slate-400 font-mono">
-                      {formatDateTime(expense.createdAt)}
-                    </td>
-                    <td className="py-3.5 px-4 font-bold text-white">
-                      {expense.title || expense.description}
-                    </td>
-                    <td className="py-3.5 px-4 text-slate-300">
-                      <span className="px-2 py-0.5 rounded-full bg-slate-800 text-[10px] font-medium border border-slate-700/60">
-                        {getCategoryLabel(expense.category)}
-                      </span>
-                    </td>
-                    <td className="py-3.5 px-4">
-                      <span className="px-2 py-0.5 rounded bg-slate-800 text-slate-300 text-[10px] uppercase font-medium">
-                        {expense.paymentMethod}
-                      </span>
-                    </td>
-                    <td className="py-3.5 px-4 font-mono text-slate-400">
-                      {expense.reference || '—'}
-                    </td>
-                    <td className="py-3.5 px-4 text-slate-400">{expense.createdByName}</td>
-                    <td className="py-3.5 px-4 text-right font-mono font-bold text-rose-400 text-sm">
-                      {formatCurrency(expense.amount, settings.currencySymbol)}
-                    </td>
-                    {isAdmin && (
-                      <td className="py-3.5 px-4 text-right space-x-1.5">
-                        <button
-                          onClick={() => openEditModal(expense)}
-                          className="p-1.5 rounded-lg bg-slate-800 hover:bg-blue-600 text-slate-300 hover:text-white transition"
-                          title="Edit expense"
-                        >
-                          <Edit2 className="w-3.5 h-3.5" />
-                        </button>
-                        <button
-                          onClick={() => setDeletingExpense(expense)}
-                          className="p-1.5 rounded-lg bg-slate-800 hover:bg-rose-600 text-slate-300 hover:text-white transition"
-                          title="Delete expense"
-                        >
-                          <Trash2 className="w-3.5 h-3.5" />
-                        </button>
+                expenses.map(expense => {
+                  const canManageRow =
+                    platformAdmin ||
+                    (shopAdmin &&
+                      Boolean(expense.shopId && canAccessShopAsAdmin(currentUser, expense.shopId)));
+
+                  return (
+                    <tr key={expense.id} className="hover:bg-slate-850/60 transition">
+                      <td className="py-3.5 px-4 text-slate-400 font-mono">
+                        {formatDateTime(expense.createdAt)}
                       </td>
-                    )}
-                  </tr>
-                ))
+                      <td className="py-3.5 px-4 font-bold text-white">
+                        {expense.title || expense.description}
+                      </td>
+                      <td className="py-3.5 px-4 text-slate-300">
+                        <span className="px-2 py-0.5 rounded-md bg-slate-800/80 text-slate-300 text-[10px] font-medium border border-slate-700/60">
+                          {expense.shopName || 'General Company'}
+                        </span>
+                      </td>
+                      <td className="py-3.5 px-4 text-slate-300">
+                        <span className="px-2 py-0.5 rounded-full bg-slate-800 text-[10px] font-medium border border-slate-700/60">
+                          {getCategoryLabel(expense.category)}
+                        </span>
+                      </td>
+                      <td className="py-3.5 px-4">
+                        <span className="px-2 py-0.5 rounded bg-slate-800 text-slate-300 text-[10px] uppercase font-medium">
+                          {expense.paymentMethod}
+                        </span>
+                      </td>
+                      <td className="py-3.5 px-4 font-mono text-slate-400">
+                        {expense.reference || '—'}
+                      </td>
+                      <td className="py-3.5 px-4 text-slate-400">{expense.createdByName}</td>
+                      <td className="py-3.5 px-4 text-right font-mono font-bold text-rose-400 text-sm">
+                        {formatCurrency(expense.amount, settings.currencySymbol)}
+                      </td>
+                      {canManageExpenseAdmin && (
+                        <td className="py-3.5 px-4 text-right space-x-1.5 whitespace-nowrap">
+                          {canManageRow && (
+                            <>
+                              <button
+                                onClick={() => openEditModal(expense)}
+                                className="p-1.5 rounded-lg bg-slate-800 hover:bg-blue-600 text-slate-300 hover:text-white transition"
+                                title="Edit expense"
+                              >
+                                <Edit2 className="w-3.5 h-3.5" />
+                              </button>
+                              <button
+                                onClick={() => setDeletingExpense(expense)}
+                                className="p-1.5 rounded-lg bg-slate-800 hover:bg-rose-600 text-slate-300 hover:text-white transition"
+                                title="Delete expense"
+                              >
+                                <Trash2 className="w-3.5 h-3.5" />
+                              </button>
+                            </>
+                          )}
+                        </td>
+                      )}
+                    </tr>
+                  );
+                })
               )}
             </tbody>
           </table>
@@ -727,6 +801,27 @@ export const AdminExpenses: React.FC = () => {
             )}
 
             <form onSubmit={handleSaveExpense} className="space-y-4 text-xs">
+              <div>
+                <label className="block text-slate-300 font-medium mb-1">
+                  Shop / Business Unit {!platformAdmin ? '*' : ''}
+                </label>
+                <select
+                  value={expenseShopId}
+                  onChange={e => setExpenseShopId(e.target.value)}
+                  required={!platformAdmin}
+                  className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white focus:outline-none focus:ring-1 focus:ring-blue-500"
+                >
+                  {platformAdmin && (
+                    <option value="GENERAL">General Company (All Business)</option>
+                  )}
+                  {accessibleShops.map(sh => (
+                    <option key={sh.id} value={sh.id}>
+                      {sh.name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
               <div>
                 <label className="block text-slate-300 font-medium mb-1">
                   Expense Description *
@@ -843,7 +938,7 @@ export const AdminExpenses: React.FC = () => {
       )}
 
       {/* Modal: Manage Categories */}
-      {isCategoryModalOpen && isAdmin && (
+      {isCategoryModalOpen && canManageExpenseAdmin && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 backdrop-blur-sm p-4">
           <div className="bg-slate-900 border border-slate-800 rounded-2xl max-w-md w-full p-6 shadow-2xl animate-in fade-in zoom-in-95 max-h-[90vh] overflow-y-auto">
             <div className="flex items-center justify-between pb-3 border-b border-slate-800 mb-4">

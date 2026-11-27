@@ -4,6 +4,7 @@ import { generateUUID } from '../utils/crypto';
 import { generateReceiptNumber, formatDateTime } from '../utils/formatters';
 import { NotificationService } from './notificationService';
 import {
+  canAccessShopAsAdmin,
   getShopAdminShopIds,
   hasAdminAccess,
   isPlatformAdmin,
@@ -120,8 +121,15 @@ export class SalesService {
 
     const now = new Date();
     const localTodayYMD = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+    const canBackdateSale =
+      isPlatformAdmin(currentUser) || canAccessShopAsAdmin(currentUser, params.shopId);
     let txDate = now;
-    if (params.saleDate && /^\d{4}-\d{2}-\d{2}$/.test(params.saleDate) && params.saleDate < localTodayYMD) {
+    if (
+      canBackdateSale &&
+      params.saleDate &&
+      /^\d{4}-\d{2}-\d{2}$/.test(params.saleDate) &&
+      params.saleDate < localTodayYMD
+    ) {
       const [year, month, day] = params.saleDate.split('-').map(Number);
       const candidate = new Date(
         year,

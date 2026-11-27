@@ -3,6 +3,7 @@ import { db } from '../db/storage';
 import { User, UserRole, SellerPermissions } from '../types';
 import { hashPassword, verifyPassword, generateUUID } from '../utils/crypto';
 import { CloudflareApi } from './cloudflareApi';
+import { getShopAdminShopIds, hasAdminAccess, isPlatformAdmin, isShopAdmin } from '../utils/permissions';
 
 const AUTH_STORAGE_KEY = 'omnibiz_active_session_v1';
 const REMEMBER_KEY = 'omnibiz_remember_me';
@@ -273,8 +274,8 @@ export class AuthService {
     newPass: string,
     currentUser: User
   ): Promise<{ success: boolean; error?: string }> {
-    if (currentUser.role !== 'ADMIN') {
-      return { success: false, error: 'Permission denied: Only Administrator can reset seller passwords.' };
+    if (!hasAdminAccess(currentUser)) {
+      return { success: false, error: 'Permission denied: Only Admin or Shop Admin can reset seller passwords.' };
     }
     return AuthService.changePassword(sellerId, '', newPass, currentUser);
   }
@@ -285,8 +286,8 @@ export class AuthService {
     newPassword: string,
     callerUser: User
   ): Promise<{ success: boolean; error?: string }> {
-    // Sellers can change only their own password. Admin can change any seller's password.
-    if (callerUser.role !== 'ADMIN' && callerUser.id !== userId) {
+    // Sellers can change only their own password. Platform Admin can change any password; Shop Admin can reset sellers in their managed shops.
+    if (!hasAdminAccess(callerUser) && callerUser.id !== userId) {
       return { success: false, error: 'Permission denied: You cannot change another user password.' };
     }
 
@@ -298,6 +299,19 @@ export class AuthService {
     const targetUser = users.find(u => u.id === userId);
     if (!targetUser) {
       return { success: false, error: 'User not found.' };
+    }
+
+    if (!isPlatformAdmin(callerUser) && callerUser.id !== userId) {
+      const managedShopIds = new Set(getShopAdminShopIds(callerUser));
+      const inManagedShop =
+        targetUser.role === 'SELLER' &&
+        (targetUser.assignedShopIds || []).some(id => managedShopIds.has(id));
+      if (!isShopAdmin(callerUser) || !inManagedShop) {
+        return {
+          success: false,
+          error: 'Permission denied: You can only reset passwords for sellers in your managed shop.',
+        };
+      }
     }
 
     // If seller is changing own password, verify old password first

@@ -22,9 +22,19 @@ export function isPlatformAdmin(user?: User | null): boolean {
 
 export function getShopAdminShopIds(user?: User | null): string[] {
   if (!user || user.role !== 'SELLER') return [];
-  const raw = user.permissions?.shopAdminShopIds;
-  if (!Array.isArray(raw)) return [];
-  return Array.from(new Set(raw.filter((id): id is string => typeof id === 'string' && id.trim().length > 0)));
+  const fromPerms = Array.isArray(user.permissions?.shopAdminShopIds)
+    ? user.permissions!.shopAdminShopIds
+    : [];
+  const fromUser = Array.isArray(user.shopAdminShopIds)
+    ? user.shopAdminShopIds
+    : [];
+  return Array.from(
+    new Set(
+      [...fromPerms, ...fromUser].filter(
+        (id): id is string => typeof id === 'string' && id.trim().length > 0
+      )
+    )
+  );
 }
 
 export function isShopAdmin(user?: User | null, shopId?: string | null): boolean {

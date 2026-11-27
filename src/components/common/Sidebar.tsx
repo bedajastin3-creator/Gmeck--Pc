@@ -46,6 +46,7 @@ interface NavChildItem {
   icon: React.ElementType;
   iconColor: string;
   badge?: number | string;
+  requiresPermission?: keyof import('../../types').SellerPermissions;
 }
 
 interface NavItem {
@@ -169,6 +170,41 @@ export const Sidebar: React.FC = () => {
 
   const sellerNav: NavItem[] = [
     { id: 'new_sale', label: 'New Sale (POS)', icon: ShoppingCart, iconColor: 'text-emerald-400' },
+    ...(hasPermission('canRecordExpenses')
+      ? [
+          {
+            id: 'expenses',
+            label: 'Expenses',
+            icon: TrendingDown,
+            iconColor: 'text-rose-400',
+            requiresAnyPermission: ['canViewExpenses', 'canRecordExpenses'] as (keyof import('../../types').SellerPermissions)[],
+            children: [
+              {
+                id: 'add',
+                label: 'Add Expense',
+                icon: Plus,
+                iconColor: 'text-emerald-400',
+              },
+              {
+                id: 'list',
+                label: 'List',
+                icon: ClipboardList,
+                iconColor: 'text-rose-400',
+              },
+            ],
+          },
+        ]
+      : hasPermission('canViewExpenses')
+        ? [
+            {
+              id: 'expenses',
+              label: 'Shop Expenses',
+              icon: TrendingDown,
+              iconColor: 'text-rose-400',
+              requiresPermission: 'canViewExpenses' as keyof import('../../types').SellerPermissions,
+            },
+          ]
+        : []),
     { id: 'settings', label: 'Account Settings', icon: Settings, iconColor: 'text-sky-300' },
   ];
 
@@ -588,7 +624,9 @@ export const Sidebar: React.FC = () => {
                   >
                     <div className="overflow-hidden">
                       <div className={`ml-4 pl-2.5 py-0.5 space-y-0.5 border-l-2 ${borderLineColor}`}>
-                        {item.children.map(child => {
+                        {item.children
+                          .filter(child => !child.requiresPermission || hasPermission(child.requiresPermission))
+                          .map(child => {
                           const ChildIcon = child.icon;
                           const isChildActive =
                             item.id === 'shops'

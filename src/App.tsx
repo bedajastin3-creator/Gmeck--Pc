@@ -41,9 +41,16 @@ const MainLayout: React.FC = () => {
   }
 
   const renderActiveView = () => {
-    // Non-admin sellers can only access New Sale (POS) and Account Settings (color)
+    // Non-admin sellers can access New Sale (POS), Account Settings, and Shop Expenses if permitted
     if (!hasAdminAccess(currentUser)) {
-      return activeTab === 'settings' ? <SellerSettings /> : <NewSalePOS />;
+      const permissions = currentUser.permissions || {};
+      if (activeTab === 'settings') {
+        return <SellerSettings />;
+      }
+      if (activeTab === 'expenses' && (permissions.canViewExpenses || permissions.canRecordExpenses)) {
+        return <AdminExpenses />;
+      }
+      return <NewSalePOS />;
     }
 
     // Shared tabs accessible to admins / shop admins

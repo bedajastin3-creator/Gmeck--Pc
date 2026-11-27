@@ -31,6 +31,11 @@ import { ProductImageViewerModal } from '../common/ProductImageViewerModal';
 import { VoiceSaleService, VoiceSaleResult, VoiceSaleItem } from '../../services/voiceSaleService';
 import { VoiceSalePreview } from '../VoiceSalePreview';
 import { CloudflareApi } from '../../services/cloudflareApi';
+import {
+  canAccessShopAsAdmin,
+  isPlatformAdmin,
+  isShopAdmin,
+} from '../../utils/permissions';
 
 const PAGE_SIZE = 15;
 
@@ -95,27 +100,9 @@ export const NewSalePOS: React.FC = () => {
   const [viewingProduct, setViewingProduct] = useState<Product | null>(null);
   const [isViewerOpen, setIsViewerOpen] = useState(false);
 
-  // Sale Date — always defaults to Today; seller can switch to a previous date to record missed sales
+  // Sale Date — always defaults to Today; admins only can switch to a previous date to record missed sales
   const todayYMD = getLocalTodayYMD();
   const [saleDate, setSaleDate] = useState<string>(() => getLocalTodayYMD());
-  const isBackdatedSale = Boolean(saleDate && saleDate < todayYMD);
-
-  const handleSaleDateChange = (raw: string) => {
-    if (!raw || !/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
-      setSaleDate(todayYMD);
-      return;
-    }
-    if (raw > todayYMD) {
-      addToast({
-        type: 'warning',
-        title: 'Future Date Not Allowed',
-        description: 'You can only select today or a previous date.',
-      });
-      setSaleDate(todayYMD);
-      return;
-    }
-    setSaleDate(raw);
-  };
 
   // Voice sale state
   const [isRecording, setIsRecording] = useState(false);
@@ -146,6 +133,47 @@ export const NewSalePOS: React.FC = () => {
     availableShops[0]?.id ||
     dbState.shops[0]?.id ||
     '';
+
+  const resolvedSaleShopId =
+    targetShopId === 'ALL' ? dbState.shops[0]?.id || '' : targetShopId || dbState.shops[0]?.id || '';
+
+  const canSelectSaleDate = Boolean(
+    currentUser &&
+      (isPlatformAdmin(currentUser) ||
+        (resolvedSaleShopId
+          ? canAccessShopAsAdmin(currentUser, resolvedSaleShopId)
+          : isShopAdmin(currentUser)))
+  );
+
+  const effectiveSaleDate = canSelectSaleDate ? saleDate || todayYMD : todayYMD;
+  const isBackdatedSale = canSelectSaleDate && Boolean(saleDate && saleDate < todayYMD);
+
+  useEffect(() => {
+    if (!canSelectSaleDate && saleDate !== todayYMD) {
+      setSaleDate(todayYMD);
+    }
+  }, [canSelectSaleDate, saleDate, todayYMD]);
+
+  const handleSaleDateChange = (raw: string) => {
+    if (!canSelectSaleDate) {
+      setSaleDate(todayYMD);
+      return;
+    }
+    if (!raw || !/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
+      setSaleDate(todayYMD);
+      return;
+    }
+    if (raw > todayYMD) {
+      addToast({
+        type: 'warning',
+        title: 'Future Date Not Allowed',
+        description: 'You can only select today or a previous date.',
+      });
+      setSaleDate(todayYMD);
+      return;
+    }
+    setSaleDate(raw);
+  };
 
   const products = useMemo(() => {
     return dbState.products.filter(
@@ -782,7 +810,7 @@ export const NewSalePOS: React.FC = () => {
         assistantName: settings.enableSalesAssistant
           ? assistantName.trim() || undefined
           : undefined,
-        saleDate: saleDate || todayYMD,
+        saleDate: effectiveSaleDate,
       },
       currentUser
     );
@@ -793,7 +821,7 @@ export const NewSalePOS: React.FC = () => {
       addToast({
         type: 'success',
         title: isBackdatedSale
-          ? `Sale Recorded (${formatSaleDateFull(saleDate)})`
+          ? `Sale Recorded (${formatSaleDateFull(effectiveSaleDate)})`
           : 'Sale Completed Successfully',
         description: `Receipt #${result.sale.receiptNumber} generated. Inventory updated.`,
       });
@@ -819,8 +847,7 @@ export const NewSalePOS: React.FC = () => {
     dbState.shops,
     overallDiscount,
     saleNotes,
-    saleDate,
-    todayYMD,
+    effectiveSaleDate,
     isBackdatedSale,
     addToast,
     showReceipt,
@@ -945,39 +972,41 @@ export const NewSalePOS: React.FC = () => {
               )}
             </div>
 
-            {/* Calendar Date Picker on Cart Search Bar */}
-            <label
-              title={
-                isBackdatedSale
-                  ? `Recording sale for ${formatSaleDateFull(saleDate)} (tap to change)`
-                  : 'Sale Date: Today (tap to record a previous date)'
-              }
-              className={`relative shrink-0 inline-flex items-center gap-1.5 px-2.5 py-2.5 rounded-xl border text-[11px] font-semibold cursor-pointer select-none transition active:scale-95 ${
-                isBackdatedSale
-                  ? 'bg-amber-500/20 border-amber-500/50 text-amber-300 ring-1 ring-amber-500/30'
-                  : 'bg-slate-900 hover:bg-slate-800 border-slate-700/90 text-slate-300'
-              }`}
-            >
-              <Calendar className={`w-4 h-4 shrink-0 ${isBackdatedSale ? 'text-amber-300' : 'text-blue-400'}`} />
-              <span className="whitespace-nowrap">
-                {isBackdatedSale ? formatSaleDateChip(saleDate) : 'Today'}
-              </span>
-              <input
-                type="date"
-                value={saleDate}
-                max={todayYMD}
-                onClick={e => {
-                  try {
-                    (e.currentTarget as HTMLInputElement & { showPicker?: () => void }).showPicker?.();
-                  } catch {
-                    // Ignore browsers that open picker natively or disallow programmatic showPicker
-                  }
-                }}
-                onChange={e => handleSaleDateChange(e.target.value)}
-                aria-label="Select sale date"
-                className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
-              />
-            </label>
+            {/* Calendar Date Picker on Cart Search Bar (Admins only) */}
+            {canSelectSaleDate && (
+              <label
+                title={
+                  isBackdatedSale
+                    ? `Recording sale for ${formatSaleDateFull(saleDate)} (tap to change)`
+                    : 'Sale Date: Today (tap to record a previous date)'
+                }
+                className={`relative shrink-0 inline-flex items-center gap-1.5 px-2.5 py-2.5 rounded-xl border text-[11px] font-semibold cursor-pointer select-none transition active:scale-95 ${
+                  isBackdatedSale
+                    ? 'bg-amber-500/20 border-amber-500/50 text-amber-300 ring-1 ring-amber-500/30'
+                    : 'bg-slate-900 hover:bg-slate-800 border-slate-700/90 text-slate-300'
+                }`}
+              >
+                <Calendar className={`w-4 h-4 shrink-0 ${isBackdatedSale ? 'text-amber-300' : 'text-blue-400'}`} />
+                <span className="whitespace-nowrap">
+                  {isBackdatedSale ? formatSaleDateChip(saleDate) : 'Today'}
+                </span>
+                <input
+                  type="date"
+                  value={saleDate}
+                  max={todayYMD}
+                  onClick={e => {
+                    try {
+                      (e.currentTarget as HTMLInputElement & { showPicker?: () => void }).showPicker?.();
+                    } catch {
+                      // Ignore browsers that open picker natively or disallow programmatic showPicker
+                    }
+                  }}
+                  onChange={e => handleSaleDateChange(e.target.value)}
+                  aria-label="Select sale date"
+                  className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
+                />
+              </label>
+            )}
           </div>
 
           {isBackdatedSale && (
@@ -1436,45 +1465,47 @@ export const NewSalePOS: React.FC = () => {
               />
             </div>
 
-            {/* Sale Date Calendar Picker (Defaults to Today; allows switching to a previous date) */}
-            <label
-              id="pos-sale-date-picker"
-              title={
-                isBackdatedSale
-                  ? `Sale date: ${formatSaleDateFull(saleDate)} (tap to change)`
-                  : 'Sale date: Today (tap to add previous-date sales)'
-              }
-              className={`relative shrink-0 inline-flex items-center gap-1.5 px-2.5 py-2 rounded-xl border text-xs font-semibold cursor-pointer select-none transition active:scale-95 ${
-                isBackdatedSale
-                  ? 'bg-amber-500/20 border-amber-500/50 text-amber-300 ring-1 ring-amber-500/30 shadow-sm shadow-amber-500/20'
-                  : 'bg-slate-800 hover:bg-slate-700 border-slate-700 text-slate-200'
-              }`}
-            >
-              <Calendar className={`w-4 h-4 shrink-0 ${isBackdatedSale ? 'text-amber-300' : 'text-blue-400'}`} />
-              <span className="hidden sm:inline whitespace-nowrap">
-                {isBackdatedSale ? formatSaleDateChip(saleDate) : 'Today'}
-              </span>
-              {isBackdatedSale && (
-                <span className="sm:hidden text-[11px] whitespace-nowrap">
-                  {formatSaleDateChip(saleDate)}
+            {/* Sale Date Calendar Picker (Admins only; defaults to Today) */}
+            {canSelectSaleDate && (
+              <label
+                id="pos-sale-date-picker"
+                title={
+                  isBackdatedSale
+                    ? `Sale date: ${formatSaleDateFull(saleDate)} (tap to change)`
+                    : 'Sale date: Today (tap to add previous-date sales)'
+                }
+                className={`relative shrink-0 inline-flex items-center gap-1.5 px-2.5 py-2 rounded-xl border text-xs font-semibold cursor-pointer select-none transition active:scale-95 ${
+                  isBackdatedSale
+                    ? 'bg-amber-500/20 border-amber-500/50 text-amber-300 ring-1 ring-amber-500/30 shadow-sm shadow-amber-500/20'
+                    : 'bg-slate-800 hover:bg-slate-700 border-slate-700 text-slate-200'
+                }`}
+              >
+                <Calendar className={`w-4 h-4 shrink-0 ${isBackdatedSale ? 'text-amber-300' : 'text-blue-400'}`} />
+                <span className="hidden sm:inline whitespace-nowrap">
+                  {isBackdatedSale ? formatSaleDateChip(saleDate) : 'Today'}
                 </span>
-              )}
-              <input
-                type="date"
-                value={saleDate}
-                max={todayYMD}
-                onClick={e => {
-                  try {
-                    (e.currentTarget as HTMLInputElement & { showPicker?: () => void }).showPicker?.();
-                  } catch {
-                    // Ignore browsers that open picker natively or disallow programmatic showPicker
-                  }
-                }}
-                onChange={e => handleSaleDateChange(e.target.value)}
-                aria-label="Sale date"
-                className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
-              />
-            </label>
+                {isBackdatedSale && (
+                  <span className="sm:hidden text-[11px] whitespace-nowrap">
+                    {formatSaleDateChip(saleDate)}
+                  </span>
+                )}
+                <input
+                  type="date"
+                  value={saleDate}
+                  max={todayYMD}
+                  onClick={e => {
+                    try {
+                      (e.currentTarget as HTMLInputElement & { showPicker?: () => void }).showPicker?.();
+                    } catch {
+                      // Ignore browsers that open picker natively or disallow programmatic showPicker
+                    }
+                  }}
+                  onChange={e => handleSaleDateChange(e.target.value)}
+                  aria-label="Sale date"
+                  className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
+                />
+              </label>
+            )}
 
             {/* Voice Sale mic button */}
             <button
@@ -1839,7 +1870,7 @@ export const NewSalePOS: React.FC = () => {
               assistantName: settings.enableSalesAssistant
                 ? assistantName.trim() || undefined
                 : undefined,
-              saleDate: saleDate || todayYMD,
+              saleDate: effectiveSaleDate,
             };
 
             setIsProcessing(true);
@@ -1853,7 +1884,7 @@ export const NewSalePOS: React.FC = () => {
               addToast({
                 type: 'success',
                 title: isBackdatedSale
-                  ? `Sale Recorded (${formatSaleDateFull(saleDate)})`
+                  ? `Sale Recorded (${formatSaleDateFull(effectiveSaleDate)})`
                   : 'Sale Completed Successfully',
                 description: `Receipt #${result.sale.receiptNumber} generated via Voice AI.`,
               });
