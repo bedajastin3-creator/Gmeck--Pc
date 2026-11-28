@@ -5,8 +5,8 @@ import { SyncService, SyncState } from '../services/syncService';
 import { CloudflareApi } from '../services/cloudflareApi';
 import { User, Sale, ToastMessage, Shop } from '../types';
 import { getColorOption } from '../utils/colors';
-import { generateUUID } from '../utils/crypto';
 import { hasAdminAccess } from '../utils/permissions';
+import { CachedHomeSnapshot, HomeCacheService } from '../services/homeCacheService';
 
 export type StoresSubTab = 'stores' | 'inventory' | 'transfer' | 'list' | 'transfer_view';
 export type ShopsSubTab = 'list' | 'add';
@@ -72,13 +72,20 @@ interface AppContextType {
   activeReceipt: Sale | null;
   showReceipt: (sale: Sale) => void;
   closeReceipt: () => void;
+  // Online-only cloud state
+  isOnline: boolean;
+  isCloudLoaded: boolean;
+  isInitialLoading: boolean;
+  cloudError: string | null;
+  cachedHome: CachedHomeSnapshot | null;
+  retryConnection: () => Promise<boolean>;
   // Sync status
   syncStatus: { state: SyncState; pendingCount: number };
   triggerSync: () => Promise<void>;
   pullLatestNow: (force?: boolean) => Promise<boolean>;
   refreshStoresFromCloud: (force?: boolean) => Promise<{ success: boolean; error?: string }>;
   // Settings
-  updateSettings: (settings: any) => void;
+  updateSettings: (settings: any) => Promise<{ success: boolean; error?: string }>;
   // Seller color theme
   sellerColor: ReturnType<typeof getColorOption>;
 }
@@ -88,8 +95,19 @@ const AppContext = createContext<AppContextType | undefined>(undefined);
 export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [currentUser, setCurrentUser] = useState<User | null>(() => AuthService.getActiveUser());
   const [dbState, setDbState] = useState<DatabaseState>(() => db.getState());
+  const [isOnline, setIsOnline] = useState<boolean>(() => CloudflareApi.isOnline());
+  const [isCloudLoaded, setIsCloudLoaded] = useState<boolean>(() => db.isCloudLoaded());
+  const [isInitialLoading, setIsInitialLoading] = useState<boolean>(() => !db.isCloudLoaded());
+  const [cloudError, setCloudError] = useState<string | null>(null);
+  const [cachedHome, setCachedHome] = useState<CachedHomeSnapshot | null>(() => {
+    const u = AuthService.getActiveUser();
+    return u ? HomeCacheService.load(u.id) : null;
+  });
   const [activeTab, setActiveTabState] = useState<string>(() => {
     const u = AuthService.getActiveUser();
+    if (u && (!CloudflareApi.isOnline() || !db.isCloudLoaded()) && HomeCacheService.load(u.id)) {
+      return 'dashboard';
+    }
     if (u && !hasAdminAccess(u)) return 'new_sale';
     return 'dashboard';
   });
@@ -114,24 +132,99 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     const saved = localStorage.getItem('diocres_selected_shop_id');
     return saved || 'ALL';
   });
-  
+
   const isPullingRef = useRef<boolean>(false);
-  const isPushingRef = useRef<boolean>(false);
   const lastPullTimeRef = useRef<number>(0);
   const currentUserRef = useRef<User | null>(currentUser);
+  const isOnlineRef = useRef<boolean>(isOnline);
+  const wasOfflineLockedRef = useRef<boolean>(false);
+  const prevIsOnlineRef = useRef<boolean>(isOnline);
   const PULL_INTERVAL = 60000; // 60 seconds between background pulls so desktop/mobile App stays live
   const FOCUS_PULL_COOLDOWN = 10000; // 10 seconds cooldown on window focus
 
   useEffect(() => {
+    isOnlineRef.current = isOnline;
+  }, [isOnline]);
+
+  useEffect(() => {
     currentUserRef.current = currentUser;
-    if (currentUser && !hasAdminAccess(currentUser)) {
-      setActiveTabState(prev => (prev === 'new_sale' || prev === 'settings' ? prev : 'new_sale'));
+    if (currentUser && (!isOnline || !isCloudLoaded)) {
+      setActiveTabState('dashboard');
+      return;
     }
-  }, [currentUser]);
+    if (currentUser && !hasAdminAccess(currentUser)) {
+      const canExpense = Boolean(
+        currentUser.permissions?.canViewExpenses || currentUser.permissions?.canRecordExpenses
+      );
+      setActiveTabState(prev => {
+        if (prev === 'new_sale' || prev === 'settings') return prev;
+        if (prev === 'expenses' && canExpense) return prev;
+        return 'new_sale';
+      });
+    }
+  }, [currentUser, isOnline, isCloudLoaded]);
+
+  // Enforce Home-only when offline & restore seller default POS view on reconnect
+  useEffect(() => {
+    const wasOnline = prevIsOnlineRef.current;
+    prevIsOnlineRef.current = isOnline;
+
+    if (!currentUser) {
+      wasOfflineLockedRef.current = false;
+      return;
+    }
+
+    if (!isOnline) {
+      wasOfflineLockedRef.current = true;
+      setActiveTabState('dashboard');
+      if (wasOnline) {
+        addToast({
+          type: 'warning',
+          title: 'You are offline',
+          description: 'Showing cached Home. Connect to the internet to open other pages.',
+        });
+      }
+      return;
+    }
+
+    if (isOnline && isCloudLoaded && wasOfflineLockedRef.current) {
+      wasOfflineLockedRef.current = false;
+      if (!hasAdminAccess(currentUser)) {
+        setActiveTabState('new_sale');
+      }
+    }
+  }, [isOnline, isCloudLoaded, currentUser?.id]);
+
+  const notifyOfflineBlockedPage = () => {
+    addToast({
+      type: 'warning',
+      title: 'Offline — Internet Required',
+      description: 'You are offline. Only cached Home is available until internet returns.',
+    });
+  };
 
   const setActiveTab = (tab: string) => {
+    if (!isOnlineRef.current || !db.isCloudLoaded()) {
+      if (tab !== 'dashboard') {
+        notifyOfflineBlockedPage();
+      }
+      setActiveTabState('dashboard');
+      return;
+    }
     if (currentUserRef.current && !hasAdminAccess(currentUserRef.current)) {
-      setActiveTabState(tab === 'settings' ? 'settings' : 'new_sale');
+      if (tab === 'settings') {
+        setActiveTabState('settings');
+        return;
+      }
+      const canExpense = Boolean(
+        currentUserRef.current.permissions?.canViewExpenses ||
+          currentUserRef.current.permissions?.canRecordExpenses
+      );
+      if (tab === 'expenses' && canExpense) {
+        setActiveTabState('expenses');
+        return;
+      }
+      setActiveTabState('new_sale');
       return;
     }
     setActiveTabState(tab);
@@ -142,9 +235,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     localStorage.setItem('diocres_selected_shop_id', shopId);
   };
 
-  // Available shops based on current user
+  // Available shops based on current user (uses cached Home shops when offline at startup)
   const availableShops = useMemo(() => {
-    const allShops = dbState.shops || [];
+    const allShops = db.isCloudLoaded()
+      ? dbState.shops || []
+      : cachedHome?.shops || dbState.shops || [];
     if (!currentUser) return allShops;
 
     if (currentUser.role === 'ADMIN') {
@@ -153,76 +248,70 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
     const assigned = currentUser.assignedShopIds || [];
     return allShops.filter(s => s.status === 'ACTIVE' && assigned.includes(s.id));
-  }, [dbState.shops, currentUser]);
+  }, [dbState.shops, cachedHome?.shops, currentUser, isCloudLoaded]);
 
   // Current Shop entity
   const currentShop = useMemo(() => {
     if (selectedShopId === 'ALL') return null;
-    return (dbState.shops || []).find(s => s.id === selectedShopId) || null;
-  }, [dbState.shops, selectedShopId]);
+    const allShops = db.isCloudLoaded()
+      ? dbState.shops || []
+      : cachedHome?.shops || dbState.shops || [];
+    return allShops.find(s => s.id === selectedShopId) || null;
+  }, [dbState.shops, cachedHome?.shops, selectedShopId, isCloudLoaded]);
 
-  /**
-   * PUSH PENDING ITEMS TO CLOUD
-   * Called immediately after any local data change (via db.subscribe)
-   */
-  const pushPendingItems = async () => {
-    if (isPushingRef.current) return;
+  const validateActiveUserAgainstCloud = (state: DatabaseState) => {
+    const activeUser = currentUserRef.current;
+    if (!activeUser || !db.isCloudLoaded()) return;
 
-    const queue = db.getSyncQueue();
-    const pendingItems = queue.filter(item => item.status === 'PENDING');
+    const freshUser = state.users.find(u => u.id === activeUser.id);
+    if (!freshUser) {
+      AuthService.logout();
+      setCurrentUser(null);
+      setToasts(prev => [
+        ...prev,
+        {
+          id: Date.now().toString(),
+          type: 'warning',
+          title: 'Session Expired',
+          description: 'Your account was not found in the cloud database. Please sign in again.',
+        },
+      ]);
+      return;
+    }
 
-    if (pendingItems.length === 0) return;
+    if (freshUser.status !== 'ACTIVE') {
+      AuthService.logout();
+      setCurrentUser(null);
+      setToasts(prev => [
+        ...prev,
+        {
+          id: Date.now().toString(),
+          type: 'warning',
+          title: 'Account Deactivated',
+          description: 'Your seller account has been deactivated by an Administrator.',
+        },
+      ]);
+      return;
+    }
 
-    isPushingRef.current = true;
+    const changed =
+      freshUser.updatedAt !== activeUser.updatedAt ||
+      freshUser.name !== activeUser.name ||
+      freshUser.color !== activeUser.color ||
+      freshUser.avatarUrl !== activeUser.avatarUrl ||
+      freshUser.role !== activeUser.role ||
+      JSON.stringify(freshUser.permissions || {}) !== JSON.stringify(activeUser.permissions || {}) ||
+      JSON.stringify(freshUser.assignedShopIds || []) !== JSON.stringify(activeUser.assignedShopIds || []);
 
-    try {
-      const online = await CloudflareApi.checkConnection();
-
-      if (online) {
-        console.log(`[Sync] Pushing ${pendingItems.length} items to cloud...`);
-
-        const operations = pendingItems.map(item => ({
-          id: item.id,
-          operation: item.operation || item.action,
-          entityType: item.entityType,
-          entityId: item.entityId,
-          payload: item.payload,
-        }));
-
-        const pushResult = await CloudflareApi.pushSync(operations);
-
-        if (pushResult.success) {
-          const updatedQueue = db.getSyncQueue().map(item => {
-            if (item.status === 'PENDING') {
-              return { ...item, status: 'SYNCED' as const };
-            }
-            return item;
-          });
-          db.saveSyncQueue(updatedQueue);
-
-          localStorage.setItem('omnibiz_last_synced_at', new Date().toISOString());
-
-          const state = db.getState();
-          setDbState({ ...state });
-          setSyncStatus(SyncService.getSyncStatus());
-
-          console.log(`[Sync] Successfully pushed ${pendingItems.length} items`);
-        } else {
-          console.log('[Sync] Push failed:', pushResult);
-        }
-      } else {
-        console.log('[Sync] Offline - will retry later');
-      }
-    } catch (error) {
-      console.log('[Sync] Push error:', error);
-    } finally {
-      isPushingRef.current = false;
+    if (changed) {
+      setCurrentUser(freshUser);
+      AuthService.setActiveUser(freshUser);
     }
   };
 
   /**
    * PULL LATEST CLOUD DATA
-   * Pulls every 60s, on focus, on Home view mount, or on startup/login
+   * Pulls on startup, login, reconnect, focus, and periodically every 60s.
    */
   const pullCloudData = async (force: boolean = false): Promise<boolean> => {
     if (isPullingRef.current) return false;
@@ -235,98 +324,113 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     isPullingRef.current = true;
 
     try {
-      const online = await CloudflareApi.checkConnection();
-      if (!online) {
+      if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+        setIsOnline(false);
+        setSyncStatus({ state: 'OFFLINE_LOCAL', pendingCount: 0 });
+        if (!db.isCloudLoaded()) {
+          setCloudError(CloudflareApi.OFFLINE_ERROR_MESSAGE);
+        }
         return false;
       }
 
-      console.log('[Sync] Pulling cloud data...');
+      const online = await CloudflareApi.checkConnection();
+      setIsOnline(online);
+      if (!online) {
+        setSyncStatus({ state: 'OFFLINE_LOCAL', pendingCount: 0 });
+        if (!db.isCloudLoaded()) {
+          setCloudError(CloudflareApi.OFFLINE_ERROR_MESSAGE);
+        }
+        return false;
+      }
 
-      // Pass no since parameter to get ALL data on first load
       const pullResult = await CloudflareApi.pullSync();
 
       if (pullResult.success && pullResult.data) {
-        SyncService.applyCloudData(pullResult.data);
-
-        localStorage.setItem('omnibiz_last_synced_at', new Date().toISOString());
-        localStorage.setItem('omnibiz_has_synced', 'true');
+        SyncService.applyCloudData(pullResult.data, true);
 
         const state = db.getState();
         setDbState({ ...state });
+        setIsOnline(true);
+        setIsCloudLoaded(true);
+        setCloudError(null);
         setSyncStatus(SyncService.getSyncStatus());
         lastPullTimeRef.current = Date.now();
 
-        console.log('[Sync] Pull completed');
+        validateActiveUserAgainstCloud(state);
         return true;
       }
 
+      if (!db.isCloudLoaded()) {
+        setCloudError(pullResult.error || CloudflareApi.OFFLINE_ERROR_MESSAGE);
+      }
       lastPullTimeRef.current = Date.now();
       return false;
-    } catch (error) {
-      console.log('[Sync] Pull error:', error);
+    } catch (error: any) {
+      const errMsg = CloudflareApi.formatError(error, CloudflareApi.OFFLINE_ERROR_MESSAGE);
+      if (CloudflareApi.isNetworkError(error)) {
+        setIsOnline(false);
+      }
+      if (!db.isCloudLoaded()) {
+        setCloudError(errMsg);
+      }
+      setSyncStatus(SyncService.getSyncStatus());
       return false;
     } finally {
       isPullingRef.current = false;
     }
   };
 
-  // 1. FORCE PULL ON APP STARTUP (ensures desktop/mobile app receives latest permissions/data from web)
+  const retryConnection = async (): Promise<boolean> => {
+    if (!db.isCloudLoaded()) {
+      setIsInitialLoading(true);
+    }
+    setCloudError(null);
+    const ok = await pullCloudData(true);
+    setIsInitialLoading(false);
+    return ok;
+  };
+
+  // 1. INITIAL CLOUD LOAD ON STARTUP (strictly online-only: never use offline fallback)
   useEffect(() => {
-    console.log('[Startup] Pulling latest data and user permissions from cloud...');
+    let active = true;
     (async () => {
-      await pushPendingItems();
       await pullCloudData(true);
+      if (active) {
+        setIsInitialLoading(false);
+      }
     })();
+    return () => {
+      active = false;
+    };
   }, []);
 
-  // 2. Listen to LocalDB changes and push immediately
+  // 2. Retry automatically if initial cloud load has not succeeded yet
+  useEffect(() => {
+    if (isCloudLoaded) return;
+    const retryTimer = setInterval(() => {
+      if (typeof navigator === 'undefined' || navigator.onLine !== false) {
+        pullCloudData(true).then(ok => {
+          if (ok) setIsInitialLoading(false);
+        });
+      }
+    }, 8000);
+    return () => clearInterval(retryTimer);
+  }, [isCloudLoaded]);
+
+  // 3. Listen to in-memory DB state changes (keep React state & currentUser fresh)
   useEffect(() => {
     const unsubscribe = db.subscribe(() => {
       const state = db.getState();
       setDbState({ ...state });
+      setIsCloudLoaded(db.isCloudLoaded());
       setSyncStatus(SyncService.getSyncStatus());
-
-      const activeUser = currentUserRef.current;
-      if (activeUser) {
-        const freshUser = state.users.find(u => u.id === activeUser.id);
-        if (freshUser) {
-          if (freshUser.status !== 'ACTIVE') {
-            AuthService.logout();
-            setCurrentUser(null);
-            setToasts(prev => [...prev, {
-              id: Date.now().toString(),
-              type: 'warning',
-              title: 'Account Deactivated',
-              description: 'Your seller account has been deactivated by an Administrator.',
-            }]);
-          } else {
-            const changed =
-              freshUser.updatedAt !== activeUser.updatedAt ||
-              freshUser.name !== activeUser.name ||
-              freshUser.color !== activeUser.color ||
-              freshUser.avatarUrl !== activeUser.avatarUrl ||
-              JSON.stringify(freshUser.permissions || {}) !== JSON.stringify(activeUser.permissions || {}) ||
-              JSON.stringify(freshUser.assignedShopIds || []) !== JSON.stringify(activeUser.assignedShopIds || []);
-
-            if (changed) {
-              setCurrentUser(freshUser);
-              AuthService.setActiveUser(freshUser);
-            }
-          }
-        }
-      }
-      
-      // PUSH: Immediately push pending items when db changes
-      const pendingCount = db.getSyncQueue().filter(q => q.status === 'PENDING').length;
-      if (pendingCount > 0) {
-        pushPendingItems();
-      }
+      validateActiveUserAgainstCloud(state);
     });
 
     return () => unsubscribe();
   }, []);
 
-  // 3. Pull cloud data on login, periodically, when viewing dashboard, and when app regains focus
+  // 4. Pull cloud data on login, periodically, when viewing dashboard, and when app regains focus
   useEffect(() => {
     if (currentUser?.id) {
       pullCloudData(true);
@@ -351,7 +455,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     };
   }, [currentUser?.id]);
 
-  // 3b. Pull fresh data whenever user switches to Home dashboard
+  // 4b. Pull fresh data whenever user switches to Home dashboard
   useEffect(() => {
     if (currentUser?.id && activeTab === 'dashboard') {
       if (Date.now() - lastPullTimeRef.current >= 4000) {
@@ -360,36 +464,60 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
   }, [activeTab, currentUser?.id]);
 
-  // 4. Push on reconnect
+  // 5. Track live network & CloudflareApi connection status
   useEffect(() => {
+    const unsubConn = CloudflareApi.onConnectionChange(online => {
+      setIsOnline(online);
+      setSyncStatus(SyncService.getSyncStatus());
+      if (!online && !db.isCloudLoaded()) {
+        setCloudError(CloudflareApi.OFFLINE_ERROR_MESSAGE);
+      }
+    });
+
     const handleOnline = async () => {
-      console.log('[Sync] Connection restored - pushing pending items');
-      await pushPendingItems();
-      await pullCloudData(true);
+      setIsOnline(true);
+      const ok = await pullCloudData(true);
+      if (ok) {
+        setIsInitialLoading(false);
+      }
     };
 
     const handleOffline = () => {
-      console.log('[Sync] Connection lost');
-      setSyncStatus({ state: 'OFFLINE_LOCAL', pendingCount: SyncService.getPendingCount() });
+      setIsOnline(false);
+      setSyncStatus({ state: 'OFFLINE_LOCAL', pendingCount: 0 });
+      if (!db.isCloudLoaded()) {
+        setCloudError(CloudflareApi.OFFLINE_ERROR_MESSAGE);
+      }
     };
 
     window.addEventListener('online', handleOnline);
     window.addEventListener('offline', handleOffline);
 
     return () => {
+      unsubConn();
       window.removeEventListener('online', handleOnline);
       window.removeEventListener('offline', handleOffline);
     };
   }, []);
+
+  // Refresh lightweight Home-only offline cache whenever live cloud data changes
+  useEffect(() => {
+    if (!currentUser || !isCloudLoaded || !isOnline) return;
+    const timer = window.setTimeout(() => {
+      const snap = HomeCacheService.saveFromLiveState(currentUser);
+      if (snap) {
+        setCachedHome(snap);
+      }
+    }, 150);
+    return () => window.clearTimeout(timer);
+  }, [dbState, currentUser, isCloudLoaded, isOnline]);
 
   // Ensure seller has a valid shop selected
   useEffect(() => {
     if (!currentUser) return;
 
     if (currentUser.role === 'SELLER') {
-      const sellerShops = (dbState.shops || []).filter(
-        s => s.status === 'ACTIVE' && (currentUser.assignedShopIds || []).includes(s.id)
-      );
+      const sellerShops = availableShops;
 
       if (sellerShops.length > 0) {
         const isCurrentValid = sellerShops.some(s => s.id === selectedShopId);
@@ -398,7 +526,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         }
       }
     }
-  }, [currentUser, dbState.shops, selectedShopId]);
+  }, [currentUser, availableShops, selectedShopId]);
 
   const refreshUser = () => {
     const u = AuthService.getActiveUser();
@@ -406,14 +534,16 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   };
 
   const login = (user: User) => {
-    // Get freshest user data from local DB (includes permissions)
     const allUsers = db.getUsers();
     const freshUser = allUsers.find(u => u.id === user.id) || user;
-    
-    console.log('[Login] User:', { id: freshUser.id, role: freshUser.role, permissions: freshUser.permissions });
-    
+
     AuthService.setActiveUser(freshUser);
     setCurrentUser(freshUser);
+
+    const existingCached = HomeCacheService.load(freshUser.id);
+    if (existingCached) {
+      setCachedHome(existingCached);
+    }
 
     if (freshUser.role === 'ADMIN') {
       setActiveTab('dashboard');
@@ -432,21 +562,18 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       title: `Welcome back, ${freshUser.name}`,
       description: `Logged in as ${freshUser.role}`,
     });
-    
-    // Push any pending items first, then force-pull latest data/permissions sequentially
-    setTimeout(async () => {
-      await pushPendingItems();
-      await pullCloudData(true);
+
+    setTimeout(() => {
+      pullCloudData(true);
     }, 200);
   };
 
   const logout = () => {
-    // Push pending items before logout
-    pushPendingItems();
-    
     AuthService.logout();
+    HomeCacheService.clear();
+    setCachedHome(null);
     setCurrentUser(null);
-    setActiveTab('dashboard');
+    setActiveTabState('dashboard');
     addToast({
       type: 'info',
       title: 'Logged Out',
@@ -480,6 +607,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   };
 
   const openStoresSubTab = (subTab: StoresSubTab) => {
+    if (!isOnlineRef.current || !db.isCloudLoaded()) {
+      notifyOfflineBlockedPage();
+      setActiveTabState('dashboard');
+      return;
+    }
     setStoresSubTab(subTab);
     setStoresNavTick(prev => prev + 1);
     setActiveTab('stores');
@@ -490,6 +622,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   };
 
   const openShopsSubTab = (subTab: ShopsSubTab) => {
+    if (!isOnlineRef.current || !db.isCloudLoaded()) {
+      notifyOfflineBlockedPage();
+      setActiveTabState('dashboard');
+      return;
+    }
     setShopsSubTab(subTab);
     setShopsNavTick(prev => prev + 1);
     setActiveTab('shops');
@@ -500,6 +637,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   };
 
   const openInventoryFilter = (filter: InventoryFilter) => {
+    if (!isOnlineRef.current || !db.isCloudLoaded()) {
+      notifyOfflineBlockedPage();
+      setActiveTabState('dashboard');
+      return;
+    }
     setInventoryFilter(filter);
     setInventoryNavTick(prev => prev + 1);
     setActiveTab('inventory');
@@ -510,6 +652,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   };
 
   const openProductsSubTab = (subTab: ProductsSubTab) => {
+    if (!isOnlineRef.current || !db.isCloudLoaded()) {
+      notifyOfflineBlockedPage();
+      setActiveTabState('dashboard');
+      return;
+    }
     setProductsSubTab(subTab);
     setProductsNavTick(prev => prev + 1);
     setActiveTab('products');
@@ -520,6 +667,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   };
 
   const openPurchasesSubTab = (subTab: PurchasesSubTab) => {
+    if (!isOnlineRef.current || !db.isCloudLoaded()) {
+      notifyOfflineBlockedPage();
+      setActiveTabState('dashboard');
+      return;
+    }
     setPurchasesSubTab(subTab);
     setPurchasesNavTick(prev => prev + 1);
     setActiveTab('purchases');
@@ -530,6 +682,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   };
 
   const openExpensesSubTab = (subTab: ExpensesSubTab) => {
+    if (!isOnlineRef.current || !db.isCloudLoaded()) {
+      notifyOfflineBlockedPage();
+      setActiveTabState('dashboard');
+      return;
+    }
     setExpensesSubTab(subTab);
     setExpensesNavTick(prev => prev + 1);
     setActiveTab('expenses');
@@ -540,6 +697,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   };
 
   const openSellersSubTab = (subTab: SellersSubTab) => {
+    if (!isOnlineRef.current || !db.isCloudLoaded()) {
+      notifyOfflineBlockedPage();
+      setActiveTabState('dashboard');
+      return;
+    }
     setSellersSubTab(subTab);
     setSellersNavTick(prev => prev + 1);
     setActiveTab('sellers');
@@ -550,8 +712,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   ): Promise<{ success: boolean; error?: string }> => {
     try {
       const online = await CloudflareApi.checkConnection();
+      setIsOnline(online);
       if (!online) {
-        return { success: false, error: 'Offline: showing locally saved stores.' };
+        return { success: false, error: CloudflareApi.OFFLINE_ERROR_MESSAGE };
       }
 
       const cloudStores = await CloudflareApi.getStores();
@@ -560,7 +723,6 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       }
 
       if (force) {
-        await pushPendingItems();
         await pullCloudData(true);
       }
 
@@ -570,59 +732,53 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     } catch (err: any) {
       return {
         success: false,
-        error: err?.message || 'Could not refresh stores from cloud.',
+        error: CloudflareApi.formatError(err, 'Could not refresh stores from cloud.'),
       };
     }
   };
 
   const triggerSync = async () => {
-    setSyncStatus({ state: 'SYNCING', pendingCount: syncStatus.pendingCount });
-    
-    // Push pending items
-    await pushPendingItems();
-    
-    // Pull latest data (force)
-    await pullCloudData(true);
-    
+    setSyncStatus({ state: 'SYNCING', pendingCount: 0 });
+
+    const pulled = await pullCloudData(true);
     setSyncStatus(SyncService.getSyncStatus());
-    
-    const pendingCount = SyncService.getPendingCount();
-    
-    if (pendingCount === 0) {
+
+    if (pulled) {
       addToast({
         type: 'success',
-        title: 'Synchronization Complete',
-        description: 'All records up to date.',
+        title: 'Cloud Database Synced',
+        description: 'Live data refreshed from cloud database.',
       });
     } else {
       addToast({
-        type: 'warning',
-        title: 'Sync Status',
-        description: `${pendingCount} items still pending. Will retry automatically.`,
+        type: 'error',
+        title: 'Offline',
+        description: CloudflareApi.OFFLINE_ERROR_MESSAGE,
       });
     }
   };
 
-  const updateSettings = (newSettings: any) => {
+  const updateSettings = async (
+    newSettings: any
+  ): Promise<{ success: boolean; error?: string }> => {
     const currentSettings = db.getSettings();
     const updatedSettings = { ...currentSettings, ...newSettings };
-    db.saveSettings(updatedSettings);
-    
-    db.enqueueSync({
-      id: generateUUID(),
+
+    const commitRes = await SyncService.commitOperation({
       operation: 'UPDATE_SETTINGS',
       entityType: 'SETTINGS',
       entityId: 'global',
       payload: updatedSettings,
-      status: 'PENDING',
-      createdAt: new Date().toISOString(),
     });
-    
+
+    if (!commitRes.success) {
+      return { success: false, error: commitRes.error || CloudflareApi.OFFLINE_ERROR_MESSAGE };
+    }
+
+    db.saveSettings(updatedSettings);
     setDbState(db.getState());
     setSyncStatus(SyncService.getSyncStatus());
-    
-    // Push immediately
-    pushPendingItems();
+    return { success: true };
   };
 
   const sellerColor = useMemo(() => {
@@ -684,6 +840,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         activeReceipt,
         showReceipt,
         closeReceipt,
+        isOnline,
+        isCloudLoaded,
+        isInitialLoading,
+        cloudError,
+        cachedHome,
+        retryConnection,
         syncStatus,
         triggerSync,
         pullLatestNow: pullCloudData,

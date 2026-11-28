@@ -691,7 +691,7 @@ export const AdminInventory: React.FC = () => {
   const totalLossValue = filteredLosses.reduce((sum, m) => sum + (m.costValue || 0), 0);
   const totalLossUnits = filteredLosses.reduce((sum, m) => sum + Math.abs(m.changeQty), 0);
 
-  const handleAdjustStock = (e: React.FormEvent) => {
+  const handleAdjustStock = async (e: React.FormEvent) => {
     e.preventDefault();
     setModalError('');
 
@@ -741,7 +741,7 @@ export const AdminInventory: React.FC = () => {
       ? `[${adjustmentCategory}] ${reasonInput.trim()}`
       : `[${adjustmentCategory}] Stock adjustment`;
 
-    const res = InventoryService.adjustStock(
+    const res = await InventoryService.adjustStock(
       selectedProductId,
       newQty,
       finalReason,

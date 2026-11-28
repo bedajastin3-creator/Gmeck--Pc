@@ -270,7 +270,7 @@ export const AdminExpenses: React.FC = () => {
     setIsModalOpen(true);
   };
 
-  const handleSaveExpense = (e: React.FormEvent) => {
+  const handleSaveExpense = async (e: React.FormEvent) => {
     e.preventDefault();
     setFormError('');
 
@@ -294,7 +294,7 @@ export const AdminExpenses: React.FC = () => {
     const targetShopId = isCompany ? null : expenseShopId;
 
     if (editingExpense) {
-      const res = ExpenseService.updateExpense(
+      const res = await ExpenseService.updateExpense(
         editingExpense.id,
         {
           title: title.trim(),
@@ -321,7 +321,7 @@ export const AdminExpenses: React.FC = () => {
         setFormError(res.error || 'Failed to update expense.');
       }
     } else {
-      const res = ExpenseService.createExpense(
+      const res = await ExpenseService.createExpense(
         {
           shopId: targetShopId,
           isCompanyExpense: isCompany,
@@ -352,10 +352,10 @@ export const AdminExpenses: React.FC = () => {
     }
   };
 
-  const handleDeleteExpense = () => {
+  const handleDeleteExpense = async () => {
     if (!deletingExpense || !currentUser) return;
 
-    const res = ExpenseService.deleteExpense(deletingExpense.id, currentUser);
+    const res = await ExpenseService.deleteExpense(deletingExpense.id, currentUser);
 
     if (res.success) {
       addToast({

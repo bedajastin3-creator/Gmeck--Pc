@@ -585,7 +585,7 @@ export const AdminAdjustInventory: React.FC = () => {
     };
   }, [evaluatedRows]);
 
-  const handleSubmitBatch = (e: React.FormEvent) => {
+  const handleSubmitBatch = async (e: React.FormEvent) => {
     e.preventDefault();
     setFormError('');
 
@@ -618,7 +618,7 @@ export const AdminAdjustInventory: React.FC = () => {
       if (!item.product || !item.location) continue;
       const reasonCore = item.row.note.trim() || batchReason.trim();
       const finalReason = `[${item.row.category}] ${reasonCore}`;
-      const res = InventoryService.adjustStock(
+      const res = await InventoryService.adjustStock(
         item.product.id,
         item.newQty,
         finalReason,

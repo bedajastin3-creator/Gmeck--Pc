@@ -737,7 +737,7 @@ export const NewSalePOS: React.FC = () => {
   // ─────────────────────────────────────────────────────────────
   // Complete Sale
   // ─────────────────────────────────────────────────────────────
-  const handleCompleteSale = useCallback(() => {
+  const handleCompleteSale = useCallback(async () => {
     if (!currentUser) return;
 
     if (cart.length === 0) {
@@ -794,7 +794,7 @@ export const NewSalePOS: React.FC = () => {
 
     setIsProcessing(true);
 
-    const result = SalesService.createSale(
+    const result = await SalesService.createSale(
       {
         shopId: targetShopId === 'ALL' ? (dbState.shops[0]?.id || '') : (targetShopId || dbState.shops[0]?.id || ''),
         items: cart.map(i => ({
@@ -1875,7 +1875,7 @@ export const NewSalePOS: React.FC = () => {
 
             setIsProcessing(true);
 
-            const result = SalesService.createSale(salePayload, currentUser);
+            const result = await SalesService.createSale(salePayload, currentUser);
 
             setIsProcessing(false);
             setVoiceDraft(null);

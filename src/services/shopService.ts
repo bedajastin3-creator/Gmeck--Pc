@@ -2,6 +2,8 @@ import { db } from '../db/storage';
 import { Shop, User, ShopStatus, SellerPermissions } from '../types';
 import { generateUUID } from '../utils/crypto';
 import { getShopAdminShopIds, isPlatformAdmin } from '../utils/permissions';
+import { CloudflareApi } from './cloudflareApi';
+import { CloudOperation, SyncService } from './syncService';
 
 export interface ShopFilterOptions {
   status?: 'ALL' | ShopStatus;
@@ -85,11 +87,11 @@ export class ShopService {
   /**
    * Platform Admin designates, replaces, or removes the Shop Admin for a specific shop.
    */
-  public static setShopAdmin(
+  public static async setShopAdmin(
     shopId: string,
     sellerIdToAssign: string | null,
     currentUser: User
-  ): { success: boolean; error?: string } {
+  ): Promise<{ success: boolean; error?: string }> {
     try {
       if (!isPlatformAdmin(currentUser)) {
         return {
@@ -201,33 +203,32 @@ export class ShopService {
         return updated;
       });
 
-      db.saveUsers(updatedUsers);
+      const ops: CloudOperation[] = modifiedUsers.map(seller => ({
+        operation: 'UPDATE_SELLER',
+        entityType: 'SELLER',
+        entityId: seller.id,
+        payload: {
+          id: seller.id,
+          username: seller.username,
+          name: seller.name,
+          role: seller.role,
+          passwordHash: seller.passwordHash,
+          color: seller.color,
+          status: seller.status,
+          assignedShopIds: seller.assignedShopIds,
+          avatarUrl: seller.avatarUrl || null,
+          permissions: seller.permissions || {},
+          createdAt: seller.createdAt,
+          updatedAt: seller.updatedAt,
+        },
+      }));
 
-      // Enqueue sync for all updated sellers
-      modifiedUsers.forEach(seller => {
-        db.enqueueSync({
-          id: generateUUID(),
-          operation: 'UPDATE_SELLER',
-          entityType: 'SELLER',
-          entityId: seller.id,
-          payload: {
-            id: seller.id,
-            username: seller.username,
-            name: seller.name,
-            role: seller.role,
-            passwordHash: seller.passwordHash,
-            color: seller.color,
-            status: seller.status,
-            assignedShopIds: seller.assignedShopIds,
-            avatarUrl: seller.avatarUrl || null,
-            permissions: seller.permissions || {},
-            createdAt: seller.createdAt,
-            updatedAt: seller.updatedAt,
-          },
-          status: 'PENDING',
-          createdAt: now,
-        });
-      });
+      const commit = await SyncService.commitOperations(ops);
+      if (!commit.success) {
+        return { success: false, error: commit.error || CloudflareApi.OFFLINE_ERROR_MESSAGE };
+      }
+
+      db.saveUsers(updatedUsers);
 
       db.addAuditLog({
         id: generateUUID(),
@@ -249,10 +250,10 @@ export class ShopService {
     }
   }
 
-  public static createShop(
+  public static async createShop(
     shopData: Omit<Shop, 'id' | 'createdAt' | 'updatedAt'>,
     createdBy: User
-  ): { success: boolean; shop?: Shop; error?: string } {
+  ): Promise<{ success: boolean; shop?: Shop; error?: string }> {
     try {
       if (!isPlatformAdmin(createdBy)) {
         return { success: false, error: 'Permission Denied: Only Platform Admin can create shops.' };
@@ -285,6 +286,16 @@ export class ShopService {
         updatedAt: now,
       };
 
+      const commit = await SyncService.commitOperation({
+        operation: 'CREATE_SHOP',
+        entityType: 'SHOP',
+        entityId: newShop.id,
+        payload: newShop,
+      });
+      if (!commit.success) {
+        return { success: false, error: commit.error || CloudflareApi.OFFLINE_ERROR_MESSAGE };
+      }
+
       const updatedShops = [...shops, newShop];
       db.saveShops(updatedShops);
 
@@ -301,7 +312,6 @@ export class ShopService {
       });
       db.saveUsers(updatedUsers);
 
-      // Audit log
       db.addAuditLog({
         id: generateUUID(),
         userId: createdBy.id,
@@ -313,28 +323,17 @@ export class ShopService {
         timestamp: now,
       });
 
-      // Enqueue sync item
-      db.enqueueSync({
-        id: generateUUID(),
-        operation: 'CREATE_SHOP',
-        entityType: 'SHOP',
-        entityId: newShop.id,
-        payload: newShop,
-        status: 'PENDING',
-        createdAt: now,
-      });
-
       return { success: true, shop: newShop };
     } catch (err: any) {
       return { success: false, error: err.message || 'Failed to create shop' };
     }
   }
 
-  public static updateShop(
+  public static async updateShop(
     id: string,
     updates: Partial<Omit<Shop, 'id' | 'createdAt' | 'updatedAt'>>,
     updatedBy: User
-  ): { success: boolean; shop?: Shop; error?: string } {
+  ): Promise<{ success: boolean; shop?: Shop; error?: string }> {
     try {
       if (!ShopService.canManageShop(updatedBy, id)) {
         return { success: false, error: 'Permission Denied: You do not have access to update this shop.' };
@@ -366,10 +365,20 @@ export class ShopService {
         updatedAt: now,
       };
 
-      shops[index] = updatedShop;
-      db.saveShops([...shops]);
+      const commit = await SyncService.commitOperation({
+        operation: 'UPDATE_SHOP',
+        entityType: 'SHOP',
+        entityId: updatedShop.id,
+        payload: updatedShop,
+      });
+      if (!commit.success) {
+        return { success: false, error: commit.error || CloudflareApi.OFFLINE_ERROR_MESSAGE };
+      }
 
-      // Audit log
+      const nextShops = [...shops];
+      nextShops[index] = updatedShop;
+      db.saveShops(nextShops);
+
       db.addAuditLog({
         id: generateUUID(),
         userId: updatedBy.id,
@@ -381,27 +390,17 @@ export class ShopService {
         timestamp: now,
       });
 
-      db.enqueueSync({
-        id: generateUUID(),
-        operation: 'UPDATE_SHOP',
-        entityType: 'SHOP',
-        entityId: updatedShop.id,
-        payload: updatedShop,
-        status: 'PENDING',
-        createdAt: now,
-      });
-
       return { success: true, shop: updatedShop };
     } catch (err: any) {
       return { success: false, error: err.message || 'Failed to update shop' };
     }
   }
 
-  public static toggleShopStatus(
+  public static async toggleShopStatus(
     id: string,
     newStatus: ShopStatus,
     updatedBy: User
-  ): { success: boolean; shop?: Shop; error?: string } {
+  ): Promise<{ success: boolean; shop?: Shop; error?: string }> {
     try {
       if (!ShopService.canManageShop(updatedBy, id)) {
         return { success: false, error: 'Permission Denied: You do not have access to change this shop status.' };
@@ -422,8 +421,19 @@ export class ShopService {
         updatedAt: now,
       };
 
-      shops[index] = updatedShop;
-      db.saveShops([...shops]);
+      const commit = await SyncService.commitOperation({
+        operation: 'TOGGLE_SHOP_STATUS',
+        entityType: 'SHOP',
+        entityId: updatedShop.id,
+        payload: { ...updatedShop, status: newStatus },
+      });
+      if (!commit.success) {
+        return { success: false, error: commit.error || CloudflareApi.OFFLINE_ERROR_MESSAGE };
+      }
+
+      const nextShops = [...shops];
+      nextShops[index] = updatedShop;
+      db.saveShops(nextShops);
 
       db.addAuditLog({
         id: generateUUID(),
@@ -436,16 +446,6 @@ export class ShopService {
         timestamp: now,
       });
 
-      db.enqueueSync({
-        id: generateUUID(),
-        operation: 'TOGGLE_SHOP_STATUS',
-        entityType: 'SHOP',
-        entityId: updatedShop.id,
-        payload: { ...updatedShop, status: newStatus },
-        status: 'PENDING',
-        createdAt: now,
-      });
-
       return { success: true, shop: updatedShop };
     } catch (err: any) {
       return { success: false, error: err.message || 'Failed to toggle shop status' };
@@ -456,10 +456,10 @@ export class ShopService {
    * Platform Admin deletes a shop permanently.
    * Removes the shop from users' assignedShopIds / shopAdminShopIds, stores, products, and categories.
    */
-  public static deleteShop(
+  public static async deleteShop(
     shopId: string,
     currentUser: User
-  ): { success: boolean; error?: string } {
+  ): Promise<{ success: boolean; error?: string }> {
     if (!isPlatformAdmin(currentUser)) {
       return { success: false, error: 'Permission Denied: Only Platform Admin can delete shops.' };
     }
@@ -472,6 +472,16 @@ export class ShopService {
     }
 
     const now = new Date().toISOString();
+
+    const commit = await SyncService.commitOperation({
+      operation: 'DELETE_SHOP',
+      entityType: 'SHOP',
+      entityId: shopId,
+      payload: { id: shopId },
+    });
+    if (!commit.success) {
+      return { success: false, error: commit.error || CloudflareApi.OFFLINE_ERROR_MESSAGE };
+    }
 
     // Remove shop from shops list
     const updatedShops = shops.filter(s => s.id !== shopId);
@@ -518,18 +528,6 @@ export class ShopService {
       db.saveCategories(updatedCategories);
     }
 
-    // Sync to cloud
-    db.enqueueSync({
-      id: generateUUID(),
-      operation: 'DELETE_SHOP',
-      entityType: 'SHOP',
-      entityId: shopId,
-      payload: { id: shopId },
-      status: 'PENDING',
-      createdAt: now,
-    });
-
-    // Audit log
     db.addAuditLog({
       id: generateUUID(),
       userId: currentUser.id,

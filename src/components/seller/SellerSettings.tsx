@@ -4,6 +4,7 @@ import { useApp } from '../../context/AppContext';
 import { SellerService } from '../../services/sellerService';
 import { AuthService } from '../../services/authService';
 import { CloudflareApi } from '../../services/cloudflareApi';
+import { SyncService } from '../../services/syncService';
 import { db } from '../../db/storage';
 import { SELLER_COLORS } from '../../utils/colors';
 import { hasAdminAccess } from '../../utils/permissions';
@@ -78,26 +79,50 @@ export const SellerSettings: React.FC = () => {
       const result = await CloudflareApi.uploadImage(compressed, 'seller', currentUser.id);
       
       if (result.success) {
-        // Update local user
         const users = db.getUsers();
         const userIndex = users.findIndex(u => u.id === currentUser.id);
         if (userIndex !== -1) {
-          users[userIndex].avatarUrl = result.url;
+          const updatedUser = {
+            ...users[userIndex],
+            avatarUrl: result.url,
+            updatedAt: new Date().toISOString(),
+          };
+          const commitRes = await SyncService.commitOperation({
+            operation: 'UPDATE_SELLER',
+            entityType: 'USER',
+            entityId: updatedUser.id,
+            payload: updatedUser,
+          });
+          if (!commitRes.success) {
+            addToast({
+              type: 'error',
+              title: 'Upload Failed',
+              description: commitRes.error || CloudflareApi.OFFLINE_ERROR_MESSAGE,
+            });
+            return;
+          }
+          users[userIndex] = updatedUser;
           db.saveUsers(users);
           refreshUser();
         }
-        
+
         addToast({
           type: 'success',
           title: 'Profile Picture Updated',
-          description: 'Your profile picture has been updated successfully.',
+          description: 'Your profile picture has been updated in the cloud.',
+        });
+      } else {
+        addToast({
+          type: 'error',
+          title: 'Upload Failed',
+          description: result.error || CloudflareApi.OFFLINE_ERROR_MESSAGE,
         });
       }
     } catch (error: any) {
       addToast({
         type: 'error',
         title: 'Upload Failed',
-        description: error.message || 'Could not upload profile picture.',
+        description: CloudflareApi.formatError(error, 'Could not upload profile picture.'),
       });
     } finally {
       setIsUploadingAvatar(false);
@@ -108,14 +133,20 @@ export const SellerSettings: React.FC = () => {
     }
   };
 
-  const handleColorChange = (colorId: string) => {
-    const res = SellerService.updateSellerColor(currentUser.id, colorId, currentUser);
+  const handleColorChange = async (colorId: string) => {
+    const res = await SellerService.updateSellerColor(currentUser.id, colorId, currentUser);
     if (res.success) {
       refreshUser();
       addToast({
         type: 'success',
         title: 'Theme Color Updated',
         description: 'Your personal seller UI theme accent has been updated.',
+      });
+    } else {
+      addToast({
+        type: 'error',
+        title: 'Update Failed',
+        description: res.error || CloudflareApi.OFFLINE_ERROR_MESSAGE,
       });
     }
   };
@@ -157,7 +188,7 @@ export const SellerSettings: React.FC = () => {
       addToast({
         type: 'success',
         title: 'Password Changed',
-        description: 'Your local seller login password was updated securely.',
+        description: 'Your seller login password was updated securely.',
       });
     } else {
       setPasswordError(result.error || 'Failed to update password.');
@@ -170,7 +201,7 @@ export const SellerSettings: React.FC = () => {
         <h2 className="text-xl font-bold text-white tracking-tight">Account Preferences</h2>
         <p className="text-xs text-slate-400 mt-0.5">
           {isAdminUser
-            ? 'Customize your profile appearance and manage local authentication'
+            ? 'Customize your profile appearance and manage account authentication'
             : 'Choose your personal theme color for the POS terminal'}
         </p>
       </div>

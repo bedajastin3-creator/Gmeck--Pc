@@ -9,11 +9,12 @@ import {
   StockTransferLocationType,
   StockTransferStatus,
   Store,
-  SyncQueueItem,
   User,
 } from '../types';
 import { generateUUID } from '../utils/crypto';
 import { hasAdminAccess } from '../utils/permissions';
+import { CloudflareApi } from './cloudflareApi';
+import { CloudOperation, SyncService } from './syncService';
 
 export interface StockTransferPayload {
   transferDate: string;
@@ -467,10 +468,10 @@ function applyCompletedTransferBalances(
 }
 
 export class StoreService {
-  public static createStore(
+  public static async createStore(
     data: { name: string; location?: string; shopId: string },
     currentUser: User
-  ): { success: boolean; store?: Store; error?: string } {
+  ): Promise<{ success: boolean; store?: Store; error?: string }> {
     if (!hasAdminAccess(currentUser)) {
       return { success: false, error: 'Permission Denied: Admin access required.' };
     }
@@ -513,17 +514,17 @@ export class StoreService {
       updatedAt: now,
     };
 
-    db.saveStores([newStore, ...stores]);
-
-    db.enqueueSync({
-      id: generateUUID(),
+    const commit = await SyncService.commitOperation({
       operation: 'CREATE_STORE',
       entityType: 'STORE',
       entityId: newStore.id,
       payload: newStore,
-      status: 'PENDING',
-      createdAt: now,
     });
+    if (!commit.success) {
+      return { success: false, error: commit.error || CloudflareApi.OFFLINE_ERROR_MESSAGE };
+    }
+
+    db.saveStores([newStore, ...stores]);
 
     db.addAuditLog({
       id: generateUUID(),
@@ -540,11 +541,11 @@ export class StoreService {
     return { success: true, store: newStore };
   }
 
-  public static updateStore(
+  public static async updateStore(
     storeId: string,
     updates: Partial<Pick<Store, 'name' | 'location' | 'shopId' | 'status'>>,
     currentUser: User
-  ): { success: boolean; store?: Store; error?: string } {
+  ): Promise<{ success: boolean; store?: Store; error?: string }> {
     if (!hasAdminAccess(currentUser)) {
       return { success: false, error: 'Permission Denied: Admin access required.' };
     }
@@ -595,19 +596,19 @@ export class StoreService {
       updatedAt: now,
     };
 
-    const nextStores = [...stores];
-    nextStores[index] = updatedStore;
-    db.saveStores(nextStores);
-
-    db.enqueueSync({
-      id: generateUUID(),
+    const commit = await SyncService.commitOperation({
       operation: 'UPDATE_STORE',
       entityType: 'STORE',
       entityId: updatedStore.id,
       payload: updatedStore,
-      status: 'PENDING',
-      createdAt: now,
     });
+    if (!commit.success) {
+      return { success: false, error: commit.error || CloudflareApi.OFFLINE_ERROR_MESSAGE };
+    }
+
+    const nextStores = [...stores];
+    nextStores[index] = updatedStore;
+    db.saveStores(nextStores);
 
     db.addAuditLog({
       id: generateUUID(),
@@ -624,10 +625,10 @@ export class StoreService {
     return { success: true, store: updatedStore };
   }
 
-  public static deleteStore(
+  public static async deleteStore(
     storeId: string,
     currentUser: User
-  ): { success: boolean; error?: string } {
+  ): Promise<{ success: boolean; error?: string }> {
     if (!hasAdminAccess(currentUser)) {
       return { success: false, error: 'Permission Denied: Admin access required.' };
     }
@@ -640,11 +641,10 @@ export class StoreService {
 
     const now = new Date().toISOString();
     const remainingStores = stores.filter(s => s.id !== storeId);
-    db.saveStores(remainingStores);
 
     // Clean store references from products and recalculate aggregate storeStock
     const products = [...db.getProducts()];
-    const syncItems: SyncQueueItem[] = [];
+    const ops: CloudOperation[] = [];
     let productsChanged = false;
 
     for (let i = 0; i < products.length; i++) {
@@ -675,31 +675,30 @@ export class StoreService {
       products[i] = updatedProd;
       productsChanged = true;
 
-      syncItems.push({
-        id: generateUUID(),
+      ops.push({
         operation: 'UPDATE_PRODUCT',
         entityType: 'PRODUCT',
         entityId: updatedProd.id,
         payload: updatedProd,
-        status: 'PENDING',
-        createdAt: now,
       });
     }
 
-    if (productsChanged) {
-      db.saveProducts(products);
-    }
-
-    syncItems.push({
-      id: generateUUID(),
+    ops.push({
       operation: 'DELETE_STORE',
       entityType: 'STORE',
       entityId: storeId,
       payload: { id: storeId },
-      status: 'PENDING',
-      createdAt: now,
     });
-    db.enqueueSyncBatch(syncItems);
+
+    const commit = await SyncService.commitOperations(ops);
+    if (!commit.success) {
+      return { success: false, error: commit.error || CloudflareApi.OFFLINE_ERROR_MESSAGE };
+    }
+
+    db.saveStores(remainingStores);
+    if (productsChanged) {
+      db.saveProducts(products);
+    }
 
     db.addAuditLog({
       id: generateUUID(),
@@ -716,10 +715,10 @@ export class StoreService {
     return { success: true };
   }
 
-  public static executeStockTransfer(
+  public static async executeStockTransfer(
     payload: StockTransferPayload,
     currentUser: User
-  ): { success: boolean; transfer?: StockTransfer; error?: string } {
+  ): Promise<{ success: boolean; transfer?: StockTransfer; error?: string }> {
     if (!hasAdminAccess(currentUser)) {
       return { success: false, error: 'Permission Denied: Admin access required.' };
     }
@@ -826,6 +825,39 @@ export class StoreService {
       return { success: false, error: applyRes.error || 'Transfer failed.' };
     }
 
+    const ops: CloudOperation[] = [];
+    for (const createdProd of applyRes.createdProducts) {
+      ops.push({
+        operation: 'CREATE_PRODUCT',
+        entityType: 'PRODUCT',
+        entityId: createdProd.id,
+        payload: createdProd,
+      });
+    }
+    const finalProductMap = new Map(workingProducts.map(p => [p.id, p]));
+    for (const pid of applyRes.updatedProductIds) {
+      const prod = finalProductMap.get(pid);
+      if (prod) {
+        ops.push({
+          operation: 'UPDATE_PRODUCT',
+          entityType: 'PRODUCT',
+          entityId: prod.id,
+          payload: prod,
+        });
+      }
+    }
+    ops.push({
+      operation: 'UPSERT_STOCK_TRANSFER',
+      entityType: 'STOCK_TRANSFER',
+      entityId: transfer.id,
+      payload: transfer,
+    });
+
+    const commit = await SyncService.commitOperations(ops);
+    if (!commit.success) {
+      return { success: false, error: commit.error || CloudflareApi.OFFLINE_ERROR_MESSAGE };
+    }
+
     if (transfer.status === 'COMPLETED') {
       db.saveProducts(workingProducts);
       if (applyRes.movements.length > 0) {
@@ -835,44 +867,6 @@ export class StoreService {
 
     const existingTransfers = db.getStockTransfers();
     db.saveStockTransfers([transfer, ...existingTransfers]);
-
-    const syncBatch: SyncQueueItem[] = [];
-    for (const createdProd of applyRes.createdProducts) {
-      syncBatch.push({
-        id: generateUUID(),
-        operation: 'CREATE_PRODUCT',
-        entityType: 'PRODUCT',
-        entityId: createdProd.id,
-        payload: createdProd,
-        status: 'PENDING',
-        createdAt: now,
-      });
-    }
-    const finalProductMap = new Map(workingProducts.map(p => [p.id, p]));
-    for (const pid of applyRes.updatedProductIds) {
-      const prod = finalProductMap.get(pid);
-      if (prod) {
-        syncBatch.push({
-          id: generateUUID(),
-          operation: 'UPDATE_PRODUCT',
-          entityType: 'PRODUCT',
-          entityId: prod.id,
-          payload: prod,
-          status: 'PENDING',
-          createdAt: now,
-        });
-      }
-    }
-    syncBatch.push({
-      id: generateUUID(),
-      operation: 'UPSERT_STOCK_TRANSFER',
-      entityType: 'STOCK_TRANSFER',
-      entityId: transfer.id,
-      payload: transfer,
-      status: 'PENDING',
-      createdAt: now,
-    });
-    db.enqueueSyncBatch(syncBatch);
 
     db.addAuditLog({
       id: generateUUID(),
@@ -889,11 +883,11 @@ export class StoreService {
     return { success: true, transfer };
   }
 
-  public static updateStockTransfer(
+  public static async updateStockTransfer(
     transferId: string,
     payload: StockTransferPayload,
     currentUser: User
-  ): { success: boolean; transfer?: StockTransfer; error?: string } {
+  ): Promise<{ success: boolean; transfer?: StockTransfer; error?: string }> {
     if (!hasAdminAccess(currentUser)) {
       return { success: false, error: 'Permission Denied: Admin access required.' };
     }
@@ -1016,6 +1010,39 @@ export class StoreService {
 
     applyRes.updatedProductIds.forEach(id => touchedIds.add(id));
 
+    const ops: CloudOperation[] = [];
+    for (const createdProd of applyRes.createdProducts) {
+      ops.push({
+        operation: 'CREATE_PRODUCT',
+        entityType: 'PRODUCT',
+        entityId: createdProd.id,
+        payload: createdProd,
+      });
+    }
+    const finalProductMap = new Map(workingProducts.map(p => [p.id, p]));
+    for (const pid of touchedIds) {
+      const prod = finalProductMap.get(pid);
+      if (prod) {
+        ops.push({
+          operation: 'UPDATE_PRODUCT',
+          entityType: 'PRODUCT',
+          entityId: prod.id,
+          payload: prod,
+        });
+      }
+    }
+    ops.push({
+      operation: 'UPSERT_STOCK_TRANSFER',
+      entityType: 'STOCK_TRANSFER',
+      entityId: updatedTransfer.id,
+      payload: updatedTransfer,
+    });
+
+    const commit = await SyncService.commitOperations(ops);
+    if (!commit.success) {
+      return { success: false, error: commit.error || CloudflareApi.OFFLINE_ERROR_MESSAGE };
+    }
+
     if (touchedIds.size > 0 || applyRes.createdProducts.length > 0) {
       db.saveProducts(workingProducts);
     }
@@ -1026,44 +1053,6 @@ export class StoreService {
     const nextTransfers = [...transfers];
     nextTransfers[existingIdx] = updatedTransfer;
     db.saveStockTransfers(nextTransfers);
-
-    const syncBatch: SyncQueueItem[] = [];
-    for (const createdProd of applyRes.createdProducts) {
-      syncBatch.push({
-        id: generateUUID(),
-        operation: 'CREATE_PRODUCT',
-        entityType: 'PRODUCT',
-        entityId: createdProd.id,
-        payload: createdProd,
-        status: 'PENDING',
-        createdAt: now,
-      });
-    }
-    const finalProductMap = new Map(workingProducts.map(p => [p.id, p]));
-    for (const pid of touchedIds) {
-      const prod = finalProductMap.get(pid);
-      if (prod) {
-        syncBatch.push({
-          id: generateUUID(),
-          operation: 'UPDATE_PRODUCT',
-          entityType: 'PRODUCT',
-          entityId: prod.id,
-          payload: prod,
-          status: 'PENDING',
-          createdAt: now,
-        });
-      }
-    }
-    syncBatch.push({
-      id: generateUUID(),
-      operation: 'UPSERT_STOCK_TRANSFER',
-      entityType: 'STOCK_TRANSFER',
-      entityId: updatedTransfer.id,
-      payload: updatedTransfer,
-      status: 'PENDING',
-      createdAt: now,
-    });
-    db.enqueueSyncBatch(syncBatch);
 
     db.addAuditLog({
       id: generateUUID(),
@@ -1080,10 +1069,10 @@ export class StoreService {
     return { success: true, transfer: updatedTransfer };
   }
 
-  public static deleteStockTransfer(
+  public static async deleteStockTransfer(
     transferId: string,
     currentUser: User
-  ): { success: boolean; error?: string } {
+  ): Promise<{ success: boolean; error?: string }> {
     if (!hasAdminAccess(currentUser)) {
       return { success: false, error: 'Permission Denied: Admin access required.' };
     }
@@ -1098,7 +1087,8 @@ export class StoreService {
     const stores = db.getStores();
     const shops = db.getShops();
     const workingProducts = db.getProducts().map(p => ({ ...p }));
-    const syncBatch: SyncQueueItem[] = [];
+    const ops: CloudOperation[] = [];
+    let hasProductUpdates = false;
 
     if (target.status === 'COMPLETED') {
       const revertRes = applyCompletedTransferBalances(
@@ -1112,37 +1102,38 @@ export class StoreService {
       );
 
       if (revertRes.updatedProductIds.size > 0) {
-        db.saveProducts(workingProducts);
+        hasProductUpdates = true;
         const prodMap = new Map(workingProducts.map(p => [p.id, p]));
         for (const pid of revertRes.updatedProductIds) {
           const prod = prodMap.get(pid);
           if (prod) {
-            syncBatch.push({
-              id: generateUUID(),
+            ops.push({
               operation: 'UPDATE_PRODUCT',
               entityType: 'PRODUCT',
               entityId: prod.id,
               payload: prod,
-              status: 'PENDING',
-              createdAt: now,
             });
           }
         }
       }
     }
 
-    db.saveStockTransfers(transfers.filter(t => t.id !== transferId));
-
-    syncBatch.push({
-      id: generateUUID(),
+    ops.push({
       operation: 'DELETE_STOCK_TRANSFER',
       entityType: 'STOCK_TRANSFER',
       entityId: transferId,
       payload: { id: transferId },
-      status: 'PENDING',
-      createdAt: now,
     });
-    db.enqueueSyncBatch(syncBatch);
+
+    const commit = await SyncService.commitOperations(ops);
+    if (!commit.success) {
+      return { success: false, error: commit.error || CloudflareApi.OFFLINE_ERROR_MESSAGE };
+    }
+
+    if (hasProductUpdates) {
+      db.saveProducts(workingProducts);
+    }
+    db.saveStockTransfers(transfers.filter(t => t.id !== transferId));
 
     db.addAuditLog({
       id: generateUUID(),

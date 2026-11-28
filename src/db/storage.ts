@@ -1,4 +1,3 @@
-
 import {
   User,
   Category,
@@ -20,23 +19,7 @@ import {
   PurchaseReturn,
   CustomerRecord,
 } from '../types';
-import {
-  INITIAL_USERS,
-  INITIAL_CATEGORIES,
-  INITIAL_PRODUCTS,
-  INITIAL_SALES,
-  INITIAL_PURCHASES,
-  INITIAL_EXPENSES,
-  INITIAL_MOVEMENTS,
-  INITIAL_SETTINGS,
-  INITIAL_AUDIT_LOGS,
-  INITIAL_SHOPS,
-  INITIAL_IMPORT_HISTORY,
-  INITIAL_DEBTS,
-  DEFAULT_ADMIN_HASH,
-} from './seedData';
-
-const DB_PREFIX = 'omnibiz_pos_db_v3_';
+import { INITIAL_SETTINGS } from './seedData';
 
 export interface DatabaseState {
   shops: Shop[];
@@ -62,9 +45,16 @@ export interface DatabaseState {
 
 type DBListener = () => void;
 
-class LocalDatabase {
+/**
+ * Pure in-memory session database.
+ * Online-only mode: no business records are saved to or loaded from localStorage.
+ * Every mutation commits to the Cloudflare D1 backend first and updates this in-memory cache.
+ */
+class MemoryDatabase {
   private listeners: Set<DBListener> = new Set();
   private memoryCache: DatabaseState | null = null;
+  private cloudLoaded = false;
+  private preMigrationSnapshot: any = null;
 
   constructor() {
     this.cleanupLegacyStorage();
@@ -77,185 +67,58 @@ class LocalDatabase {
         const keysToRemove: string[] = [];
         for (let i = 0; i < localStorage.length; i++) {
           const key = localStorage.key(i);
-          if (key && (key.startsWith('omnibiz_pos_db_v1_') || key.startsWith('omnibiz_pos_db_v2_'))) {
+          if (
+            key &&
+            (key.startsWith('omnibiz_pos_db_v1_') ||
+              key.startsWith('omnibiz_pos_db_v2_') ||
+              key.startsWith('omnibiz_pos_db_v3_') ||
+              key === 'omnibiz_pre_migration_snapshot_v1' ||
+              key === 'omnibiz_has_synced' ||
+              key === 'omnibiz_last_synced_at')
+          ) {
             keysToRemove.push(key);
           }
         }
         keysToRemove.forEach(k => localStorage.removeItem(k));
       }
     } catch (e) {
-      console.warn('[LocalDB] Legacy storage cleanup warning', e);
-    }
-  }
-
-  private getKey(table: string): string {
-    return `${DB_PREFIX}${table}`;
-  }
-
-  private loadTable<T>(tableName: string, fallback: T): T {
-    try {
-      const serialized = localStorage.getItem(this.getKey(tableName));
-      if (!serialized) {
-        this.saveTable(tableName, fallback);
-        return fallback;
-      }
-      return JSON.parse(serialized) as T;
-    } catch (e) {
-      console.warn(`[LocalDB] Error reading table ${tableName}, using fallback`, e);
-      return fallback;
-    }
-  }
-
-  private saveTable<T>(tableName: string, data: T): void {
-    const key = this.getKey(tableName);
-    const json = JSON.stringify(data);
-    try {
-      localStorage.setItem(key, json);
-    } catch (e) {
-      // Handle QuotaExceededError cleanly by evicting expendable caches first
-      try {
-        localStorage.removeItem(LocalDatabase.PRE_MIGRATION_KEY);
-        // Prune already-SYNCED items from sync_queue to free space
-        if (tableName !== 'sync_queue' && this.memoryCache?.syncQueue) {
-          const prunedQueue = this.memoryCache.syncQueue.filter(
-            q => q.status === 'PENDING' || q.status === 'FAILED'
-          );
-          if (prunedQueue.length !== this.memoryCache.syncQueue.length) {
-            this.memoryCache.syncQueue = prunedQueue;
-            try {
-              localStorage.setItem(this.getKey('sync_queue'), JSON.stringify(prunedQueue));
-            } catch {
-              // ignore secondary error
-            }
-          }
-        }
-        localStorage.setItem(key, json);
-      } catch (retryErr) {
-        // Fallback for non-critical tables so core data (e.g. products) never crashes
-        if (tableName === 'movements' && Array.isArray(data) && data.length > 500) {
-          try {
-            localStorage.setItem(key, JSON.stringify(data.slice(0, 500)));
-            return;
-          } catch {
-            // ignore
-          }
-        }
-        if (tableName === 'sync_queue' && Array.isArray(data)) {
-          try {
-            const pendingOnly = (data as unknown as SyncQueueItem[]).filter(
-              q => q.status === 'PENDING' || q.status === 'FAILED'
-            );
-            localStorage.setItem(key, JSON.stringify(pendingOnly.slice(0, 500)));
-            return;
-          } catch {
-            // Keep full queue in memoryCache even if localStorage is full
-            return;
-          }
-        }
-        console.error(`[LocalDB] Failed writing table ${tableName}`, retryErr || e);
-      }
+      console.warn('[MemoryDB] Legacy storage cleanup warning', e);
     }
   }
 
   public init(): DatabaseState {
-    let shops = this.loadTable<Shop[]>('shops', INITIAL_SHOPS);
-    const stores = this.loadTable<Store[]>('stores', []);
-    let users = this.loadTable<User[]>('users', INITIAL_USERS);
-    let categories = this.loadTable<Category[]>('categories', INITIAL_CATEGORIES);
-    let products = this.loadTable<Product[]>('products', INITIAL_PRODUCTS);
-    let sales = this.loadTable<Sale[]>('sales', INITIAL_SALES);
-    let purchases = this.loadTable<Purchase[]>('purchases', INITIAL_PURCHASES);
-    let expenses = this.loadTable<Expense[]>('expenses', INITIAL_EXPENSES);
-    let movements = this.loadTable<InventoryMovement[]>('movements', INITIAL_MOVEMENTS);
-    let settings = this.loadTable<BusinessSettings>('settings', INITIAL_SETTINGS);
-    const auditLogs = this.loadTable<AuditLog[]>('audit_logs', INITIAL_AUDIT_LOGS);
-    const syncQueue = this.loadTable<SyncQueueItem[]>('sync_queue', []);
-    const importHistory = this.loadTable<ImportHistoryItem[]>('import_history', INITIAL_IMPORT_HISTORY);
-    const saleEditRequests = this.loadTable<SaleEditRequest[]>('sale_edit_requests', []);
-    const stockTransfers = this.loadTable<StockTransfer[]>('stock_transfers', []);
-    const purchaseReturns = this.loadTable<PurchaseReturn[]>('purchase_returns', []);
-    const customerRecords = this.loadTable<CustomerRecord[]>('customer_records', []);
-
-    // Ensure users have Admin account
-    if (!users || users.length === 0) {
-      users = INITIAL_USERS;
-      this.saveTable('users', users);
-    }
-
-    // Ensure Admin has all shops assigned
-    const allShopIds = (shops || []).map(s => s.id);
-    let usersModified = false;
-    users = users.map(u => {
-      let mod = false;
-      const copy = { ...u };
-      if (copy.role === 'ADMIN') {
-        if ((copy.username || '').toLowerCase() === 'admin') {
-          copy.username = 'Admin';
-          copy.passwordHash = copy.passwordHash || DEFAULT_ADMIN_HASH;
-          mod = true;
-        }
-        copy.assignedShopIds = allShopIds;
-        mod = true;
-      }
-      if (mod) usersModified = true;
-      return copy;
-    });
-
-    if (usersModified) {
-      this.saveTable('users', users);
-    }
-
-    // Ensure business branding is correct and currency is TSh
-    let settingsModified = false;
-    if (settings.businessName === 'Electronics & Retail Solutions' || !settings.businessName) {
-      settings = {
-        ...settings,
-        businessName: 'Gmeck Company Limited',
-        tagline: 'Electronics Tools & Retail Solutions',
-        receiptHeaderNote: 'Thank you for shopping with Diocres Hardware&Retail Solutions!',
-      };
-      settingsModified = true;
-    }
-
-    if (!settings.currencySymbol || settings.currencySymbol === '$') {
-      settings = {
-        ...settings,
-        currencySymbol: 'TSh',
-        currencyCode: 'TZS',
-      };
-      settingsModified = true;
-    }
-
-    if (settingsModified) {
-      this.saveTable('settings', settings);
-    }
-
-    const debts = this.loadTable<DebtRecord[]>('debts', INITIAL_DEBTS);
-    const notifications = this.loadTable<AppNotification[]>('notifications', []);
-
     this.memoryCache = {
-      shops: shops || [],
-      stores: stores || [],
-      users: users || [],
-      categories: categories || [],
-      products: products || [],
-      sales: sales || [],
-      purchases: purchases || [],
-      expenses: expenses || [],
-      movements: movements || [],
-      settings,
-      auditLogs: auditLogs || [],
-      syncQueue: syncQueue || [],
-      importHistory: importHistory || [],
-      debts: debts || [],
-      notifications: notifications || [],
-      saleEditRequests: saleEditRequests || [],
-      stockTransfers: stockTransfers || [],
-      purchaseReturns: purchaseReturns || [],
-      customerRecords: customerRecords || [],
+      shops: [],
+      stores: [],
+      users: [],
+      categories: [],
+      products: [],
+      sales: [],
+      purchases: [],
+      expenses: [],
+      movements: [],
+      settings: { ...INITIAL_SETTINGS },
+      auditLogs: [],
+      syncQueue: [],
+      importHistory: [],
+      debts: [],
+      notifications: [],
+      saleEditRequests: [],
+      stockTransfers: [],
+      purchaseReturns: [],
+      customerRecords: [],
     };
-
+    this.cloudLoaded = false;
     return this.memoryCache;
+  }
+
+  public isCloudLoaded(): boolean {
+    return this.cloudLoaded;
+  }
+
+  public setCloudLoaded(loaded: boolean): void {
+    this.cloudLoaded = loaded;
+    this.notify();
   }
 
   public getState(): DatabaseState {
@@ -277,7 +140,7 @@ class LocalDatabase {
       try {
         fn();
       } catch (err) {
-        console.error('[LocalDB] Listener error', err);
+        console.error('[MemoryDB] Listener error', err);
       }
     });
   }
@@ -290,7 +153,6 @@ class LocalDatabase {
   public saveShops(shops: Shop[]): void {
     if (!this.memoryCache) this.init();
     this.memoryCache!.shops = shops;
-    this.saveTable('shops', shops);
     this.notify();
   }
 
@@ -302,7 +164,6 @@ class LocalDatabase {
   public saveStores(stores: Store[]): void {
     if (!this.memoryCache) this.init();
     this.memoryCache!.stores = stores;
-    this.saveTable('stores', stores);
     this.notify();
   }
 
@@ -314,7 +175,6 @@ class LocalDatabase {
   public saveStockTransfers(transfers: StockTransfer[]): void {
     if (!this.memoryCache) this.init();
     this.memoryCache!.stockTransfers = transfers;
-    this.saveTable('stock_transfers', transfers);
     this.notify();
   }
 
@@ -326,7 +186,6 @@ class LocalDatabase {
   public saveUsers(users: User[]): void {
     if (!this.memoryCache) this.init();
     this.memoryCache!.users = users;
-    this.saveTable('users', users);
     this.notify();
   }
 
@@ -338,7 +197,6 @@ class LocalDatabase {
   public saveCategories(categories: Category[]): void {
     if (!this.memoryCache) this.init();
     this.memoryCache!.categories = categories;
-    this.saveTable('categories', categories);
     this.notify();
   }
 
@@ -350,7 +208,6 @@ class LocalDatabase {
   public saveProducts(products: Product[]): void {
     if (!this.memoryCache) this.init();
     this.memoryCache!.products = products;
-    this.saveTable('products', products);
     this.notify();
   }
 
@@ -362,7 +219,6 @@ class LocalDatabase {
   public saveSales(sales: Sale[]): void {
     if (!this.memoryCache) this.init();
     this.memoryCache!.sales = sales;
-    this.saveTable('sales', sales);
     this.notify();
   }
 
@@ -374,7 +230,6 @@ class LocalDatabase {
   public savePurchases(purchases: Purchase[]): void {
     if (!this.memoryCache) this.init();
     this.memoryCache!.purchases = purchases;
-    this.saveTable('purchases', purchases);
     this.notify();
   }
 
@@ -386,7 +241,6 @@ class LocalDatabase {
   public savePurchaseReturns(returns: PurchaseReturn[]): void {
     if (!this.memoryCache) this.init();
     this.memoryCache!.purchaseReturns = returns;
-    this.saveTable('purchase_returns', returns);
     this.notify();
   }
 
@@ -398,7 +252,6 @@ class LocalDatabase {
   public saveCustomerRecords(records: CustomerRecord[]): void {
     if (!this.memoryCache) this.init();
     this.memoryCache!.customerRecords = records;
-    this.saveTable('customer_records', records);
     this.notify();
   }
 
@@ -410,7 +263,6 @@ class LocalDatabase {
   public saveExpenses(expenses: Expense[]): void {
     if (!this.memoryCache) this.init();
     this.memoryCache!.expenses = expenses;
-    this.saveTable('expenses', expenses);
     this.notify();
   }
 
@@ -422,7 +274,6 @@ class LocalDatabase {
   public saveMovements(movements: InventoryMovement[]): void {
     if (!this.memoryCache) this.init();
     this.memoryCache!.movements = movements;
-    this.saveTable('movements', movements);
     this.notify();
   }
 
@@ -434,11 +285,10 @@ class LocalDatabase {
   public saveSettings(settings: BusinessSettings): void {
     if (!this.memoryCache) this.init();
     this.memoryCache!.settings = settings;
-    this.saveTable('settings', settings);
     this.notify();
   }
 
-  // --- Audit Logs ---
+  // --- Audit Logs (in-memory session trace only) ---
   public getAuditLogs(): AuditLog[] {
     return this.getState().auditLogs || [];
   }
@@ -447,11 +297,10 @@ class LocalDatabase {
     if (!this.memoryCache) this.init();
     const updated = [log, ...(this.memoryCache!.auditLogs || [])].slice(0, 500);
     this.memoryCache!.auditLogs = updated;
-    this.saveTable('audit_logs', updated);
     this.notify();
   }
 
-  // --- Import History ---
+  // --- Import History (in-memory session trace) ---
   public getImportHistory(): ImportHistoryItem[] {
     return this.getState().importHistory || [];
   }
@@ -459,7 +308,6 @@ class LocalDatabase {
   public saveImportHistory(history: ImportHistoryItem[]): void {
     if (!this.memoryCache) this.init();
     this.memoryCache!.importHistory = history;
-    this.saveTable('import_history', history);
     this.notify();
   }
 
@@ -467,48 +315,17 @@ class LocalDatabase {
     if (!this.memoryCache) this.init();
     const updated = [item, ...(this.memoryCache!.importHistory || [])].slice(0, 200);
     this.memoryCache!.importHistory = updated;
-    this.saveTable('import_history', updated);
     this.notify();
   }
 
-  // --- Sync Queue ---
+  // --- Sync Queue (always empty in online-only mode) ---
   public getSyncQueue(): SyncQueueItem[] {
-    return this.getState().syncQueue || [];
+    return [];
   }
 
-  public enqueueSync(item: SyncQueueItem): void {
+  public saveSyncQueue(_queue: SyncQueueItem[]): void {
     if (!this.memoryCache) this.init();
-    const updated = [item, ...(this.memoryCache!.syncQueue || [])];
-    this.memoryCache!.syncQueue = updated;
-    this.saveTable('sync_queue', updated);
-    this.notify();
-  }
-
-  public enqueueSyncBatch(items: SyncQueueItem[]): void {
-    if (!items || items.length === 0) return;
-    if (!this.memoryCache) this.init();
-    const existing = this.memoryCache!.syncQueue || [];
-    // Keep all PENDING / FAILED items plus at most the 50 most recent SYNCED items to prevent quota bloat
-    let syncedKept = 0;
-    const compactExisting = existing.filter(q => {
-      if (q.status === 'PENDING' || q.status === 'FAILED') return true;
-      if (syncedKept < 50) {
-        syncedKept++;
-        return true;
-      }
-      return false;
-    });
-    const updated = [...items, ...compactExisting];
-    this.memoryCache!.syncQueue = updated;
-    this.saveTable('sync_queue', updated);
-    this.notify();
-  }
-
-  public saveSyncQueue(queue: SyncQueueItem[]): void {
-    if (!this.memoryCache) this.init();
-    this.memoryCache!.syncQueue = queue;
-    this.saveTable('sync_queue', queue);
-    this.notify();
+    this.memoryCache!.syncQueue = [];
   }
 
   // --- Sale Edit Requests ---
@@ -519,7 +336,6 @@ class LocalDatabase {
   public saveSaleEditRequests(requests: SaleEditRequest[]): void {
     if (!this.memoryCache) this.init();
     this.memoryCache!.saleEditRequests = requests;
-    this.saveTable('sale_edit_requests', requests);
     this.notify();
   }
 
@@ -527,18 +343,14 @@ class LocalDatabase {
     if (!this.memoryCache) this.init();
     const updated = [request, ...(this.memoryCache!.saleEditRequests || [])];
     this.memoryCache!.saleEditRequests = updated;
-    this.saveTable('sale_edit_requests', updated);
     this.notify();
   }
 
   public updateSaleEditRequest(requestId: string, patch: Partial<SaleEditRequest>): void {
     if (!this.memoryCache) this.init();
     const current = this.memoryCache!.saleEditRequests || [];
-    const updated = current.map(r =>
-      r.id === requestId ? { ...r, ...patch } : r
-    );
+    const updated = current.map(r => (r.id === requestId ? { ...r, ...patch } : r));
     this.memoryCache!.saleEditRequests = updated;
-    this.saveTable('sale_edit_requests', updated);
     this.notify();
   }
 
@@ -550,7 +362,6 @@ class LocalDatabase {
   public saveDebts(debts: DebtRecord[]): void {
     if (!this.memoryCache) this.init();
     this.memoryCache!.debts = debts;
-    this.saveTable('debts', debts);
     this.notify();
   }
 
@@ -558,7 +369,6 @@ class LocalDatabase {
     if (!this.memoryCache) this.init();
     const updated = [debt, ...(this.memoryCache!.debts || [])];
     this.memoryCache!.debts = updated;
-    this.saveTable('debts', updated);
     this.notify();
   }
 
@@ -569,7 +379,6 @@ class LocalDatabase {
       d.id === debtId ? { ...d, ...patch, updatedAt: new Date().toISOString() } : d
     );
     this.memoryCache!.debts = updated;
-    this.saveTable('debts', updated);
     this.notify();
   }
 
@@ -578,7 +387,6 @@ class LocalDatabase {
     const current = this.memoryCache!.debts || [];
     const updated = current.filter(d => d.id !== debtId);
     this.memoryCache!.debts = updated;
-    this.saveTable('debts', updated);
     this.notify();
   }
 
@@ -590,7 +398,6 @@ class LocalDatabase {
   public saveNotifications(notifications: AppNotification[]): void {
     if (!this.memoryCache) this.init();
     this.memoryCache!.notifications = notifications;
-    this.saveTable('notifications', notifications);
     this.notify();
   }
 
@@ -606,7 +413,6 @@ class LocalDatabase {
     if (!isDup) {
       const updated = [notification, ...current].slice(0, 300);
       this.memoryCache!.notifications = updated;
-      this.saveTable('notifications', updated);
       this.notify();
     }
   }
@@ -624,7 +430,6 @@ class LocalDatabase {
       return n;
     });
     this.memoryCache!.notifications = updated;
-    this.saveTable('notifications', updated);
     this.notify();
   }
 
@@ -639,17 +444,16 @@ class LocalDatabase {
       return n;
     });
     this.memoryCache!.notifications = updated;
-    this.saveTable('notifications', updated);
     this.notify();
   }
 
-  // --- Backup & Restore ---
+  // --- Backup & Export (reads current live in-memory cloud snapshot) ---
   public exportFullBackup(): string {
     const data = this.getState();
     const payload = {
       version: '2.0.0',
       exportedAt: new Date().toISOString(),
-      generator: 'Diocres Android Mobile Business System',
+      generator: 'Gmeck Cloud Business System',
       data,
     };
     return JSON.stringify(payload, null, 2);
@@ -666,72 +470,53 @@ class LocalDatabase {
         return { success: false, message: 'Corrupt database snapshot: core tables are missing' };
       }
 
-      this.saveTable('shops', d.shops || INITIAL_SHOPS);
-      this.saveTable('stores', d.stores || []);
-      this.saveTable('users', d.users);
-      this.saveTable('categories', d.categories || INITIAL_CATEGORIES);
-      this.saveTable('products', d.products);
-      this.saveTable('sales', d.sales);
-      this.saveTable('purchases', d.purchases || []);
-      this.saveTable('expenses', d.expenses || []);
-      this.saveTable('movements', d.movements || []);
-      this.saveTable('settings', d.settings || INITIAL_SETTINGS);
-      this.saveTable('audit_logs', d.auditLogs || []);
-      this.saveTable('sync_queue', d.syncQueue || []);
-      this.saveTable('import_history', d.importHistory || INITIAL_IMPORT_HISTORY);
-      this.saveTable('debts', d.debts || INITIAL_DEBTS);
-      this.saveTable('notifications', d.notifications || []);
-      this.saveTable('sale_edit_requests', d.saleEditRequests || []);
-      this.saveTable('stock_transfers', d.stockTransfers || []);
-      this.saveTable('purchase_returns', d.purchaseReturns || []);
-      this.saveTable('customer_records', d.customerRecords || []);
-
-      this.init();
+      this.memoryCache = {
+        shops: d.shops || [],
+        stores: d.stores || [],
+        users: d.users,
+        categories: d.categories || [],
+        products: d.products,
+        sales: d.sales,
+        purchases: d.purchases || [],
+        expenses: d.expenses || [],
+        movements: d.movements || [],
+        settings: d.settings || { ...INITIAL_SETTINGS },
+        auditLogs: d.auditLogs || [],
+        syncQueue: [],
+        importHistory: d.importHistory || [],
+        debts: d.debts || [],
+        notifications: d.notifications || [],
+        saleEditRequests: d.saleEditRequests || [],
+        stockTransfers: d.stockTransfers || [],
+        purchaseReturns: d.purchaseReturns || [],
+        customerRecords: d.customerRecords || [],
+      };
       this.notify();
       return {
         success: true,
-        message: `Successfully restored backup from ${parsed.exportedAt || 'archive'}`,
+        message: `Loaded backup from ${parsed.exportedAt || 'archive'} into memory`,
       };
     } catch (e: any) {
       return {
         success: false,
-        message: `Failed to restore database: ${e.message || 'JSON parse error'}`,
+        message: `Failed to parse backup: ${e.message || 'JSON parse error'}`,
       };
     }
   }
 
-  private static readonly PRE_MIGRATION_KEY = 'omnibiz_pre_migration_snapshot_v1';
-
-  public savePreMigrationSnapshot(label: string = 'Pre-Import Backup'): boolean {
-    try {
-      const state = this.getState();
-      // Skip oversized snapshots so localStorage quota remains available for imported products
-      if ((state.products?.length || 0) > 1500) {
-        localStorage.removeItem(LocalDatabase.PRE_MIGRATION_KEY);
-        return false;
-      }
-      // Clear previous snapshot first to avoid holding two copies during setItem
-      localStorage.removeItem(LocalDatabase.PRE_MIGRATION_KEY);
-      const snapshot = {
-        savedAt: new Date().toISOString(),
-        label,
-        shops: state.shops || [],
-        stores: state.stores || [],
-        categories: state.categories || [],
-        products: state.products || [],
-        sales: state.sales || [],
-        importHistory: state.importHistory || [],
-      };
-      const serialized = JSON.stringify(snapshot);
-      if (serialized.length > 1_500_000) {
-        return false;
-      }
-      localStorage.setItem(LocalDatabase.PRE_MIGRATION_KEY, serialized);
-      return true;
-    } catch (e) {
-      console.warn('[LocalDB] Failed to save pre-migration snapshot (storage quota?):', e);
-      return false;
-    }
+  public savePreMigrationSnapshot(label: string = 'Pre-Import Snapshot'): boolean {
+    const state = this.getState();
+    this.preMigrationSnapshot = {
+      savedAt: new Date().toISOString(),
+      label,
+      shops: [...(state.shops || [])],
+      stores: [...(state.stores || [])],
+      categories: [...(state.categories || [])],
+      products: [...(state.products || [])],
+      sales: [...(state.sales || [])],
+      importHistory: [...(state.importHistory || [])],
+    };
+    return true;
   }
 
   public hasPreMigrationSnapshot(): {
@@ -741,112 +526,70 @@ class LocalDatabase {
     productCount?: number;
     storeCount?: number;
   } {
-    try {
-      const raw = localStorage.getItem(LocalDatabase.PRE_MIGRATION_KEY);
-      if (!raw) return { exists: false };
-      const parsed = JSON.parse(raw);
-      if (!parsed || !Array.isArray(parsed.products)) return { exists: false };
-      return {
-        exists: true,
-        savedAt: parsed.savedAt,
-        label: parsed.label,
-        productCount: parsed.products.length,
-        storeCount: Array.isArray(parsed.stores) ? parsed.stores.length : 0,
-      };
-    } catch {
+    if (!this.preMigrationSnapshot || !Array.isArray(this.preMigrationSnapshot.products)) {
       return { exists: false };
     }
+    return {
+      exists: true,
+      savedAt: this.preMigrationSnapshot.savedAt,
+      label: this.preMigrationSnapshot.label,
+      productCount: this.preMigrationSnapshot.products.length,
+      storeCount: Array.isArray(this.preMigrationSnapshot.stores)
+        ? this.preMigrationSnapshot.stores.length
+        : 0,
+    };
   }
 
   public restorePreMigrationSnapshot(): { success: boolean; message: string } {
-    try {
-      const raw = localStorage.getItem(LocalDatabase.PRE_MIGRATION_KEY);
-      if (!raw) {
-        return { success: false, message: 'No pre-import snapshot is available to restore.' };
-      }
-      const parsed = JSON.parse(raw);
-      if (!parsed || !Array.isArray(parsed.products)) {
-        return { success: false, message: 'Pre-import snapshot is invalid or incomplete.' };
-      }
-
-      if (Array.isArray(parsed.shops)) this.saveTable('shops', parsed.shops);
-      if (Array.isArray(parsed.stores)) this.saveTable('stores', parsed.stores);
-      if (Array.isArray(parsed.categories)) this.saveTable('categories', parsed.categories);
-      this.saveTable('products', parsed.products);
-      if (Array.isArray(parsed.sales)) this.saveTable('sales', parsed.sales);
-      if (Array.isArray(parsed.movements)) this.saveTable('movements', parsed.movements);
-      if (Array.isArray(parsed.importHistory)) this.saveTable('import_history', parsed.importHistory);
-      if (Array.isArray(parsed.syncQueue)) this.saveTable('sync_queue', parsed.syncQueue);
-
-      localStorage.removeItem(LocalDatabase.PRE_MIGRATION_KEY);
-      this.init();
-      this.notify();
-      return {
-        success: true,
-        message: `Rolled back to state before "${parsed.label || 'import'}" (${parsed.products.length} products restored).`,
-      };
-    } catch (e: any) {
-      return {
-        success: false,
-        message: `Rollback failed: ${e.message || 'Unknown error'}`,
-      };
+    if (!this.preMigrationSnapshot || !Array.isArray(this.preMigrationSnapshot.products)) {
+      return { success: false, message: 'No pre-import snapshot is available to restore.' };
     }
+    const snap = this.preMigrationSnapshot;
+    if (!this.memoryCache) this.init();
+    if (Array.isArray(snap.shops)) this.memoryCache!.shops = snap.shops;
+    if (Array.isArray(snap.stores)) this.memoryCache!.stores = snap.stores;
+    if (Array.isArray(snap.categories)) this.memoryCache!.categories = snap.categories;
+    this.memoryCache!.products = snap.products;
+    if (Array.isArray(snap.sales)) this.memoryCache!.sales = snap.sales;
+    if (Array.isArray(snap.importHistory)) this.memoryCache!.importHistory = snap.importHistory;
+    this.preMigrationSnapshot = null;
+    this.notify();
+    return {
+      success: true,
+      message: `Restored "${snap.label || 'import'}" (${snap.products.length} products) in memory.`,
+    };
   }
 
   public clearPreMigrationSnapshot(): void {
-    try {
-      localStorage.removeItem(LocalDatabase.PRE_MIGRATION_KEY);
-    } catch {
-      // ignore
-    }
+    this.preMigrationSnapshot = null;
   }
 
   public wipeAllData(keepShopsAndAdmin: boolean = true): void {
-    const shops = keepShopsAndAdmin
-      ? this.memoryCache?.shops?.length
-        ? this.memoryCache.shops
-        : INITIAL_SHOPS
-      : INITIAL_SHOPS;
-    const users = keepShopsAndAdmin
-      ? this.memoryCache?.users?.length
-        ? this.memoryCache.users
-        : INITIAL_USERS
-      : INITIAL_USERS;
-    const settings = this.memoryCache?.settings || INITIAL_SETTINGS;
+    const existingShops = keepShopsAndAdmin ? this.memoryCache?.shops || [] : [];
+    const existingUsers = keepShopsAndAdmin ? this.memoryCache?.users || [] : [];
+    const existingSettings = this.memoryCache?.settings || { ...INITIAL_SETTINGS };
 
-    this.saveTable('shops', shops);
-    this.saveTable('stores', []);
-    this.saveTable('users', users);
-    this.saveTable('categories', []);
-    this.saveTable('products', []);
-    this.saveTable('sales', []);
-    this.saveTable('purchases', []);
-    this.saveTable('expenses', []);
-    this.saveTable('movements', []);
-    this.saveTable('settings', settings);
-    this.saveTable('audit_logs', [
-      {
-        id: `audit-wipe-${Date.now()}`,
-        userId: users[0]?.id || 'user-admin-01',
-        userName: users[0]?.name || 'Administrator',
-        action: 'SYSTEM_INITIALIZATION',
-        details:
-          'Wiped all demo and transactional data in preparation for live Cloudflare deployment',
-        entityType: 'SETTINGS',
-        timestamp: new Date().toISOString(),
-        createdAt: new Date().toISOString(),
-      },
-    ]);
-    this.saveTable('sync_queue', []);
-    this.saveTable('import_history', []);
-    this.saveTable('debts', []);
-    this.saveTable('notifications', []);
-    this.saveTable('sale_edit_requests', []);
-    this.saveTable('stock_transfers', []);
-    this.saveTable('purchase_returns', []);
-    this.saveTable('customer_records', []);
-
-    this.init();
+    this.memoryCache = {
+      shops: existingShops,
+      stores: [],
+      users: existingUsers,
+      categories: [],
+      products: [],
+      sales: [],
+      purchases: [],
+      expenses: [],
+      movements: [],
+      settings: existingSettings,
+      auditLogs: [],
+      syncQueue: [],
+      importHistory: [],
+      debts: [],
+      notifications: [],
+      saleEditRequests: [],
+      stockTransfers: [],
+      purchaseReturns: [],
+      customerRecords: [],
+    };
     this.notify();
   }
 
@@ -855,5 +598,5 @@ class LocalDatabase {
   }
 }
 
-export const db = new LocalDatabase();
+export const db = new MemoryDatabase();
 export const StorageService = db;

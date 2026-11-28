@@ -120,7 +120,7 @@ export const SellerSales: React.FC = () => {
   };
 
   // Submit edit request
-  const handleSubmitEditRequest = () => {
+  const handleSubmitEditRequest = async () => {
     if (!editingSale || !currentUser) return;
 
     if (!editReason.trim()) {
@@ -134,7 +134,7 @@ export const SellerSales: React.FC = () => {
 
     setIsSubmitting(true);
 
-    const result = SalesService.requestSaleEdit(
+    const result = await SalesService.requestSaleEdit(
       editingSale.id,
       editItems,
       editReason,

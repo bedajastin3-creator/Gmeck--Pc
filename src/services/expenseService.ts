@@ -9,6 +9,8 @@ import {
   isPlatformAdmin,
   isShopAdmin,
 } from '../utils/permissions';
+import { CloudflareApi } from './cloudflareApi';
+import { SyncService } from './syncService';
 
 function getAllowedExpenseShopIds(user: User): Set<string> | null {
   if (isPlatformAdmin(user)) return null;
@@ -23,7 +25,7 @@ export class ExpenseService {
    * Record operational expense (Shop-specific or General Company).
    * Platform Admin, Shop Admin, OR Seller with canRecordExpenses permission.
    */
-  public static recordExpense(
+  public static async recordExpense(
     params: {
       shopId?: string | null;
       isCompanyExpense?: boolean;
@@ -37,7 +39,7 @@ export class ExpenseService {
       notes?: string;
     },
     currentUser: User
-  ): { success: boolean; expense?: Expense; error?: string } {
+  ): Promise<{ success: boolean; expense?: Expense; error?: string }> {
     const effectivePerms = getEffectiveSellerPermissions(currentUser);
     if (!hasAdminAccess(currentUser) && !effectivePerms.canRecordExpenses) {
       return { success: false, error: 'Permission Denied: You do not have permission to record expenses.' };
@@ -107,17 +109,17 @@ export class ExpenseService {
       createdAt: new Date().toISOString(),
     };
 
-    db.saveExpenses([newExpense, ...db.getExpenses()]);
-
-    db.enqueueSync({
-      id: generateUUID(),
+    const commit = await SyncService.commitOperation({
       operation: 'CREATE_EXPENSE',
       entityType: 'EXPENSE',
       entityId: newExpense.id,
       payload: newExpense,
-      status: 'PENDING',
-      createdAt: new Date().toISOString(),
     });
+    if (!commit.success) {
+      return { success: false, error: commit.error || CloudflareApi.OFFLINE_ERROR_MESSAGE };
+    }
+
+    db.saveExpenses([newExpense, ...db.getExpenses()]);
 
     db.addAuditLog({
       id: generateUUID(),
@@ -133,7 +135,7 @@ export class ExpenseService {
     return { success: true, expense: newExpense };
   }
 
-  public static createExpense(
+  public static async createExpense(
     params: {
       shopId?: string | null;
       isCompanyExpense?: boolean;
@@ -153,7 +155,7 @@ export class ExpenseService {
    * Update an existing expense.
    * Platform Admin, Shop Admin (within managed shops), or Seller with canRecordExpenses (own only).
    */
-  public static updateExpense(
+  public static async updateExpense(
     expenseId: string,
     updates: {
       title?: string;
@@ -167,7 +169,7 @@ export class ExpenseService {
       isCompanyExpense?: boolean;
     },
     currentUser: User
-  ): { success: boolean; expense?: Expense; error?: string } {
+  ): Promise<{ success: boolean; expense?: Expense; error?: string }> {
     const expenses = db.getExpenses();
     const index = expenses.findIndex(e => e.id === expenseId);
 
@@ -262,18 +264,19 @@ export class ExpenseService {
       date: updates.date || current.date,
     };
 
-    expenses[index] = updatedExpense;
-    db.saveExpenses(expenses);
-
-    db.enqueueSync({
-      id: generateUUID(),
+    const commit = await SyncService.commitOperation({
       operation: 'UPDATE_EXPENSE',
       entityType: 'EXPENSE',
       entityId: expenseId,
       payload: updatedExpense,
-      status: 'PENDING',
-      createdAt: new Date().toISOString(),
     });
+    if (!commit.success) {
+      return { success: false, error: commit.error || CloudflareApi.OFFLINE_ERROR_MESSAGE };
+    }
+
+    const nextExpenses = [...expenses];
+    nextExpenses[index] = updatedExpense;
+    db.saveExpenses(nextExpenses);
 
     db.addAuditLog({
       id: generateUUID(),
@@ -293,10 +296,10 @@ export class ExpenseService {
    * Delete an expense permanently.
    * Platform Admin OR Shop Admin (within their managed shops).
    */
-  public static deleteExpense(
+  public static async deleteExpense(
     expenseId: string,
     currentUser: User
-  ): { success: boolean; error?: string } {
+  ): Promise<{ success: boolean; error?: string }> {
     const expenses = db.getExpenses();
     const expense = expenses.find(e => e.id === expenseId);
 
@@ -318,18 +321,18 @@ export class ExpenseService {
       };
     }
 
-    const updatedExpenses = expenses.filter(e => e.id !== expenseId);
-    db.saveExpenses(updatedExpenses);
-
-    db.enqueueSync({
-      id: generateUUID(),
+    const commit = await SyncService.commitOperation({
       operation: 'DELETE_EXPENSE',
       entityType: 'EXPENSE',
       entityId: expenseId,
       payload: { id: expenseId },
-      status: 'PENDING',
-      createdAt: new Date().toISOString(),
     });
+    if (!commit.success) {
+      return { success: false, error: commit.error || CloudflareApi.OFFLINE_ERROR_MESSAGE };
+    }
+
+    const updatedExpenses = expenses.filter(e => e.id !== expenseId);
+    db.saveExpenses(updatedExpenses);
 
     db.addAuditLog({
       id: generateUUID(),

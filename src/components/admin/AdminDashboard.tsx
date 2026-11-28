@@ -13,6 +13,8 @@ import {
   Shield,
   CreditCard,
   RefreshCw,
+  WifiOff,
+  Lock,
 } from 'lucide-react';
 import { useApp } from '../../context/AppContext';
 import { ReportService } from '../../services/reportService';
@@ -27,10 +29,25 @@ function toLocalYMD(d: Date): string {
 }
 
 export const AdminDashboard: React.FC = () => {
-  const { currentUser, dbState, setActiveTab, showReceipt, selectedShopId, currentShop, pullLatestNow } = useApp();
+  const {
+    currentUser,
+    dbState,
+    setActiveTab,
+    showReceipt,
+    selectedShopId,
+    currentShop,
+    pullLatestNow,
+    isOnline,
+    isCloudLoaded,
+    cachedHome,
+    retryConnection,
+    addToast,
+  } = useApp();
   const [timeFilter, setTimeFilter] = useState<'today' | 'week' | 'month' | 'all'>('today');
   const [todayKey, setTodayKey] = useState<string>(() => toLocalYMD(new Date()));
   const [isRefreshingLive, setIsRefreshingLive] = useState(false);
+
+  const isOfflineMode = !isOnline || !isCloudLoaded;
 
   // Pull live data immediately on Home mount and every 30s while visible
   useEffect(() => {
@@ -77,8 +94,8 @@ export const AdminDashboard: React.FC = () => {
 
   const canAccessDashboard = Boolean(currentUser && hasAdminAccess(currentUser));
 
-  const summary = useMemo(() => {
-    if (!canAccessDashboard || !currentUser) {
+  const liveSummary = useMemo(() => {
+    if (!canAccessDashboard || !currentUser || isOfflineMode) {
       return null;
     }
     return ReportService.getFinancialSummary(
@@ -86,27 +103,55 @@ export const AdminDashboard: React.FC = () => {
       { shopId: selectedShopId },
       currentUser
     );
-  }, [canAccessDashboard, dateRange, selectedShopId, currentUser, dbState]);
+  }, [canAccessDashboard, dateRange, selectedShopId, currentUser, dbState, isOfflineMode]);
+
+  const cachedShopEntry = useMemo(() => {
+    if (!cachedHome?.adminByShop) return null;
+    return cachedHome.adminByShop[selectedShopId] || cachedHome.adminByShop['ALL'] || null;
+  }, [cachedHome, selectedShopId]);
+
+  const summary = isOfflineMode
+    ? cachedShopEntry?.periods?.[timeFilter] || null
+    : liveSummary;
 
   if (!canAccessDashboard || !currentUser || !summary) return null;
 
-  const settings = dbState.settings;
+  const settings = !isCloudLoaded && cachedHome?.settings ? cachedHome.settings : dbState.settings;
 
   const handleManualLiveRefresh = async () => {
     if (isRefreshingLive) return;
     setIsRefreshingLive(true);
     try {
       setTodayKey(toLocalYMD(new Date()));
-      await pullLatestNow(true);
+      const ok = await retryConnection();
+      if (!ok) {
+        addToast({
+          type: 'warning',
+          title: 'Still Offline',
+          description: 'Wait for internet connection to refresh live cloud data.',
+        });
+      }
     } finally {
       setIsRefreshingLive(false);
     }
   };
 
   // Inventory stats filtered by shop if specific shop is selected
-  const lowStockProducts = (dbState.products || []).filter(
-    p => p.status === 'ACTIVE' && p.currentStock <= p.minStock && (!selectedShopId || selectedShopId === 'ALL' || p.shopId === selectedShopId)
-  );
+  const lowStockCount = isOfflineMode
+    ? cachedShopEntry?.lowStockCount || 0
+    : (dbState.products || []).filter(
+        p =>
+          p.status === 'ACTIVE' &&
+          p.currentStock <= p.minStock &&
+          (!selectedShopId || selectedShopId === 'ALL' || p.shopId === selectedShopId)
+      ).length;
+
+  const recentSales =
+    'recentSales' in summary
+      ? summary.recentSales
+      : [...(summary.filteredSales || [])]
+          .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
+          .slice(0, 6);
 
   const shopScopeLabel = selectedShopId === 'ALL' 
     ? 'Company Overview (All Shops)' 
@@ -117,15 +162,23 @@ export const AdminDashboard: React.FC = () => {
       {/* Top Header & Range Filters */}
       <div className="flex flex-wrap items-center justify-between gap-4 mb-6 pb-4 border-b border-slate-800">
         <div>
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 flex-wrap">
             <h2 className="text-xl font-bold text-white tracking-tight">Executive Business Overview</h2>
             <span className="px-2 py-0.5 rounded-full bg-blue-500/20 text-blue-300 text-[10px] font-bold border border-blue-500/30">
               {shopScopeLabel}
             </span>
+            {isOfflineMode && (
+              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-amber-500/15 text-amber-300 text-[10px] font-bold border border-amber-500/35">
+                <WifiOff className="w-3 h-3" />
+                Cached Home (Offline)
+              </span>
+            )}
           </div>
           <p className="text-xs text-slate-400 mt-0.5">
-            {selectedShopId === 'ALL' 
-              ? 'Consolidated company-wide financial performance across all business units' 
+            {isOfflineMode && cachedHome?.cachedAt
+              ? `Offline snapshot cached ${formatDateTime(cachedHome.cachedAt)} • Reconnect to open other pages`
+              : selectedShopId === 'ALL'
+              ? 'Consolidated company-wide financial performance across all business units'
               : `Real-time analytics and financial metrics for ${currentShop?.name || 'selected shop'}`}
           </p>
         </div>
@@ -140,7 +193,7 @@ export const AdminDashboard: React.FC = () => {
             className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-800 text-xs font-semibold text-emerald-300 transition disabled:opacity-60"
           >
             <RefreshCw className={`w-3.5 h-3.5 ${isRefreshingLive ? 'animate-spin' : ''}`} />
-            <span>{isRefreshingLive ? 'Syncing...' : 'Refresh'}</span>
+            <span>{isRefreshingLive ? 'Syncing...' : isOfflineMode ? 'Retry Online' : 'Refresh'}</span>
           </button>
 
           <div className="flex items-center gap-1 bg-slate-900 p-1 rounded-xl border border-slate-800 text-xs font-semibold">
@@ -230,13 +283,13 @@ export const AdminDashboard: React.FC = () => {
       </div>
 
       {/* Low Stock Warning Box */}
-      {lowStockProducts.length > 0 && (
+      {lowStockCount > 0 && (
         <div className="mb-6 p-4 rounded-xl bg-amber-500/10 border border-amber-500/30 text-amber-200 flex items-center justify-between">
           <div className="flex items-center gap-3">
             <AlertTriangle className="w-5 h-5 text-amber-400 shrink-0" />
             <div>
               <h4 className="text-xs font-bold text-amber-300">
-                Action Required: {lowStockProducts.length} Product(s) Below Minimum Stock
+                Action Required: {lowStockCount} Product(s) Below Minimum Stock
               </h4>
               <p className="text-xs text-amber-200/80 mt-0.5">
                 Restock through the Purchases or Inventory adjustment module to prevent checkout shortages.
@@ -245,9 +298,14 @@ export const AdminDashboard: React.FC = () => {
           </div>
           <button
             onClick={() => setActiveTab('inventory')}
-            className="px-3.5 py-1.5 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 text-xs font-bold transition shrink-0"
+            className={`px-3.5 py-1.5 rounded-lg text-xs font-bold transition shrink-0 inline-flex items-center gap-1.5 ${
+              isOfflineMode
+                ? 'bg-slate-800 text-slate-400 border border-slate-700 cursor-not-allowed opacity-70'
+                : 'bg-amber-500 hover:bg-amber-400 text-slate-950'
+            }`}
           >
-            Manage Inventory
+            {isOfflineMode && <Lock className="w-3 h-3" />}
+            <span>Manage Inventory</span>
           </button>
         </div>
       )}
@@ -308,9 +366,14 @@ export const AdminDashboard: React.FC = () => {
             </div>
             <button
               onClick={() => setActiveTab('sellers')}
-              className="text-xs text-blue-400 hover:text-blue-300 font-semibold transition"
+              className={`text-xs font-semibold transition inline-flex items-center gap-1 ${
+                isOfflineMode
+                  ? 'text-slate-500 cursor-not-allowed'
+                  : 'text-blue-400 hover:text-blue-300'
+              }`}
             >
-              Manage Sellers
+              {isOfflineMode && <Lock className="w-3 h-3" />}
+              <span>Manage Sellers</span>
             </button>
           </div>
 
@@ -355,12 +418,21 @@ export const AdminDashboard: React.FC = () => {
         <div className="flex items-center justify-between mb-4">
           <div>
             <h3 className="text-sm font-bold text-white">Recent Transactions</h3>
-            <p className="text-xs text-slate-400 mt-0.5">Live store receipts saved to local database</p>
+            <p className="text-xs text-slate-400 mt-0.5">
+              {isOfflineMode
+                ? 'Cached Home snapshot (offline)'
+                : 'Live store transactions from cloud database'}
+            </p>
           </div>
           <button
             onClick={() => setActiveTab('sales')}
-            className="text-xs text-blue-400 hover:text-blue-300 font-semibold flex items-center gap-1 transition"
+            className={`text-xs font-semibold flex items-center gap-1 transition ${
+              isOfflineMode
+                ? 'text-slate-500 cursor-not-allowed'
+                : 'text-blue-400 hover:text-blue-300'
+            }`}
           >
+            {isOfflineMode && <Lock className="w-3 h-3" />}
             <span>View All Sales</span>
             <ArrowRight className="w-3.5 h-3.5" />
           </button>
@@ -382,14 +454,14 @@ export const AdminDashboard: React.FC = () => {
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-800/60">
-              {(summary.filteredSales || []).length === 0 ? (
+              {recentSales.length === 0 ? (
                 <tr>
                   <td colSpan={9} className="py-8 text-center text-slate-500">
                     No transactions found for the selected shop/period.
                   </td>
                 </tr>
               ) : (
-                (summary.filteredSales || []).slice(0, 6).map(sale => (
+                recentSales.map(sale => (
                   <tr key={sale.id} className="hover:bg-slate-850/60 transition">
                     <td className="py-3 font-mono font-semibold text-white">
                       <div>{sale.receiptNumber}</div>

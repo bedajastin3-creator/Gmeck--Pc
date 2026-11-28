@@ -4,6 +4,7 @@ import * as XLSX from 'xlsx';
 import { db } from '../db/storage';
 import { generateUUID } from '../utils/crypto';
 import { User, Product } from '../types';
+import { SyncService, CloudOperation } from './syncService';
 
 export interface ImportProgressInfo {
   stage: 'READING' | 'PARSING' | 'VALIDATING' | 'SAVING' | 'DONE';
@@ -195,158 +196,12 @@ export class ExcelImportService {
     return parseFloat(cleaned);
   }
 
-  public static commitImport(
+  public static async commitImport(
     rows: ExcelProductRow[],
     shopId: string,
     currentUser: User
-  ): { success: boolean; created: number; updated: number; errors: string[] } {
-    const shop = db.getShops().find(s => s.id === shopId);
-    if (!shop) {
-      return { success: false, created: 0, updated: 0, errors: ['Selected shop does not exist.'] };
-    }
-
-    const allProducts = [...db.getProducts()];
-    const now = new Date().toISOString();
-    let created = 0;
-    let updated = 0;
-    const errors: string[] = [];
-
-    rows.forEach(row => {
-      try {
-        const existingIndex = allProducts.findIndex(
-          p =>
-            p.shopId === shopId &&
-            p.name.toLowerCase().trim() === row.productName.toLowerCase().trim()
-        );
-
-        if (existingIndex !== -1) {
-          const existing = allProducts[existingIndex];
-          const prevStock = existing.currentStock || 0;
-          const newStock = prevStock + row.quantity;
-
-          const productId = existing.id;
-          allProducts[existingIndex] = {
-            ...existing,
-            purchasePrice: row.buyingPrice > 0 ? row.buyingPrice : existing.purchasePrice,
-            sellingPrice: row.sellingPrice,
-            currentStock: newStock,
-            updatedAt: now,
-          };
-
-          db.enqueueSync({
-            id: generateUUID(),
-            operation: 'UPDATE_PRODUCT',
-            entityType: 'PRODUCT',
-            entityId: productId,
-            payload: allProducts[existingIndex],
-            status: 'PENDING',
-            createdAt: now,
-          });
-
-          if (row.quantity > 0) {
-            db.saveMovements([
-              {
-                id: generateUUID(),
-                shopId: shop.id,
-                shopName: shop.name,
-                productId,
-                productName: row.productName,
-                previousQty: prevStock,
-                changeQty: row.quantity,
-                newQty: newStock,
-                type: 'ADJUSTMENT',
-                reason: `Excel import by ${currentUser.name}`,
-                userId: currentUser.id,
-                userName: currentUser.name,
-                createdAt: now,
-              },
-              ...db.getMovements(),
-            ]);
-          }
-
-          updated++;
-        } else {
-          const productId = generateUUID();
-          const sku = `SKU-${Date.now().toString().slice(-6)}-${Math.floor(Math.random() * 900 + 100)}`;
-          const barcode = `${Math.floor(100000000000 + Math.random() * 900000000000)}`;
-
-          const newProduct: Product = {
-            id: productId,
-            shopId,
-            name: row.productName,
-            sku,
-            barcode,
-            categoryId: '',
-            sellingPrice: row.sellingPrice,
-            purchasePrice: row.buyingPrice || 0,
-            currentStock: row.quantity,
-            minStock: 5,
-            unit: 'pcs',
-            status: 'ACTIVE',
-            createdAt: now,
-            updatedAt: now,
-          };
-
-          allProducts.push(newProduct);
-
-          db.enqueueSync({
-            id: generateUUID(),
-            operation: 'CREATE_PRODUCT',
-            entityType: 'PRODUCT',
-            entityId: productId,
-            payload: newProduct,
-            status: 'PENDING',
-            createdAt: now,
-          });
-
-          if (row.quantity > 0) {
-            db.saveMovements([
-              {
-                id: generateUUID(),
-                shopId: shop.id,
-                shopName: shop.name,
-                productId,
-                productName: row.productName,
-                previousQty: 0,
-                changeQty: row.quantity,
-                newQty: row.quantity,
-                type: 'ADJUSTMENT',
-                reason: `Excel import by ${currentUser.name}`,
-                userId: currentUser.id,
-                userName: currentUser.name,
-                createdAt: now,
-              },
-              ...db.getMovements(),
-            ]);
-          }
-
-          created++;
-        }
-      } catch (err: any) {
-        errors.push(`"${row.productName}": ${err.message}`);
-      }
-    });
-
-    if (created > 0 || updated > 0) {
-      db.saveProducts(allProducts);
-
-      db.addImportHistory({
-        id: generateUUID(),
-        fileName: 'Excel Import',
-        dataType: 'PRODUCTS',
-        totalRecords: rows.length,
-        successCount: created + updated,
-        failedCount: errors.length,
-        createdCount: created,
-        updatedCount: updated,
-        importedByUserId: currentUser.id,
-        importedByName: currentUser.name,
-        createdAt: now,
-        notes: `Imported to ${shop.name}`,
-      });
-    }
-
-    return { success: errors.length === 0, created, updated, errors };
+  ): Promise<{ success: boolean; created: number; updated: number; errors: string[] }> {
+    return this.commitImportAsync(rows, shopId, currentUser);
   }
 
   public static async commitImportAsync(
@@ -371,7 +226,7 @@ export class ExcelImportService {
     const allProducts = [...db.getProducts()];
     const existingMovements = [...db.getMovements()];
     const newMovements: import('../types').InventoryMovement[] = [];
-    const syncQueueBatch: import('../types').SyncQueueItem[] = [];
+    const cloudOps: CloudOperation[] = [];
 
     const now = new Date().toISOString();
     let created = 0;
@@ -481,14 +336,12 @@ export class ExcelImportService {
 
           allProducts[existingIndex] = updatedProduct;
 
-          syncQueueBatch.push({
+          cloudOps.push({
             id: generateUUID(),
             operation: 'UPDATE_PRODUCT',
             entityType: 'PRODUCT',
             entityId: existing.id,
             payload: updatedProduct,
-            status: 'PENDING',
-            createdAt: now,
           });
 
           if (row.quantity > 0) {
@@ -560,14 +413,12 @@ export class ExcelImportService {
 
           allProducts.push(newProduct);
 
-          syncQueueBatch.push({
+          cloudOps.push({
             id: generateUUID(),
             operation: 'CREATE_PRODUCT',
             entityType: 'PRODUCT',
             entityId: productId,
             payload: newProduct,
-            status: 'PENDING',
-            createdAt: now,
           });
 
           if (row.quantity > 0) {
@@ -611,12 +462,29 @@ export class ExcelImportService {
     }
 
     if (created > 0 || updated > 0) {
+      if (cloudOps.length > 0) {
+        onProgress?.({
+          stage: 'SAVING',
+          percent: 96,
+          processedRows: totalRows,
+          totalRows,
+          message: `Saving ${cloudOps.length.toLocaleString()} product(s) to cloud database...`,
+        });
+
+        const commitRes = await SyncService.commitOperations(cloudOps);
+        if (!commitRes.success) {
+          return {
+            success: false,
+            created: 0,
+            updated: 0,
+            errors: [commitRes.error || 'Failed to save imported products to cloud database.'],
+          };
+        }
+      }
+
       db.saveProducts(allProducts);
       if (newMovements.length > 0) {
         db.saveMovements([...newMovements.reverse(), ...existingMovements]);
-      }
-      if (syncQueueBatch.length > 0) {
-        db.enqueueSyncBatch(syncQueueBatch);
       }
 
       db.addImportHistory({

@@ -421,10 +421,10 @@ export const AdminProducts: React.FC = () => {
     }
   };
 
-  const handleDeleteProduct = () => {
+  const handleDeleteProduct = async () => {
     if (!deletingProduct || !currentUser) return;
 
-    const res = ProductService.deleteProduct(deletingProduct.id, currentUser);
+    const res = await ProductService.deleteProduct(deletingProduct.id, currentUser);
 
     if (res.success) {
       addToast({
@@ -471,7 +471,7 @@ export const AdminProducts: React.FC = () => {
     setProductsSubTab('category_list');
   };
 
-  const handleSaveCategory = (e: React.FormEvent) => {
+  const handleSaveCategory = async (e: React.FormEvent) => {
     e.preventDefault();
     setCatModalError('');
 
@@ -486,7 +486,7 @@ export const AdminProducts: React.FC = () => {
     }
 
     if (editingCategory) {
-      const res = CategoryService.updateCategory(
+      const res = await CategoryService.updateCategory(
         editingCategory.id,
         { name: catNameInput.trim(), shopId: catShopIdInput, color: catColorInput },
         currentUser
@@ -504,7 +504,7 @@ export const AdminProducts: React.FC = () => {
         setCatModalError(res.error || 'Failed to update category.');
       }
     } else {
-      const res = CategoryService.createCategory(
+      const res = await CategoryService.createCategory(
         { name: catNameInput.trim(), shopId: catShopIdInput, color: catColorInput },
         currentUser
       );
@@ -529,8 +529,8 @@ export const AdminProducts: React.FC = () => {
     }
   };
 
-  const handleToggleCategoryStatus = (cat: Category) => {
-    const res = CategoryService.toggleCategoryStatus(cat.id, currentUser);
+  const handleToggleCategoryStatus = async (cat: Category) => {
+    const res = await CategoryService.toggleCategoryStatus(cat.id, currentUser);
     if (res.success) {
       addToast({
         type: 'info',

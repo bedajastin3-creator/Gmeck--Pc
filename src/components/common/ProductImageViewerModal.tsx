@@ -215,7 +215,7 @@ export const ProductImageViewerModal: React.FC<ProductImageViewerModalProps> = (
           </div>
 
           <div className="text-[11px] text-slate-500">
-            {totalImages > 1 ? 'Use ‹ Left and Right › arrows to switch photos' : 'Stored locally for offline viewing'}
+            {totalImages > 1 ? 'Use ‹ Left and Right › arrows to switch photos' : 'Synced with cloud product catalog'}
           </div>
         </div>
       </div>

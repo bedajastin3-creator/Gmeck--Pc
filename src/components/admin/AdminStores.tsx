@@ -1376,7 +1376,7 @@ export const AdminStores: React.FC = () => {
     setIsStoreModalOpen(true);
   };
 
-  const handleSaveStore = (e: React.FormEvent) => {
+  const handleSaveStore = async (e: React.FormEvent) => {
     e.preventDefault();
     setStoreFormError('');
 
@@ -1390,7 +1390,7 @@ export const AdminStores: React.FC = () => {
     }
 
     const res = editingStore
-      ? StoreService.updateStore(
+      ? await StoreService.updateStore(
           editingStore.id,
           {
             name: storeName.trim(),
@@ -1399,7 +1399,7 @@ export const AdminStores: React.FC = () => {
           },
           currentUser
         )
-      : StoreService.createStore(
+      : await StoreService.createStore(
           {
             name: storeName.trim(),
             location: storeLocation.trim() || undefined,
@@ -1415,7 +1415,7 @@ export const AdminStores: React.FC = () => {
         title: editingStore ? 'Store Updated' : 'Store Created',
         description: editingStore
           ? `Store "${storeName.trim()}" updated.`
-          : `Store "${storeName.trim()}" assigned to ${assignedShop?.name || 'shop'} and queued for sync.`,
+          : `Store "${storeName.trim()}" assigned to ${assignedShop?.name || 'shop'} and saved to cloud.`,
       });
       setIsStoreModalOpen(false);
     } else {
@@ -1423,8 +1423,8 @@ export const AdminStores: React.FC = () => {
     }
   };
 
-  const handleConfirmDeleteStore = (store: Store) => {
-    const res = StoreService.deleteStore(store.id, currentUser);
+  const handleConfirmDeleteStore = async (store: Store) => {
+    const res = await StoreService.deleteStore(store.id, currentUser);
     if (res.success) {
       if (selectedInventoryStoreId === store.id) {
         setSelectedInventoryStoreId('ALL_COMBINED');
@@ -1438,7 +1438,7 @@ export const AdminStores: React.FC = () => {
       addToast({
         type: 'success',
         title: 'Store Deleted',
-        description: `"${store.name}" has been deleted and queued for sync.`,
+        description: `"${store.name}" has been deleted from cloud database.`,
       });
       setDeletingStore(null);
     } else {
@@ -1673,8 +1673,8 @@ export const AdminStores: React.FC = () => {
     };
 
     const res = editingTransferId
-      ? StoreService.updateStockTransfer(editingTransferId, payload, currentUser)
-      : StoreService.executeStockTransfer(payload, currentUser);
+      ? await StoreService.updateStockTransfer(editingTransferId, payload, currentUser)
+      : await StoreService.executeStockTransfer(payload, currentUser);
 
     if (res.success && res.transfer) {
       setTransferProgressPct(100);
@@ -1712,7 +1712,7 @@ export const AdminStores: React.FC = () => {
     }
   };
 
-  const handleConfirmDeleteTransfer = (transfer: StockTransfer & { isLegacy?: boolean }) => {
+  const handleConfirmDeleteTransfer = async (transfer: StockTransfer & { isLegacy?: boolean }) => {
     if (transfer.isLegacy) {
       addToast({
         type: 'warning',
@@ -1723,7 +1723,7 @@ export const AdminStores: React.FC = () => {
       return;
     }
 
-    const res = StoreService.deleteStockTransfer(transfer.id, currentUser);
+    const res = await StoreService.deleteStockTransfer(transfer.id, currentUser);
     if (res.success) {
       addToast({
         type: 'success',
@@ -2236,14 +2236,14 @@ export const AdminStores: React.FC = () => {
     setActiveSubTab('transfer');
   };
 
-  const handleConfirmDeleteProduct = () => {
+  const handleConfirmDeleteProduct = async () => {
     if (!deletingProduct) return;
-    const res = ProductService.deleteProduct(deletingProduct.id, currentUser);
+    const res = await ProductService.deleteProduct(deletingProduct.id, currentUser);
     if (res.success) {
       addToast({
         type: 'success',
         title: 'Product Deleted',
-        description: `"${deletingProduct.name}" has been deleted and queued for sync.`,
+        description: `"${deletingProduct.name}" has been deleted from cloud database.`,
       });
       if (deletingProduct.id in selectedTransferMap) {
         setSelectedTransferMap(prev => {

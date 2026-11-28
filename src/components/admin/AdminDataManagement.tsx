@@ -563,11 +563,11 @@ export const AdminDataManagement: React.FC = () => {
     setQbImportResult(null);
   };
 
-  const handleExecuteQBImport = () => {
+  const handleExecuteQBImport = async () => {
     if (!qbImportText.trim()) return;
 
     setIsProcessingQB(true);
-    const result = QuickBooksService.parseAndImportIIF(qbImportText, currentUser);
+    const result = await QuickBooksService.parseAndImportIIF(qbImportText, currentUser);
     setIsProcessingQB(false);
     setQbImportResult(result);
 
@@ -575,7 +575,13 @@ export const AdminDataManagement: React.FC = () => {
       addToast({
         type: 'success',
         title: 'QuickBooks Import Complete',
-        description: `Imported ${result.itemsImported} products.`,
+        description: `Imported ${result.itemsImported} products to cloud database.`,
+      });
+    } else {
+      addToast({
+        type: 'error',
+        title: 'QuickBooks Import Failed',
+        description: result.error || 'Could not import QuickBooks products.',
       });
     }
   };
@@ -591,8 +597,14 @@ export const AdminDataManagement: React.FC = () => {
     if (result.success) {
       addToast({
         type: 'success',
-        title: 'Sync Successful',
-        description: result.message || `Synchronized ${result.processedCount} records.`,
+        title: 'Cloud Refresh Successful',
+        description: result.message || 'Live data refreshed from cloud database.',
+      });
+    } else {
+      addToast({
+        type: 'error',
+        title: 'Offline',
+        description: result.message || 'You are offline. Wait for internet connection.',
       });
     }
   };
@@ -679,7 +691,7 @@ export const AdminDataManagement: React.FC = () => {
             }`}
           >
             <Cloud className="w-4 h-4" />
-            <span>Sync ({queueStats.pending})</span>
+            <span>Cloud Sync</span>
           </button>
         </div>
       )}
@@ -1393,9 +1405,9 @@ export const AdminDataManagement: React.FC = () => {
         <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 sm:p-6 space-y-4">
           <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
             <div>
-              <h3 className="font-bold text-sm text-white">Offline Sync Queue</h3>
+              <h3 className="font-bold text-sm text-white">Cloud Database Sync</h3>
               <p className="text-[11px] sm:text-xs text-slate-400 mt-0.5">
-                Local changes waiting to sync with cloud
+                Online-only mode: every change commits immediately to the cloud database
               </p>
             </div>
 

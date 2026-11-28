@@ -4,13 +4,13 @@ import { useApp } from '../../context/AppContext';
 import { formatCurrency, formatDateTime } from '../../utils/formatters';
 
 export const ReceiptModal: React.FC = () => {
-  const { activeReceipt, closeReceipt, dbState, addToast } = useApp();
+  const { activeReceipt, closeReceipt, dbState, addToast, isCloudLoaded, cachedHome } = useApp();
   const [copied, setCopied] = React.useState(false);
   const printRef = useRef<HTMLDivElement>(null);
 
   if (!activeReceipt) return null;
 
-  const settings = dbState.settings;
+  const settings = !isCloudLoaded && cachedHome?.settings ? cachedHome.settings : dbState.settings;
 
   const handlePrint = () => {
     window.print();

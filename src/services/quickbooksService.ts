@@ -1,6 +1,7 @@
 import { db } from '../db/storage';
 import { Product, User } from '../types';
 import { generateUUID } from '../utils/crypto';
+import { SyncService, CloudOperation } from './syncService';
 
 export class QuickBooksService {
   /**
@@ -16,12 +17,12 @@ INVITEM\tLED Work Light\tPART\tRechargeable 1000lm Floodlight\t24.99\t12.00\t18\
   }
 
   /**
-   * Parse QuickBooks IIF item list text and import products into local DB.
+   * Parse QuickBooks IIF item list text and import products directly to cloud DB.
    */
-  public static parseAndImportIIF(
+  public static async parseAndImportIIF(
     iifText: string,
     currentUser: User
-  ): { success: boolean; itemsImported: number; skipped: number; error?: string } {
+  ): Promise<{ success: boolean; itemsImported: number; skipped: number; error?: string }> {
     if (currentUser.role !== 'ADMIN') {
       return { success: false, itemsImported: 0, skipped: 0, error: 'Only administrators can import QuickBooks files.' };
     }
@@ -39,10 +40,11 @@ INVITEM\tLED Work Light\tPART\tRechargeable 1000lm Floodlight\t24.99\t12.00\t18\
       let qtyIdx = 6;
       let skuIdx = 1;
 
-      const existingProducts = db.getProducts();
+      const existingProducts = [...db.getProducts()];
       const defaultShopId = db.getShops()[0]?.id || 'shop-1';
       let imported = 0;
       let skipped = 0;
+      const cloudOps: CloudOperation[] = [];
 
       for (const line of lines) {
         if (line.startsWith('!INVITEM')) {
@@ -98,7 +100,25 @@ INVITEM\tLED Work Light\tPART\tRechargeable 1000lm Floodlight\t24.99\t12.00\t18\
         };
 
         existingProducts.unshift(newProd);
+        cloudOps.push({
+          operation: 'CREATE_PRODUCT',
+          entityType: 'PRODUCT',
+          entityId: newProd.id,
+          payload: newProd,
+        });
         imported++;
+      }
+
+      if (cloudOps.length > 0) {
+        const commitRes = await SyncService.commitOperations(cloudOps);
+        if (!commitRes.success) {
+          return {
+            success: false,
+            itemsImported: 0,
+            skipped,
+            error: commitRes.error || 'Failed to save QuickBooks products to cloud database.',
+          };
+        }
       }
 
       if (imported > 0) {

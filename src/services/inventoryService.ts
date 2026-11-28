@@ -2,6 +2,8 @@ import { db } from '../db/storage';
 import { InventoryMovement, MovementType, User } from '../types';
 import { generateUUID } from '../utils/crypto';
 import { getAdminManagedShops, hasAdminAccess, isPlatformAdmin, isShopAdmin } from '../utils/permissions';
+import { CloudflareApi } from './cloudflareApi';
+import { SyncService } from './syncService';
 
 function getAllowedShopIdsForInventory(currentUser?: User): Set<string> | null {
   if (!currentUser || isPlatformAdmin(currentUser)) return null;
@@ -16,14 +18,14 @@ export class InventoryService {
    * Adjust stock manually for count correction, damage, loss, or physical inventory.
    * Admin, Shop Admin, OR Seller with canManageInventory permission.
    */
-  public static adjustStock(
+  public static async adjustStock(
     productId: string,
     newQuantity: number,
     reason: string,
     currentUser: User,
     movementType: MovementType = 'ADJUSTMENT',
     options?: { targetLocation?: 'SHOP' | string } | string
-  ): { success: boolean; error?: string; lossValue?: number } {
+  ): Promise<{ success: boolean; error?: string; lossValue?: number }> {
     if (!hasAdminAccess(currentUser) && !currentUser.permissions?.canManageInventory) {
       return { success: false, error: 'Permission Denied: You do not have permission to adjust stock levels.' };
     }
@@ -61,7 +63,6 @@ export class InventoryService {
 
     const nowMs = Date.now();
     const nowIso = new Date(nowMs).toISOString();
-    const followUpIso = new Date(nowMs + 5).toISOString();
 
     if (targetStore) {
       const shopWarehouses = allStores.filter(s => s.shopId === prod.shopId && !s.isShopFloor);
@@ -124,9 +125,6 @@ export class InventoryService {
         updatedAt: nowIso,
       };
 
-      products[prodIndex] = updatedProduct;
-      db.saveProducts(products);
-
       const costValue = Number((Math.abs(diff) * (prod.purchasePrice || 0)).toFixed(2));
       const movement: InventoryMovement = {
         id: generateUUID(),
@@ -145,28 +143,29 @@ export class InventoryService {
         userName: currentUser.name,
         createdAt: nowIso,
       };
+
+      const commit = await SyncService.commitOperations([
+        {
+          operation: 'STOCK_ADJUSTMENT',
+          entityType: 'INVENTORY',
+          entityId: movement.id,
+          payload: movement,
+        },
+        {
+          operation: 'UPDATE_PRODUCT',
+          entityType: 'PRODUCT',
+          entityId: updatedProduct.id,
+          payload: updatedProduct,
+        },
+      ]);
+      if (!commit.success) {
+        return { success: false, error: commit.error || CloudflareApi.OFFLINE_ERROR_MESSAGE };
+      }
+
+      const nextProducts = [...products];
+      nextProducts[prodIndex] = updatedProduct;
+      db.saveProducts(nextProducts);
       db.saveMovements([movement, ...db.getMovements()]);
-
-      db.enqueueSync({
-        id: generateUUID(),
-        operation: 'STOCK_ADJUSTMENT',
-        entityType: 'INVENTORY',
-        entityId: movement.id,
-        payload: movement,
-        status: 'PENDING',
-        createdAt: nowIso,
-      });
-
-      // Also enqueue full product update so store_stocks / store_details / aggregate store_stock stay accurate in D1
-      db.enqueueSync({
-        id: generateUUID(),
-        operation: 'UPDATE_PRODUCT',
-        entityType: 'PRODUCT',
-        entityId: updatedProduct.id,
-        payload: updatedProduct,
-        status: 'PENDING',
-        createdAt: followUpIso,
-      });
 
       db.addAuditLog({
         id: generateUUID(),
@@ -233,9 +232,6 @@ export class InventoryService {
       updatedAt: nowIso,
     };
 
-    products[prodIndex] = updatedProduct;
-    db.saveProducts(products);
-
     const movement: InventoryMovement = {
       id: generateUUID(),
       shopId: prod.shopId,
@@ -252,30 +248,33 @@ export class InventoryService {
       userName: currentUser.name,
       createdAt: nowIso,
     };
-    db.saveMovements([movement, ...db.getMovements()]);
 
-    // Include ALL movement data in sync payload
-    db.enqueueSync({
-      id: generateUUID(),
-      operation: 'STOCK_ADJUSTMENT',
-      entityType: 'INVENTORY',
-      entityId: movement.id,
-      payload: movement,
-      status: 'PENDING',
-      createdAt: nowIso,
-    });
-
+    const ops: any[] = [
+      {
+        operation: 'STOCK_ADJUSTMENT',
+        entityType: 'INVENTORY',
+        entityId: movement.id,
+        payload: movement,
+      },
+    ];
     if (updatedFloorMap) {
-      db.enqueueSync({
-        id: generateUUID(),
+      ops.push({
         operation: 'UPDATE_PRODUCT',
         entityType: 'PRODUCT',
         entityId: updatedProduct.id,
         payload: updatedProduct,
-        status: 'PENDING',
-        createdAt: followUpIso,
       });
     }
+
+    const commit = await SyncService.commitOperations(ops);
+    if (!commit.success) {
+      return { success: false, error: commit.error || CloudflareApi.OFFLINE_ERROR_MESSAGE };
+    }
+
+    const nextProducts = [...products];
+    nextProducts[prodIndex] = updatedProduct;
+    db.saveProducts(nextProducts);
+    db.saveMovements([movement, ...db.getMovements()]);
 
     db.addAuditLog({
       id: generateUUID(),
@@ -295,12 +294,12 @@ export class InventoryService {
    * Receive fast stock-in.
    * Admin, Shop Admin, OR Seller with canManageInventory permission.
    */
-  public static stockIn(
+  public static async stockIn(
     productId: string,
     addQuantity: number,
     reason: string,
     currentUser: User
-  ): { success: boolean; error?: string } {
+  ): Promise<{ success: boolean; error?: string }> {
     if (!hasAdminAccess(currentUser) && !currentUser.permissions?.canManageInventory) {
       return { success: false, error: 'Permission Denied: You do not have permission to perform stock-in.' };
     }

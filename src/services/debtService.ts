@@ -1,6 +1,7 @@
 import { db } from '../db/storage';
 import { DebtRecord, DebtSummary, DebtType, DebtStatus, DebtPayment, User } from '../types';
-import { generateUUID } from '../utils/crypto';
+import { CloudflareApi } from './cloudflareApi';
+import { SyncService } from './syncService';
 
 export class DebtService {
   /**
@@ -148,7 +149,7 @@ export class DebtService {
   /**
    * Create a new independent debt record
    */
-  public static createDebt(
+  public static async createDebt(
     input: {
       type: DebtType;
       debtorName: string;
@@ -160,7 +161,7 @@ export class DebtService {
       shopId?: string;
     },
     user: User
-  ): DebtRecord {
+  ): Promise<{ success: boolean; debt?: DebtRecord; error?: string }> {
     const id = `debt-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
     const now = new Date().toISOString();
     const totalAmt = Math.max(0, Number(input.amount));
@@ -202,25 +203,25 @@ export class DebtService {
       updatedAt: now,
     };
 
-    db.addDebt(record);
-
-    db.enqueueSync({
-      id: generateUUID(),
+    const commit = await SyncService.commitOperation({
       operation: 'CREATE_DEBT',
       entityType: 'DEBT',
       entityId: record.id,
       payload: record,
-      status: 'PENDING',
-      createdAt: now,
     });
+    if (!commit.success) {
+      return { success: false, error: commit.error || CloudflareApi.OFFLINE_ERROR_MESSAGE };
+    }
 
-    return record;
+    db.addDebt(record);
+
+    return { success: true, debt: record };
   }
 
   /**
    * Record a partial or full payment on a debt with ownership check
    */
-  public static recordPayment(
+  public static async recordPayment(
     debtId: string,
     paymentAmount: number,
     user: User,
@@ -229,7 +230,7 @@ export class DebtService {
       paymentMethod?: string;
       notes?: string;
     }
-  ): { success: boolean; debt?: DebtRecord; error?: string } {
+  ): Promise<{ success: boolean; debt?: DebtRecord; error?: string }> {
     const rawDebts = db.getDebts();
     const existing = rawDebts.find(d => d.id === debtId);
     if (!existing) {
@@ -295,19 +296,19 @@ export class DebtService {
         : {}),
     };
 
-    db.updateDebt(debtId, patch);
-
     const updated = { ...existing, ...patch };
 
-    db.enqueueSync({
-      id: generateUUID(),
+    const commit = await SyncService.commitOperation({
       operation: 'UPDATE_DEBT',
       entityType: 'DEBT',
       entityId: debtId,
       payload: updated,
-      status: 'PENDING',
-      createdAt: now,
     });
+    if (!commit.success) {
+      return { success: false, error: commit.error || CloudflareApi.OFFLINE_ERROR_MESSAGE };
+    }
+
+    db.updateDebt(debtId, patch);
 
     return { success: true, debt: updated };
   }
@@ -315,99 +316,111 @@ export class DebtService {
   /**
    * Mark a debt as fully Paid with ownership check
    */
-  public static markAsPaid(
+  public static async markAsPaid(
     debtId: string,
     user: User,
     paymentNotes?: string,
     paymentDate: string = new Date().toISOString()
-  ): boolean {
+  ): Promise<{ success: boolean; error?: string }> {
     const rawDebts = db.getDebts();
     const existing = rawDebts.find(d => d.id === debtId);
-    if (!existing) return false;
+    if (!existing) return { success: false, error: 'Debt not found.' };
 
-    // Ownership check
     if (user.role === 'SELLER' && existing.createdByUserId !== user.id) {
-      return false;
+      return { success: false, error: 'You can only manage your own debts.' };
     }
 
     const currentPaid = existing.paidAmount || 0;
-    const currentRemaining = existing.remainingAmount !== undefined ? existing.remainingAmount : Math.max(0, existing.amount - currentPaid);
+    const currentRemaining =
+      existing.remainingAmount !== undefined
+        ? existing.remainingAmount
+        : Math.max(0, existing.amount - currentPaid);
 
-    const res = this.recordPayment(debtId, currentRemaining > 0 ? currentRemaining : existing.amount, user, {
-      paymentDate: paymentDate.slice(0, 10),
-      notes: paymentNotes,
-      paymentMethod: 'CASH',
-    });
+    const res = await this.recordPayment(
+      debtId,
+      currentRemaining > 0 ? currentRemaining : existing.amount,
+      user,
+      {
+        paymentDate: paymentDate.slice(0, 10),
+        notes: paymentNotes,
+        paymentMethod: 'CASH',
+      }
+    );
 
-    return res.success;
+    return { success: res.success, error: res.error };
   }
 
   /**
    * Update an existing debt record with ownership check
    */
-  public static updateDebt(debtId: string, patch: Partial<DebtRecord>, currentUser?: User): boolean {
+  public static async updateDebt(
+    debtId: string,
+    patch: Partial<DebtRecord>,
+    currentUser?: User
+  ): Promise<{ success: boolean; error?: string }> {
     const rawDebts = db.getDebts();
     const existing = rawDebts.find(d => d.id === debtId);
-    if (!existing) return false;
+    if (!existing) return { success: false, error: 'Debt not found.' };
 
-    // Ownership check
     if (currentUser && currentUser.role === 'SELLER' && existing.createdByUserId !== currentUser.id) {
-      return false;
+      return { success: false, error: 'You can only manage your own debts.' };
     }
 
-    if (patch.amount !== undefined) {
-      const paid = patch.paidAmount !== undefined ? patch.paidAmount : (existing.paidAmount || 0);
-      patch.remainingAmount = Math.max(0, patch.amount - paid);
-      if (patch.remainingAmount <= 0) {
-        patch.status = 'PAID';
+    const nextPatch: Partial<DebtRecord> = { ...patch };
+    if (nextPatch.amount !== undefined) {
+      const paid = nextPatch.paidAmount !== undefined ? nextPatch.paidAmount : existing.paidAmount || 0;
+      nextPatch.remainingAmount = Math.max(0, nextPatch.amount - paid);
+      if (nextPatch.remainingAmount <= 0) {
+        nextPatch.status = 'PAID';
       }
     }
 
-    patch.updatedAt = new Date().toISOString();
-    db.updateDebt(debtId, patch);
+    nextPatch.updatedAt = new Date().toISOString();
+    const updated = { ...existing, ...nextPatch };
 
-    const updated = { ...existing, ...patch };
-    db.enqueueSync({
-      id: generateUUID(),
+    const commit = await SyncService.commitOperation({
       operation: 'UPDATE_DEBT',
       entityType: 'DEBT',
       entityId: debtId,
       payload: updated,
-      status: 'PENDING',
-      createdAt: new Date().toISOString(),
     });
+    if (!commit.success) {
+      return { success: false, error: commit.error || CloudflareApi.OFFLINE_ERROR_MESSAGE };
+    }
 
-    return true;
+    db.updateDebt(debtId, nextPatch);
+
+    return { success: true };
   }
 
   /**
    * Delete or archive a debt record with ownership check
    * Admin can delete any, Seller can only delete their own
    */
-  public static deleteDebt(debtId: string, currentUser?: User): boolean {
+  public static async deleteDebt(
+    debtId: string,
+    currentUser?: User
+  ): Promise<{ success: boolean; error?: string }> {
     const rawDebts = db.getDebts();
     const existing = rawDebts.find(d => d.id === debtId);
-    if (!existing) return false;
+    if (!existing) return { success: false, error: 'Debt not found.' };
 
-    // Ownership check
     if (currentUser && currentUser.role === 'SELLER' && existing.createdByUserId !== currentUser.id) {
-      return false;
+      return { success: false, error: 'You can only delete your own debts.' };
     }
 
-    // Delete from local database
-    db.deleteDebt(debtId);
-
-    // CRITICAL FIX: Enqueue DELETE_DEBT sync operation
-    db.enqueueSync({
-      id: generateUUID(),
+    const commit = await SyncService.commitOperation({
       operation: 'DELETE_DEBT',
       entityType: 'DEBT',
       entityId: debtId,
       payload: { id: debtId },
-      status: 'PENDING',
-      createdAt: new Date().toISOString(),
     });
+    if (!commit.success) {
+      return { success: false, error: commit.error || CloudflareApi.OFFLINE_ERROR_MESSAGE };
+    }
 
-    return true;
+    db.deleteDebt(debtId);
+
+    return { success: true };
   }
 }

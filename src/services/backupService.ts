@@ -52,13 +52,9 @@ export class BackupService {
       return { success: false, message: 'Permission Denied: Only Admin can upload backups.' };
     }
 
-    if (CloudflareApi.DISCONNECTED_MODE) {
-      return { success: false, message: 'External cloud storage is currently disconnected. Please use the Local JSON Backup export below.' };
-    }
-
     const online = await CloudflareApi.checkConnection();
     if (!online) {
-      return { success: false, message: 'Offline: Cannot upload backup to cloud.' };
+      return { success: false, message: CloudflareApi.OFFLINE_ERROR_MESSAGE };
     }
 
     try {

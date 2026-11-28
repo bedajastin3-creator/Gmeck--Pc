@@ -1,4 +1,5 @@
 import React from 'react';
+import { WifiOff, RefreshCw } from 'lucide-react';
 import { AppProvider, useApp } from './context/AppContext';
 import { Header } from './components/common/Header';
 import { Sidebar } from './components/common/Sidebar';
@@ -34,13 +35,81 @@ import { AdminDataManagement } from './components/admin/AdminDataManagement';
 import { AdminSettings } from './components/admin/AdminSettings';
 
 const MainLayout: React.FC = () => {
-  const { currentUser, activeTab } = useApp();
+  const {
+    currentUser,
+    activeTab,
+    isOnline,
+    isCloudLoaded,
+    isInitialLoading,
+    cloudError,
+    cachedHome,
+    retryConnection,
+  } = useApp();
+
+  const canShowCachedHome = Boolean(currentUser && cachedHome);
+
+  if (!isCloudLoaded && !canShowCachedHome) {
+    return (
+      <div className="min-h-screen w-screen bg-slate-950 text-slate-100 flex items-center justify-center p-6 select-none font-sans">
+        <div className="max-w-md w-full bg-slate-900 border border-slate-800 rounded-2xl p-8 text-center shadow-2xl">
+          {isInitialLoading ? (
+            <>
+              <div className="w-16 h-16 rounded-2xl bg-blue-500/15 border border-blue-500/30 flex items-center justify-center mx-auto mb-5">
+                <RefreshCw className="w-8 h-8 text-blue-400 animate-spin" />
+              </div>
+              <h2 className="text-xl font-bold text-white mb-2">
+                Connecting to Live Database...
+              </h2>
+              <p className="text-sm text-slate-400">
+                Loading your online business data. Please wait a moment.
+              </p>
+            </>
+          ) : (
+            <>
+              <div className="w-16 h-16 rounded-2xl bg-rose-500/15 border border-rose-500/30 flex items-center justify-center mx-auto mb-5">
+                <WifiOff className="w-8 h-8 text-rose-400" />
+              </div>
+              <h2 className="text-xl font-bold text-white mb-2">
+                You are offline
+              </h2>
+              <p className="text-sm text-slate-300 mb-2">
+                Wait for internet connection.
+              </p>
+              <p className="text-xs text-slate-400 mb-6">
+                {cloudError ||
+                  'No data can be loaded because this system operates online only. Check your internet connection and try again.'}
+              </p>
+              <button
+                type="button"
+                onClick={() => retryConnection()}
+                className="w-full flex items-center justify-center gap-2 py-2.5 px-4 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-sm font-semibold transition cursor-pointer"
+              >
+                <RefreshCw className="w-4 h-4" />
+                <span>Retry Connection</span>
+              </button>
+            </>
+          )}
+        </div>
+        <ToastContainer />
+      </div>
+    );
+  }
 
   if (!currentUser) {
-    return <LoginView />;
+    return (
+      <>
+        <LoginView />
+        <ToastContainer />
+      </>
+    );
   }
 
   const renderActiveView = () => {
+    // Offline mode: always display cached Home only and lock every other page
+    if (!isOnline || !isCloudLoaded) {
+      return hasAdminAccess(currentUser) ? <AdminDashboard /> : <SellerDashboard />;
+    }
+
     // Non-admin sellers can access New Sale (POS), Account Settings, and Shop Expenses if permitted
     if (!hasAdminAccess(currentUser)) {
       const permissions = currentUser.permissions || {};
@@ -170,6 +239,24 @@ const MainLayout: React.FC = () => {
   return (
     <div id="omnibiz-pos-app" className="h-screen w-screen flex flex-col bg-slate-950 text-slate-100 overflow-hidden select-none font-sans">
       <Header />
+      {(!isOnline || !isCloudLoaded) && (
+        <div className="px-4 py-2 bg-rose-950/90 border-b border-rose-500/40 text-rose-200 text-xs flex items-center justify-between gap-3 shrink-0">
+          <div className="flex items-center gap-2 font-medium">
+            <WifiOff className="w-4 h-4 text-rose-400 shrink-0" />
+            <span>
+              You are offline — Viewing cached Home. Connect to the internet to open other pages.
+            </span>
+          </div>
+          <button
+            type="button"
+            onClick={() => retryConnection()}
+            className="px-2.5 py-1 rounded-md bg-rose-500/20 hover:bg-rose-500/30 border border-rose-400/30 text-rose-100 font-semibold flex items-center gap-1.5 shrink-0 cursor-pointer"
+          >
+            <RefreshCw className="w-3 h-3" />
+            <span>Retry</span>
+          </button>
+        </div>
+      )}
       <div className="flex-1 flex overflow-hidden">
         <Sidebar />
         <main className="flex-1 flex flex-col min-w-0 overflow-hidden bg-slate-950">

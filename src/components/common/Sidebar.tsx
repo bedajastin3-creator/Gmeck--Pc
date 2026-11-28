@@ -82,7 +82,20 @@ export const Sidebar: React.FC = () => {
     openSellersSubTab,
     sellerColor,
     dbState,
+    isOnline,
+    isCloudLoaded,
+    addToast,
   } = useApp();
+
+  const offlineLocked = !isOnline || !isCloudLoaded;
+
+  const notifyOfflineLocked = () => {
+    addToast({
+      type: 'warning',
+      title: 'Offline — Internet Required',
+      description: 'You are offline. Connect to the internet to open this page.',
+    });
+  };
 
   const [expandedGroups, setExpandedGroups] = useState<Record<string, boolean>>({
     shops: activeTab === 'shops',
@@ -169,6 +182,9 @@ export const Sidebar: React.FC = () => {
   ).length;
 
   const sellerNav: NavItem[] = [
+    ...(offlineLocked
+      ? [{ id: 'dashboard', label: 'Home', icon: Home, iconColor: 'text-sky-400' }]
+      : []),
     { id: 'new_sale', label: 'New Sale (POS)', icon: ShoppingCart, iconColor: 'text-emerald-400' },
     ...(hasPermission('canRecordExpenses')
       ? [
@@ -490,8 +506,12 @@ export const Sidebar: React.FC = () => {
         <nav className="space-y-1 px-2">
           {items.map(item => {
             const Icon = item.icon;
+            const isHomeItem = item.id === 'dashboard';
+            const isItemLocked = offlineLocked && !isHomeItem;
             const isActive =
-              item.id === 'sell'
+              offlineLocked
+                ? isHomeItem
+                : item.id === 'sell'
                 ? activeTab === 'new_sale' ||
                   activeTab === 'sales' ||
                   (!showAdminMenu && activeTab === 'my_sales')
@@ -499,7 +519,7 @@ export const Sidebar: React.FC = () => {
             const hasChildren = Boolean(item.children && item.children.length > 0);
 
             if (hasChildren && item.children) {
-              const isExpanded = Boolean(expandedGroups[item.id]);
+              const isExpanded = !isItemLocked && Boolean(expandedGroups[item.id]);
               const isShopsGroup = item.id === 'shops';
               const isSellersGroup = item.id === 'sellers';
               const isSellGroup = item.id === 'sell';
@@ -573,12 +593,19 @@ export const Sidebar: React.FC = () => {
                   <button
                     type="button"
                     id={`nav-${item.id}`}
-                    onClick={() =>
-                      setExpandedGroups(prev => ({ ...prev, [item.id]: !prev[item.id] }))
-                    }
+                    title={isItemLocked ? 'Internet connection required to view this page' : undefined}
+                    onClick={() => {
+                      if (isItemLocked) {
+                        notifyOfflineLocked();
+                        return;
+                      }
+                      setExpandedGroups(prev => ({ ...prev, [item.id]: !prev[item.id] }));
+                    }}
                     aria-expanded={isExpanded}
                     className={`w-full flex items-center justify-between px-3 py-2 rounded-lg text-xs font-medium transition-all duration-200 ${
-                      isActive
+                      isItemLocked
+                        ? 'text-slate-500 opacity-55 cursor-not-allowed'
+                        : isActive
                         ? activeParentClasses
                         : isExpanded
                         ? 'bg-slate-800/80 text-white'
@@ -588,14 +615,14 @@ export const Sidebar: React.FC = () => {
                     <div className="flex items-center gap-3 min-w-0">
                       <Icon
                         className={`w-4 h-4 shrink-0 ${
-                          isActive ? activeIconColor : item.iconColor
+                          isItemLocked ? 'text-slate-500' : isActive ? activeIconColor : item.iconColor
                         }`}
                       />
                       <span className="truncate">{item.label}</span>
                     </div>
 
                     <div className="flex items-center gap-1.5 shrink-0">
-                      {item.badge !== undefined && (
+                      {!isItemLocked && item.badge !== undefined && (
                         <span
                           className={`text-[10px] px-1.5 py-0.5 rounded-full font-bold ${
                             item.badgeColor === 'blue'
@@ -606,11 +633,15 @@ export const Sidebar: React.FC = () => {
                           {item.badge}
                         </span>
                       )}
-                      <ChevronDown
-                        className={`w-3.5 h-3.5 transition-transform duration-300 ease-out ${
-                          isExpanded ? `rotate-180 ${activeChevronColor}` : 'text-slate-500'
-                        }`}
-                      />
+                      {isItemLocked ? (
+                        <Lock className="w-3 h-3 text-slate-500" />
+                      ) : (
+                        <ChevronDown
+                          className={`w-3.5 h-3.5 transition-transform duration-300 ease-out ${
+                            isExpanded ? `rotate-180 ${activeChevronColor}` : 'text-slate-500'
+                          }`}
+                        />
+                      )}
                     </div>
                   </button>
 
@@ -720,41 +751,61 @@ export const Sidebar: React.FC = () => {
               <button
                 key={item.id}
                 id={`nav-${item.id}`}
-                onClick={() => setActiveTab(item.id)}
+                title={isItemLocked ? 'Internet connection required to view this page' : undefined}
+                onClick={() => {
+                  if (isItemLocked) {
+                    notifyOfflineLocked();
+                    return;
+                  }
+                  setActiveTab(item.id);
+                }}
                 className={`w-full flex items-center justify-between px-3 py-2 rounded-lg text-xs font-medium transition-all ${
-                  isActive
+                  isItemLocked
+                    ? 'text-slate-500 opacity-55 cursor-not-allowed'
+                    : isActive
                     ? 'text-white shadow-sm font-semibold'
                     : 'text-slate-300 hover:text-white hover:bg-slate-800/60'
                 }`}
                 style={{
-                  backgroundColor: isActive
-                    ? isSeller
-                      ? sellerColor.primary
-                      : '#2563eb'
-                    : undefined,
+                  backgroundColor:
+                    !isItemLocked && isActive
+                      ? isSeller
+                        ? sellerColor.primary
+                        : '#2563eb'
+                      : undefined,
                 }}
               >
                 <div className="flex items-center gap-3 min-w-0">
                   <Icon
-                    className={`w-4 h-4 shrink-0 ${isActive ? 'text-white' : item.iconColor}`}
+                    className={`w-4 h-4 shrink-0 ${
+                      isItemLocked
+                        ? 'text-slate-500'
+                        : isActive
+                        ? 'text-white'
+                        : item.iconColor
+                    }`}
                   />
                   <span className="truncate">{item.label}</span>
                 </div>
 
-                {item.badge !== undefined && (
-                  <span
-                    className={`text-[10px] px-1.5 py-0.5 rounded-full font-bold shrink-0 ${
-                      isActive
-                        ? 'bg-white/20 text-white'
-                        : item.badgeColor === 'red'
-                        ? 'bg-rose-500/20 text-rose-400 border border-rose-500/30'
-                        : item.badgeColor === 'blue'
-                        ? 'bg-blue-500/20 text-blue-400 border border-blue-500/30'
-                        : 'bg-amber-500/20 text-amber-400 border border-amber-500/30'
-                    }`}
-                  >
-                    {item.badge}
-                  </span>
+                {isItemLocked ? (
+                  <Lock className="w-3 h-3 text-slate-500 shrink-0" />
+                ) : (
+                  item.badge !== undefined && (
+                    <span
+                      className={`text-[10px] px-1.5 py-0.5 rounded-full font-bold shrink-0 ${
+                        isActive
+                          ? 'bg-white/20 text-white'
+                          : item.badgeColor === 'red'
+                          ? 'bg-rose-500/20 text-rose-400 border border-rose-500/30'
+                          : item.badgeColor === 'blue'
+                          ? 'bg-blue-500/20 text-blue-400 border border-blue-500/30'
+                          : 'bg-amber-500/20 text-amber-400 border border-amber-500/30'
+                      }`}
+                    >
+                      {item.badge}
+                    </span>
+                  )
                 )}
               </button>
             );
@@ -765,14 +816,24 @@ export const Sidebar: React.FC = () => {
       {/* Footer Info Box */}
       <div className="p-3 border-t border-slate-800 bg-slate-950/40 text-[11px] text-slate-400">
         <div className="flex items-center justify-between mb-1">
-          <span className="font-semibold text-slate-300">Local DB Status</span>
-          <span className="inline-flex items-center gap-1 text-emerald-400 font-medium">
-            <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span>
-            Operational
+          <span className="font-semibold text-slate-300">Cloud DB Status</span>
+          <span
+            className={`inline-flex items-center gap-1 font-medium ${
+              isOnline && isCloudLoaded ? 'text-emerald-400' : 'text-rose-400'
+            }`}
+          >
+            <span
+              className={`w-1.5 h-1.5 rounded-full ${
+                isOnline && isCloudLoaded ? 'bg-emerald-500 animate-pulse' : 'bg-rose-500'
+              }`}
+            ></span>
+            {isOnline && isCloudLoaded ? 'Online' : 'Offline'}
           </span>
         </div>
         <p className="text-[10px] text-slate-400">
-          Transactions stored locally. Safe to operate without internet connection.
+          {isOnline && isCloudLoaded
+            ? 'Connected to live cloud database. Changes save immediately.'
+            : 'Home is cached offline. Wait for internet to open other pages.'}
         </p>
       </div>
     </aside>

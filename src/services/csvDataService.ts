@@ -13,6 +13,7 @@ import {
 import { generateUUID } from '../utils/crypto';
 import type { ImportProgressInfo } from './excelImportService';
 import { hasAdminAccess } from '../utils/permissions';
+import { SyncService, CloudOperation } from './syncService';
 
 // Helper to escape CSV cell
 function escapeCsvCell(val: any): string {
@@ -858,6 +859,8 @@ export class CsvDataService {
     const now = new Date().toISOString();
     let updatedCount = 0;
     let createdCount = 0;
+    const cloudOps: CloudOperation[] = [];
+    let commitMemoryUpdate: (() => void) | null = null;
 
     switch (dataType) {
       case 'PRODUCTS': {
@@ -868,7 +871,7 @@ export class CsvDataService {
         for (const item of parsedRecords) {
           if (updatedProductsMap.has(item.id)) {
             const current = updatedProductsMap.get(item.id)!;
-            updatedProductsMap.set(item.id, {
+            const nextProd: Product = {
               ...current,
               shopId: item.shopId,
               name: item.name,
@@ -882,6 +885,13 @@ export class CsvDataService {
               unit: item.unit,
               status: item.status,
               updatedAt: now,
+            };
+            updatedProductsMap.set(item.id, nextProd);
+            cloudOps.push({
+              operation: 'UPDATE_PRODUCT',
+              entityType: 'PRODUCT',
+              entityId: nextProd.id,
+              payload: nextProd,
             });
             updatedCount++;
           } else {
@@ -902,11 +912,17 @@ export class CsvDataService {
               updatedAt: now,
             };
             updatedProductsMap.set(newProd.id, newProd);
+            cloudOps.push({
+              operation: 'CREATE_PRODUCT',
+              entityType: 'PRODUCT',
+              entityId: newProd.id,
+              payload: newProd,
+            });
             createdCount++;
           }
         }
 
-        db.saveProducts(Array.from(updatedProductsMap.values()));
+        commitMemoryUpdate = () => db.saveProducts(Array.from(updatedProductsMap.values()));
         break;
       }
 
@@ -918,7 +934,7 @@ export class CsvDataService {
         for (const item of parsedRecords) {
           if (expenseMap.has(item.id)) {
             const current = expenseMap.get(item.id)!;
-            expenseMap.set(item.id, {
+            const nextExp: Expense = {
               ...current,
               shopId: item.shopId,
               shopName: item.shopName,
@@ -930,6 +946,13 @@ export class CsvDataService {
               paymentMethod: item.paymentMethod,
               date: item.date,
               reference: item.reference,
+            };
+            expenseMap.set(item.id, nextExp);
+            cloudOps.push({
+              operation: 'UPDATE_EXPENSE',
+              entityType: 'EXPENSE',
+              entityId: nextExp.id,
+              payload: nextExp,
             });
             updatedCount++;
           } else {
@@ -950,11 +973,17 @@ export class CsvDataService {
               createdAt: now,
             };
             expenseMap.set(newExp.id, newExp);
+            cloudOps.push({
+              operation: 'CREATE_EXPENSE',
+              entityType: 'EXPENSE',
+              entityId: newExp.id,
+              payload: newExp,
+            });
             createdCount++;
           }
         }
 
-        db.saveExpenses(Array.from(expenseMap.values()));
+        commitMemoryUpdate = () => db.saveExpenses(Array.from(expenseMap.values()));
         break;
       }
 
@@ -966,7 +995,7 @@ export class CsvDataService {
         for (const item of parsedRecords) {
           if (shopMap.has(item.id)) {
             const current = shopMap.get(item.id)!;
-            shopMap.set(item.id, {
+            const nextShop: Shop = {
               ...current,
               name: item.name,
               code: item.code,
@@ -975,6 +1004,13 @@ export class CsvDataService {
               phone: item.phone,
               status: item.status,
               updatedAt: now,
+            };
+            shopMap.set(item.id, nextShop);
+            cloudOps.push({
+              operation: 'UPDATE_SHOP',
+              entityType: 'SHOP',
+              entityId: nextShop.id,
+              payload: nextShop,
             });
             updatedCount++;
           } else {
@@ -990,11 +1026,17 @@ export class CsvDataService {
               updatedAt: now,
             };
             shopMap.set(newShop.id, newShop);
+            cloudOps.push({
+              operation: 'CREATE_SHOP',
+              entityType: 'SHOP',
+              entityId: newShop.id,
+              payload: newShop,
+            });
             createdCount++;
           }
         }
 
-        db.saveShops(Array.from(shopMap.values()));
+        commitMemoryUpdate = () => db.saveShops(Array.from(shopMap.values()));
         break;
       }
 
@@ -1009,13 +1051,20 @@ export class CsvDataService {
 
           if (targetId && userMap.has(targetId)) {
             const current = userMap.get(targetId)!;
-            userMap.set(targetId, {
+            const nextUser: User = {
               ...current,
               name: item.name,
               color: item.color,
               status: item.status,
               assignedShopIds: item.assignedShopIds,
               updatedAt: now,
+            };
+            userMap.set(targetId, nextUser);
+            cloudOps.push({
+              operation: 'UPDATE_SELLER',
+              entityType: 'USER',
+              entityId: nextUser.id,
+              payload: nextUser,
             });
             updatedCount++;
           } else {
@@ -1032,14 +1081,42 @@ export class CsvDataService {
               updatedAt: now,
             };
             userMap.set(newUser.id, newUser);
+            cloudOps.push({
+              operation: 'CREATE_SELLER',
+              entityType: 'USER',
+              entityId: newUser.id,
+              payload: newUser,
+            });
             createdCount++;
           }
         }
 
-        db.saveUsers(Array.from(userMap.values()));
+        commitMemoryUpdate = () => db.saveUsers(Array.from(userMap.values()));
         break;
       }
     }
+
+    if (cloudOps.length > 0) {
+      onProgress?.({
+        stage: 'SAVING',
+        percent: 85,
+        processedRows: parsedRecords.length,
+        totalRows: parsedRecords.length,
+        message: `Saving ${cloudOps.length.toLocaleString()} record(s) to cloud database...`,
+      });
+      const commitRes = await SyncService.commitOperations(cloudOps);
+      if (!commitRes.success) {
+        return {
+          success: false,
+          importedCount: 0,
+          updatedCount: 0,
+          createdCount: 0,
+          error: commitRes.error || 'Failed to save imported records to cloud database.',
+        };
+      }
+    }
+
+    commitMemoryUpdate?.();
 
     const totalImported = createdCount + updatedCount;
 

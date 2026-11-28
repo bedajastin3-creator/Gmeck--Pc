@@ -3,6 +3,8 @@ import { Sale, SaleItem, PaymentMethod, User, SaleEditRequest } from '../types';
 import { generateUUID } from '../utils/crypto';
 import { generateReceiptNumber, formatDateTime } from '../utils/formatters';
 import { NotificationService } from './notificationService';
+import { CloudflareApi } from './cloudflareApi';
+import { CloudOperation, SyncService } from './syncService';
 import {
   canAccessShopAsAdmin,
   getShopAdminShopIds,
@@ -22,7 +24,7 @@ export class SalesService {
   /**
    * Complete a new sale transaction for a specific shop.
    */
-  public static createSale(
+  public static async createSale(
     params: {
       shopId: string;
       items: CartItemInput[];
@@ -34,7 +36,7 @@ export class SalesService {
       saleDate?: string;
     },
     currentUser: User
-  ): { success: boolean; sale?: Sale; error?: string } {
+  ): Promise<{ success: boolean; sale?: Sale; error?: string }> {
     if (!params.shopId) {
       return { success: false, error: 'Shop identification is required to process sale.' };
     }
@@ -191,8 +193,6 @@ export class SalesService {
       }
       return prod;
     });
-    db.saveProducts(updatedProducts);
-
     const newMovements = saleItems.map(item => {
       const prod = products.find(p => p.id === item.productId)!;
       return {
@@ -212,19 +212,20 @@ export class SalesService {
         createdAt: txTimestamp,
       };
     });
-    db.saveMovements([...newMovements, ...db.getMovements()]);
 
-    db.saveSales([newSale, ...db.getSales()]);
-
-    db.enqueueSync({
-      id: generateUUID(),
+    const commit = await SyncService.commitOperation({
       operation: 'CREATE_SALE',
       entityType: 'SALE',
       entityId: saleId,
       payload: newSale,
-      status: 'PENDING',
-      createdAt: new Date().toISOString(),
     });
+    if (!commit.success) {
+      return { success: false, error: commit.error || CloudflareApi.OFFLINE_ERROR_MESSAGE };
+    }
+
+    db.saveProducts(updatedProducts);
+    db.saveMovements([...newMovements, ...db.getMovements()]);
+    db.saveSales([newSale, ...db.getSales()]);
 
     db.addAuditLog({
       id: generateUUID(),
@@ -250,11 +251,11 @@ export class SalesService {
   /**
    * Void/Cancel a sale transaction.
    */
-  public static voidSale(
+  public static async voidSale(
     saleId: string,
     voidReason: string,
     currentUser: User
-  ): { success: boolean; error?: string } {
+  ): Promise<{ success: boolean; error?: string }> {
     const canVoid =
       isPlatformAdmin(currentUser) ||
       hasAdminAccess(currentUser) ||
@@ -289,17 +290,17 @@ export class SalesService {
       return { success: false, error: 'Sale has already been voided.' };
     }
 
-    const products = db.getProducts();
+    const nextProducts = [...db.getProducts()];
     const returnMovements = [];
 
     for (const item of targetSale.items) {
-      const prodIndex = products.findIndex(p => p.id === item.productId && p.shopId === targetSale.shopId);
+      const prodIndex = nextProducts.findIndex(p => p.id === item.productId && p.shopId === targetSale.shopId);
       if (prodIndex !== -1) {
-        const prod = products[prodIndex];
+        const prod = nextProducts[prodIndex];
         const prevQty = prod.currentStock;
         const newQty = prevQty + item.quantity;
 
-        products[prodIndex] = {
+        nextProducts[prodIndex] = {
           ...prod,
           currentStock: newQty,
           updatedAt: new Date().toISOString(),
@@ -324,24 +325,31 @@ export class SalesService {
       }
     }
 
-    db.saveProducts(products);
-    db.saveMovements([...returnMovements, ...db.getMovements()]);
-
-    targetSale.status = 'VOIDED';
-    targetSale.voidReason = voidReason.trim();
-    targetSale.voidedAt = new Date().toISOString();
-    targetSale.voidedBy = currentUser.name;
-    db.saveSales(sales);
-
-    db.enqueueSync({
-      id: generateUUID(),
+    const commit = await SyncService.commitOperation({
       operation: 'VOID_SALE',
       entityType: 'SALE',
       entityId: saleId,
       payload: { saleId, voidReason, voidedBy: currentUser.name },
-      status: 'PENDING',
-      createdAt: new Date().toISOString(),
     });
+    if (!commit.success) {
+      return { success: false, error: commit.error || CloudflareApi.OFFLINE_ERROR_MESSAGE };
+    }
+
+    db.saveProducts(nextProducts);
+    db.saveMovements([...returnMovements, ...db.getMovements()]);
+
+    const updatedSales = sales.map(s =>
+      s.id === saleId
+        ? {
+            ...s,
+            status: 'VOIDED' as const,
+            voidReason: voidReason.trim(),
+            voidedAt: new Date().toISOString(),
+            voidedBy: currentUser.name,
+          }
+        : s
+    );
+    db.saveSales(updatedSales);
 
     db.addAuditLog({
       id: generateUUID(),
@@ -360,12 +368,12 @@ export class SalesService {
   /**
    * Seller or Admin requests a sale edit
    */
-  public static requestSaleEdit(
+  public static async requestSaleEdit(
     saleId: string,
     newItems: CartItemInput[],
     reason: string,
     currentUser: User
-  ): { success: boolean; error?: string; requiresApproval?: boolean } {
+  ): Promise<{ success: boolean; error?: string; requiresApproval?: boolean }> {
     const sales = db.getSales();
     const sale = sales.find(s => s.id === saleId);
 
@@ -436,7 +444,7 @@ export class SalesService {
       Boolean(currentUser.permissions?.canEditSales);
 
     if (canApplyDirectly) {
-      return this.applySaleEdit(sale, {
+      return await this.applySaleEdit(sale, {
         items: newSaleItems,
         subtotal: Number(newSubtotal.toFixed(2)),
         total: newTotal,
@@ -475,18 +483,18 @@ export class SalesService {
       createdAt: new Date().toISOString(),
     };
 
-    const editRequests = db.getSaleEditRequests?.() || [];
-    db.saveSaleEditRequests?.([editRequest, ...editRequests]);
-
-    db.enqueueSync({
-      id: generateUUID(),
+    const commit = await SyncService.commitOperation({
       operation: 'CREATE_SALE_EDIT_REQUEST',
       entityType: 'SALE_EDIT_REQUEST',
       entityId: editRequest.id,
       payload: editRequest,
-      status: 'PENDING',
-      createdAt: new Date().toISOString(),
     });
+    if (!commit.success) {
+      return { success: false, error: commit.error || CloudflareApi.OFFLINE_ERROR_MESSAGE };
+    }
+
+    const editRequests = db.getSaleEditRequests?.() || [];
+    db.saveSaleEditRequests?.([editRequest, ...editRequests]);
 
     const admins = db.getUsers().filter(u => u.role === 'ADMIN');
     for (const admin of admins) {
@@ -496,10 +504,7 @@ export class SalesService {
     return { success: true, requiresApproval: true };
   }
 
-  /**
-   * Apply sale edit (used by admin)
-   */
-  private static applySaleEdit(
+  private static buildSaleEditMutation(
     sale: Sale,
     newValues: {
       items: SaleItem[];
@@ -512,7 +517,7 @@ export class SalesService {
     },
     currentUser: User,
     reason?: string
-  ): { success: boolean; error?: string } {
+  ) {
     const products = db.getProducts();
     const sales = db.getSales();
 
@@ -539,12 +544,12 @@ export class SalesService {
       }
     }
 
-    db.saveProducts(updatedProducts);
-
-    const saleIndex = sales.findIndex(s => s.id === sale.id);
+    const updatedSales = [...sales];
+    const saleIndex = updatedSales.findIndex(s => s.id === sale.id);
+    let updatedSale: Sale | null = null;
     if (saleIndex !== -1) {
       const editNote = `\n[Edited by ${currentUser.name} at ${new Date().toISOString()}${reason ? ` - Reason: ${reason}` : ''}]`;
-      sales[saleIndex] = {
+      updatedSale = {
         ...sale,
         items: newValues.items,
         subtotal: newValues.subtotal,
@@ -555,17 +560,49 @@ export class SalesService {
         change: newValues.change,
         notes: (sale.notes || '') + editNote,
       };
-      db.saveSales(sales);
+      updatedSales[saleIndex] = updatedSale;
+    }
 
-      db.enqueueSync({
-        id: generateUUID(),
+    return { updatedProducts, updatedSales, updatedSale };
+  }
+
+  /**
+   * Apply sale edit (used by admin)
+   */
+  private static async applySaleEdit(
+    sale: Sale,
+    newValues: {
+      items: SaleItem[];
+      subtotal: number;
+      total: number;
+      costOfGoods: number;
+      grossProfit: number;
+      amountReceived: number;
+      change: number;
+    },
+    currentUser: User,
+    reason?: string
+  ): Promise<{ success: boolean; error?: string }> {
+    const { updatedProducts, updatedSales, updatedSale } = this.buildSaleEditMutation(
+      sale,
+      newValues,
+      currentUser,
+      reason
+    );
+
+    if (updatedSale) {
+      const commit = await SyncService.commitOperation({
         operation: 'UPDATE_SALE',
         entityType: 'SALE',
         entityId: sale.id,
-        payload: sales[saleIndex],
-        status: 'PENDING',
-        createdAt: new Date().toISOString(),
+        payload: updatedSale,
       });
+      if (!commit.success) {
+        return { success: false, error: commit.error || CloudflareApi.OFFLINE_ERROR_MESSAGE };
+      }
+
+      db.saveProducts(updatedProducts);
+      db.saveSales(updatedSales);
 
       db.addAuditLog({
         id: generateUUID(),
@@ -584,14 +621,13 @@ export class SalesService {
 
   /**
    * Approve or reject a sale edit request (admin only)
-   * FIX: Update request status FIRST, then apply sale edit
    */
-  public static reviewSaleEdit(
+  public static async reviewSaleEdit(
     requestId: string,
     action: 'APPROVE' | 'REJECT',
     currentUser: User,
     reviewNote?: string
-  ): { success: boolean; error?: string } {
+  ): Promise<{ success: boolean; error?: string }> {
     const requests = db.getSaleEditRequests?.() || [];
     const request = requests.find(r => r.id === requestId);
 
@@ -613,12 +649,11 @@ export class SalesService {
       return { success: false, error: 'Request already reviewed.' };
     }
 
-    // FIX: Update request status FIRST
     const updatedRequests = requests.map(r =>
       r.id === requestId
         ? {
             ...r,
-            status: action === 'APPROVE' ? 'APPROVED' as const : 'REJECTED' as const,
+            status: action === 'APPROVE' ? ('APPROVED' as const) : ('REJECTED' as const),
             reviewedByUserId: currentUser.id,
             reviewedByName: currentUser.name,
             reviewNote,
@@ -626,35 +661,56 @@ export class SalesService {
           }
         : r
     );
-    db.saveSaleEditRequests?.(updatedRequests);
-
-    // FIX: Enqueue REVIEW_SALE_EDIT_REQUEST FIRST
     const updatedRequest = updatedRequests.find(r => r.id === requestId);
-    db.enqueueSync({
-      id: generateUUID(),
-      operation: 'REVIEW_SALE_EDIT_REQUEST',
-      entityType: 'SALE_EDIT_REQUEST',
-      entityId: requestId,
-      payload: {
-        ...updatedRequest,
-        id: requestId,
-      },
-      status: 'PENDING',
-      createdAt: new Date().toISOString(),
-    });
 
-    // THEN apply the sale edit if approved
+    const ops: CloudOperation[] = [
+      {
+        operation: 'REVIEW_SALE_EDIT_REQUEST',
+        entityType: 'SALE_EDIT_REQUEST',
+        entityId: requestId,
+        payload: {
+          ...updatedRequest,
+          id: requestId,
+        },
+      },
+    ];
+
+    let saleEditMutation: ReturnType<typeof SalesService.buildSaleEditMutation> | null = null;
     if (action === 'APPROVE') {
-      const sales = db.getSales();
-      const sale = sales.find(s => s.id === request.saleId);
+      const sale = db.getSales().find(s => s.id === request.saleId);
       if (!sale) {
         return { success: false, error: 'Sale not found.' };
       }
-
-      const result = this.applySaleEdit(sale, request.newValues, currentUser, request.reason);
-      if (!result.success) {
-        return result;
+      saleEditMutation = this.buildSaleEditMutation(sale, request.newValues, currentUser, request.reason);
+      if (saleEditMutation.updatedSale) {
+        ops.push({
+          operation: 'UPDATE_SALE',
+          entityType: 'SALE',
+          entityId: sale.id,
+          payload: saleEditMutation.updatedSale,
+        });
       }
+    }
+
+    const commit = await SyncService.commitOperations(ops);
+    if (!commit.success) {
+      return { success: false, error: commit.error || CloudflareApi.OFFLINE_ERROR_MESSAGE };
+    }
+
+    db.saveSaleEditRequests?.(updatedRequests);
+    if (saleEditMutation && saleEditMutation.updatedSale) {
+      db.saveProducts(saleEditMutation.updatedProducts);
+      db.saveSales(saleEditMutation.updatedSales);
+      db.addAuditLog({
+        id: generateUUID(),
+        userId: currentUser.id,
+        userName: currentUser.name,
+        action: 'EDIT_SALE',
+        details: `Edited sale ${saleForReq?.receiptNumber || request.saleId}${request.reason ? ` - Reason: ${request.reason}` : ''}`,
+        entityType: 'SALE',
+        entityId: request.saleId,
+        timestamp: new Date().toISOString(),
+      });
     }
 
     NotificationService.notifySaleEditReviewed(request, action, currentUser.name, reviewNote);

@@ -193,12 +193,12 @@ export const AdminShops: React.FC = () => {
     setShopsSubTab('add');
   };
 
-  const handleSaveShop = (e: React.FormEvent) => {
+  const handleSaveShop = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!currentUser) return;
 
     if (editingShop) {
-      const res = ShopService.updateShop(
+      const res = await ShopService.updateShop(
         editingShop.id,
         {
           name: formData.name,
@@ -227,7 +227,7 @@ export const AdminShops: React.FC = () => {
         });
       }
     } else {
-      const res = ShopService.createShop(
+      const res = await ShopService.createShop(
         {
           name: formData.name,
           code: formData.code,
@@ -257,11 +257,11 @@ export const AdminShops: React.FC = () => {
     }
   };
 
-  const handleToggleStatus = (shop: Shop) => {
+  const handleToggleStatus = async (shop: Shop) => {
     if (!currentUser) return;
     const newStatus: ShopStatus = shop.status === 'ACTIVE' ? 'INACTIVE' : 'ACTIVE';
 
-    const res = ShopService.toggleShopStatus(shop.id, newStatus, currentUser);
+    const res = await ShopService.toggleShopStatus(shop.id, newStatus, currentUser);
     if (res.success) {
       addToast({
         type: newStatus === 'ACTIVE' ? 'success' : 'warning',
@@ -283,14 +283,10 @@ export const AdminShops: React.FC = () => {
     setIsDeletingShop(true);
     const targetShop = deletingShop;
     try {
-      const res = ShopService.deleteShop(targetShop.id, currentUser);
+      const res = await ShopService.deleteShop(targetShop.id, currentUser);
       if (res.success) {
         if (selectedShopId === targetShop.id) {
           setSelectedShopId('ALL');
-        }
-        // Trigger direct API delete when online (syncQueue also retains DELETE_SHOP for offline resilience)
-        if (CloudflareApi.isOnline()) {
-          CloudflareApi.deleteShop(targetShop.id).catch(() => {});
         }
         addToast({
           type: 'success',
@@ -316,9 +312,9 @@ export const AdminShops: React.FC = () => {
     setSelectedAdminSellerId(currentShopAdmin?.id || '');
   };
 
-  const handleSaveShopAdmin = (sellerIdToAssign: string | null) => {
+  const handleSaveShopAdmin = async (sellerIdToAssign: string | null) => {
     if (!currentUser || !shopAdminModalShop) return;
-    const res = ShopService.setShopAdmin(shopAdminModalShop.id, sellerIdToAssign, currentUser);
+    const res = await ShopService.setShopAdmin(shopAdminModalShop.id, sellerIdToAssign, currentUser);
     if (res.success) {
       const assignedSeller = sellerIdToAssign
         ? (dbState.users || []).find(u => u.id === sellerIdToAssign)

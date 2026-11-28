@@ -1,15 +1,25 @@
 // src/services/syncService.ts
 import { db } from '../db/storage';
 import { SaleEditRequest, SyncQueueItem, User } from '../types';
+import { generateUUID } from '../utils/crypto';
 import { CloudflareApi } from './cloudflareApi';
 
 export type SyncState = 'OFFLINE_LOCAL' | 'PENDING_SYNC' | 'SYNCING' | 'SYNCED';
+
+export interface CloudOperation {
+  id?: string;
+  operation: string;
+  entityType: string;
+  entityId: string;
+  payload: any;
+}
 
 const OP_ORDER: Record<string, number> = {
   // Tier 1 — roots
   CREATE_SHOP: 1,
   UPDATE_SHOP: 1,
   TOGGLE_SHOP_STATUS: 1,
+  UPDATE_SETTINGS: 1,
 
   // Tier 2 — depend on shops
   CREATE_CATEGORY: 2,
@@ -41,9 +51,13 @@ const OP_ORDER: Record<string, number> = {
   CREATE_SALE_EDIT_REQUEST: 5,
   REVIEW_SALE_EDIT_REQUEST: 5,
   CREATE_EXPENSE: 5,
+  UPDATE_EXPENSE: 5,
+  DELETE_EXPENSE: 5,
   CREATE_DEBT: 5,
   UPDATE_DEBT: 5,
   DELETE_DEBT: 5,
+  CREATE_CUSTOMER_RECORD: 5,
+  DELETE_CUSTOMER_RECORD: 5,
 
   // Cleanup
   DELETE_PURCHASE: 90,
@@ -54,34 +68,23 @@ const OP_ORDER: Record<string, number> = {
 };
 
 export class SyncService {
-  private static isSimulatingSync = false;
   private static isSyncing = false;
-  private static lastSyncedAt: string | null = localStorage.getItem(
-    'omnibiz_last_synced_at'
-  );
-  private static lastSyncAttempt: number = 0;
-  private static readonly SYNC_INTERVAL_MS = 60000;
-  private static hasLocalChanges = false;
+  private static lastSyncedAt: string | null = null;
 
   public static markLocalChanged(): void {
-    this.hasLocalChanges = true;
+    // No-op in online-only mode (changes commit immediately to cloud)
   }
 
   public static shouldSync(): boolean {
-    const pendingCount = this.getPendingCount();
-    if (pendingCount > 0) return true;
-
-    const now = Date.now();
-    const timeSinceLastSync = now - this.lastSyncAttempt;
-    return this.hasLocalChanges && timeSinceLastSync >= this.SYNC_INTERVAL_MS;
+    return false;
   }
 
   public static getQueueItems(): SyncQueueItem[] {
-    return db.getSyncQueue();
+    return [];
   }
 
   public static getPendingCount(): number {
-    return db.getSyncQueue().filter(item => item.status === 'PENDING').length;
+    return 0;
   }
 
   public static getSyncStats(): {
@@ -90,12 +93,11 @@ export class SyncService {
     synced: number;
     failed: number;
   } {
-    const queue = db.getSyncQueue();
     return {
-      total: queue.length,
-      pending: queue.filter(q => q.status === 'PENDING').length,
-      synced: queue.filter(q => q.status === 'SYNCED').length,
-      failed: queue.filter(q => q.status === 'FAILED').length,
+      total: 0,
+      pending: 0,
+      synced: 0,
+      failed: 0,
     };
   }
 
@@ -104,174 +106,124 @@ export class SyncService {
     pendingCount: number;
     lastSyncedAt?: string;
   } {
-    const queue = db.getSyncQueue();
-    const pending = queue.filter(q => q.status === 'PENDING').length;
-
     if (SyncService.isSyncing) {
       return {
         state: 'SYNCING',
-        pendingCount: pending,
+        pendingCount: 0,
         lastSyncedAt: this.lastSyncedAt || undefined,
       };
     }
 
-    if (pending > 0) {
+    if (!CloudflareApi.isOnline() || !db.isCloudLoaded()) {
       return {
-        state: 'PENDING_SYNC',
-        pendingCount: pending,
+        state: 'OFFLINE_LOCAL',
+        pendingCount: 0,
         lastSyncedAt: this.lastSyncedAt || undefined,
       };
     }
 
     return {
-      state: this.lastSyncedAt ? 'SYNCED' : 'OFFLINE_LOCAL',
+      state: 'SYNCED',
       pendingCount: 0,
       lastSyncedAt: this.lastSyncedAt || undefined,
     };
   }
 
   /**
-   * Sort PENDING queue items by dependency tier first, then chronologically (oldest first)
-   * because db.enqueueSync prepends newest items at index 0.
+   * Immediately commit one or more operations directly to Cloudflare D1.
+   * Online-only: fails cleanly if offline or if the backend rejects the operation,
+   * without writing anything to a local queue.
    */
-  public static sortPendingItems(items: SyncQueueItem[]): SyncQueueItem[] {
-    return [...items].sort((a, b) => {
-      const opA = (a.operation || a.action) as string;
-      const opB = (b.operation || b.action) as string;
-      const tierDiff = (OP_ORDER[opA] ?? 99) - (OP_ORDER[opB] ?? 99);
-      if (tierDiff !== 0) return tierDiff;
-      return (
-        new Date(a.createdAt || 0).getTime() - new Date(b.createdAt || 0).getTime()
-      );
-    });
-  }
-
-  /**
-   * Push PENDING items only (without forcing a pull) using topological OP_ORDER
-   * sorting and per-item reconciliation. Used by AppContext background auto-push.
-   */
-  public static async pushPendingOnly(): Promise<{
+  public static async commitOperations(
+    operations: CloudOperation[],
+    options?: { batchSize?: number }
+  ): Promise<{
     success: boolean;
     processedCount: number;
-    failedCount: number;
-    errors: any[];
-    results: any[];
+    error?: string;
+    results?: any[];
   }> {
-    const pendingItems = db.getSyncQueue().filter(item => item.status === 'PENDING');
-    if (pendingItems.length === 0) {
-      return {
-        success: true,
-        processedCount: 0,
-        failedCount: 0,
-        errors: [],
-        results: [],
-      };
+    if (!operations || operations.length === 0) {
+      return { success: true, processedCount: 0, results: [] };
     }
 
-    const sorted = this.sortPendingItems(pendingItems);
-    const BATCH_SIZE = 50;
-    const allResults: any[] = [];
-    const allErrors: any[] = [];
-    let overallSuccess = true;
-
-    for (let i = 0; i < sorted.length; i += BATCH_SIZE) {
-      const batch = sorted.slice(i, i + BATCH_SIZE);
-      const operations = batch.map(item => ({
-        id: item.id,
-        operation: item.operation || item.action,
-        entityType: item.entityType,
-        entityId: item.entityId,
-        payload: item.payload,
-      }));
-
-      const pushResult = await CloudflareApi.pushSync(operations);
-
-      const pushSuccess = pushResult.success === true;
-      const pushErrors = pushResult.errors || [];
-      const pushResults = pushResult.results || [];
-
-      if (!pushSuccess) overallSuccess = false;
-      allResults.push(...pushResults);
-      allErrors.push(...pushErrors);
-
-      // ── Per-item reconciliation ──
-      const okIds = new Set<string>(pushResults.map((r: any) => r.id));
-      const failedMap = new Map<string, string>();
-      for (const err of pushErrors) {
-        failedMap.set(err.id, err.error || 'Unknown error');
-      }
-
-      const now = new Date().toISOString();
-      const reconciledQueue = db.getSyncQueue().map(item => {
-        if (item.status !== 'PENDING') return item;
-
-        if (okIds.has(item.id)) {
-          return { ...item, status: 'SYNCED' as const, syncedAt: now };
-        }
-
-        if (failedMap.has(item.id)) {
-          const errMsg = failedMap.get(item.id)!;
-          console.error(
-            `[sync] ${item.operation || item.action} failed for ${item.entityId}: ${errMsg}`
-          );
-          return {
-            ...item,
-            status: 'FAILED' as const,
-            lastError: errMsg,
-            failedAt: now,
-            retryCount: (item.retryCount || 0) + 1,
-          };
-        }
-
-        return item;
-      });
-      db.saveSyncQueue(reconciledQueue);
-
-      if (pushSuccess) {
-        this.lastSyncedAt = now;
-        localStorage.setItem('omnibiz_last_synced_at', now);
-      }
-
-      if (i + BATCH_SIZE < sorted.length) {
-        await new Promise(resolve => setTimeout(resolve, 30));
-      }
-    }
-
-    if (!overallSuccess) {
-      console.warn(
-        `[sync] Push partial: ${allResults.length} ok, ${allErrors.length} failed`,
-        allErrors.slice(0, 10)
-      );
-    }
-
-    return {
-      success: overallSuccess,
-      processedCount: allResults.length,
-      failedCount: allErrors.length,
-      errors: allErrors,
-      results: allResults,
-    };
-  }
-
-  public static async processSyncQueue(
-    _currentUser?: User,
-    force: boolean = false
-  ): Promise<{ success: boolean; processedCount: number; message?: string }> {
-    if (!force && !this.shouldSync() && !this.isSyncing) {
-      return {
-        success: true,
-        processedCount: 0,
-        message: 'Sync skipped - no pending changes',
-      };
-    }
-
-    const online = await CloudflareApi.checkConnection();
-
-    if (!online) {
+    if (!CloudflareApi.isOnline()) {
       return {
         success: false,
         processedCount: 0,
-        message: 'Offline mode: Working locally. Will sync when online.',
+        error: CloudflareApi.OFFLINE_ERROR_MESSAGE,
+      };
+    }
+
+    const sorted = [...operations].sort((a, b) => {
+      const tierDiff = (OP_ORDER[a.operation] ?? 99) - (OP_ORDER[b.operation] ?? 99);
+      return tierDiff;
+    });
+
+    const BATCH_SIZE = options?.batchSize || 50;
+    const allResults: any[] = [];
+
+    try {
+      for (let i = 0; i < sorted.length; i += BATCH_SIZE) {
+        const batch = sorted.slice(i, i + BATCH_SIZE).map(op => ({
+          id: op.id || generateUUID(),
+          operation: op.operation,
+          entityType: op.entityType,
+          entityId: op.entityId,
+          payload: op.payload,
+        }));
+
+        const pushResult = await CloudflareApi.pushSync(batch);
+        const pushResults = pushResult.results || [];
+        const pushErrors = pushResult.errors || [];
+        allResults.push(...pushResults);
+
+        if (!pushResult.success || pushErrors.length > 0) {
+          const firstError =
+            pushErrors[0]?.error || pushResult.error || 'Cloud database rejected operation.';
+          return {
+            success: false,
+            processedCount: allResults.length,
+            error: firstError,
+            results: allResults,
+          };
+        }
+      }
+
+      this.lastSyncedAt = new Date().toISOString();
+      return {
+        success: true,
+        processedCount: allResults.length,
+        results: allResults,
+      };
+    } catch (err: any) {
+      return {
+        success: false,
+        processedCount: allResults.length,
+        error: CloudflareApi.formatError(err, 'Failed to save to cloud database.'),
+      };
+    }
+  }
+
+  public static async commitOperation(
+    operation: CloudOperation
+  ): Promise<{ success: boolean; error?: string }> {
+    const res = await this.commitOperations([operation]);
+    return { success: res.success, error: res.error };
+  }
+
+  /**
+   * Pull fresh state directly from the Cloudflare D1 database.
+   */
+  public static async processSyncQueue(
+    _currentUser?: User,
+    _force: boolean = true
+  ): Promise<{ success: boolean; processedCount: number; message?: string }> {
+    if (!CloudflareApi.isOnline()) {
+      return {
+        success: false,
+        processedCount: 0,
+        message: CloudflareApi.OFFLINE_ERROR_MESSAGE,
       };
     }
 
@@ -279,132 +231,52 @@ export class SyncService {
       return {
         success: false,
         processedCount: 0,
-        message: 'Sync already in progress',
+        message: 'Refresh already in progress',
       };
     }
 
     SyncService.isSyncing = true;
-    this.lastSyncAttempt = Date.now();
 
     try {
-      const pendingBefore = this.getPendingCount();
+      const pullResult = await CloudflareApi.pullSync();
 
-      let pushSuccess = true;
-      let pushErrors: any[] = [];
-      let pushResults: any[] = [];
-
-      // ───────────────────────────────────────────────────────────
-      // 1. PUSH
-      // ───────────────────────────────────────────────────────────
-      if (pendingBefore > 0) {
-        const pushOutcome = await this.pushPendingOnly();
-        pushSuccess = pushOutcome.success;
-        pushErrors = pushOutcome.errors;
-        pushResults = pushOutcome.results;
-      }
-
-      // ───────────────────────────────────────────────────────────
-      // 2. PULL (only if push fully succeeded OR forced/local changes)
-      // ───────────────────────────────────────────────────────────
-      const canPull =
-        pushSuccess && (force || pendingBefore > 0 || this.hasLocalChanges);
-
-      if (canPull) {
-        const pullResult = await CloudflareApi.pullSync(
-          force ? undefined : this.lastSyncedAt || undefined
-        );
-
-        if (pullResult.success && pullResult.data) {
-          this.applyCloudData(pullResult.data);
-          this.lastSyncedAt = new Date().toISOString();
-          localStorage.setItem('omnibiz_last_synced_at', this.lastSyncedAt);
-        }
-      }
-
-      this.hasLocalChanges = false;
-      SyncService.isSyncing = false;
-
-      // ───────────────────────────────────────────────────────────
-      // 3. Honest return value
-      // ───────────────────────────────────────────────────────────
-      if (!pushSuccess) {
-        const firstError = pushErrors[0]?.error || 'unknown';
+      if (pullResult.success && pullResult.data) {
+        this.applyCloudData(pullResult.data, true);
+        this.lastSyncedAt = new Date().toISOString();
+        SyncService.isSyncing = false;
         return {
-          success: false,
-          processedCount: pushResults.length,
-          message: `Sync partial: ${pushResults.length} pushed, ${pushErrors.length} failed. First error: ${firstError}`,
+          success: true,
+          processedCount: 0,
+          message: 'Live database refreshed successfully.',
         };
       }
 
+      SyncService.isSyncing = false;
       return {
-        success: true,
-        processedCount: pendingBefore,
-        message:
-          pendingBefore > 0
-            ? `Cloud sync complete: ${pendingBefore} pushed, cloud data pulled.`
-            : 'Cloud sync complete: all records up to date.',
+        success: false,
+        processedCount: 0,
+        message: pullResult.error || 'Could not load cloud data.',
       };
     } catch (error: any) {
       SyncService.isSyncing = false;
       return {
         success: false,
         processedCount: 0,
-        message: `Cloud sync failed: ${error.message}. Working offline.`,
+        message: CloudflareApi.formatError(error, 'Failed to load cloud data.'),
       };
     }
   }
 
-  // Retry failed items by flipping them back to PENDING.
   public static retryFailed(): void {
-    const queue = db.getSyncQueue().map(item =>
-      item.status === 'FAILED'
-        ? ({ ...item, status: 'PENDING' as const } as SyncQueueItem)
-        : item
-    );
-    db.saveSyncQueue(queue);
+    // No local queue in online-only mode
   }
 
-  // Drop FAILED items (e.g. after user acknowledges).
   public static clearFailed(): void {
-    const queue = db.getSyncQueue().filter(q => q.status !== 'FAILED');
-    db.saveSyncQueue(queue);
-  }
-
-  public static async simulateServerSync(): Promise<{
-    success: boolean;
-    syncedCount: number;
-  }> {
-    if (SyncService.isSimulatingSync) {
-      return { success: false, syncedCount: 0 };
-    }
-
-    SyncService.isSimulatingSync = true;
-    const queue = db.getSyncQueue();
-    const pendingItems = queue.filter(item => item.status === 'PENDING');
-
-    if (pendingItems.length === 0) {
-      SyncService.isSimulatingSync = false;
-      return { success: true, syncedCount: 0 };
-    }
-
-    await new Promise(resolve => setTimeout(resolve, 1200));
-
-    const updatedQueue = queue.map(item => {
-      if (item.status === 'PENDING') {
-        return { ...item, status: 'SYNCED' as const };
-      }
-      return item;
-    });
-
-    db.saveSyncQueue(updatedQueue);
-    SyncService.isSimulatingSync = false;
-
-    return { success: true, syncedCount: pendingItems.length };
+    // No local queue in online-only mode
   }
 
   public static clearCompleted(): void {
-    const queue = db.getSyncQueue().filter(q => q.status !== 'SYNCED');
-    db.saveSyncQueue(queue);
+    // No local queue in online-only mode
   }
 
   public static applyCloudShops(
@@ -413,35 +285,11 @@ export class SyncService {
   ): void {
     if (!Array.isArray(cloudShops)) return;
 
-    const queue = db.getSyncQueue();
-    const pendingDeleteShopIds = new Set(
-      queue
-        .filter(q => q.status === 'PENDING' && (q.operation || q.action) === 'DELETE_SHOP')
-        .map(q => q.entityId)
-    );
-    const pendingMutateShopIds = new Set(
-      queue
-        .filter(
-          q =>
-            q.status === 'PENDING' &&
-            ['CREATE_SHOP', 'UPDATE_SHOP', 'TOGGLE_SHOP_STATUS'].includes(
-              String(q.operation || q.action)
-            )
-        )
-        .map(q => q.entityId)
-    );
-
-    const localShops = db.getShops();
-    const merged: any[] = options?.reconcileDeleted
-      ? localShops.filter(s => pendingMutateShopIds.has(s.id) && !pendingDeleteShopIds.has(s.id))
-      : localShops.filter(s => !pendingDeleteShopIds.has(s.id));
+    const merged: any[] = options?.reconcileDeleted ? [] : [...db.getShops()];
 
     cloudShops.forEach((cloudShop: any) => {
-      if (!cloudShop?.id || pendingDeleteShopIds.has(cloudShop.id)) return;
+      if (!cloudShop?.id) return;
       const index = merged.findIndex(s => s.id === cloudShop.id);
-      if (index !== -1 && pendingMutateShopIds.has(cloudShop.id)) {
-        return;
-      }
       const existing = index !== -1 ? merged[index] : undefined;
       const rawStatus = String(cloudShop.status || existing?.status || 'ACTIVE').toUpperCase();
       const shopData = {
@@ -453,8 +301,16 @@ export class SyncService {
         phone: cloudShop.phone ?? existing?.phone,
         status: (rawStatus === 'INACTIVE' ? 'INACTIVE' : 'ACTIVE') as 'ACTIVE' | 'INACTIVE',
         color: cloudShop.color ?? existing?.color,
-        createdAt: cloudShop.created_at || cloudShop.createdAt || existing?.createdAt || new Date().toISOString(),
-        updatedAt: cloudShop.updated_at || cloudShop.updatedAt || existing?.updatedAt || new Date().toISOString(),
+        createdAt:
+          cloudShop.created_at ||
+          cloudShop.createdAt ||
+          existing?.createdAt ||
+          new Date().toISOString(),
+        updatedAt:
+          cloudShop.updated_at ||
+          cloudShop.updatedAt ||
+          existing?.updatedAt ||
+          new Date().toISOString(),
       };
 
       if (index === -1) {
@@ -473,34 +329,11 @@ export class SyncService {
   ) {
     if (!Array.isArray(cloudStores)) return db.getStores();
 
-    const queue = db.getSyncQueue();
-    const pendingDeleteStoreIds = new Set(
-      queue
-        .filter(q => q.status === 'PENDING' && (q.operation || q.action) === 'DELETE_STORE')
-        .map(q => q.entityId)
-    );
-    const pendingMutateStoreIds = new Set(
-      queue
-        .filter(
-          q =>
-            q.status === 'PENDING' &&
-            ['CREATE_STORE', 'UPDATE_STORE'].includes(String(q.operation || q.action))
-        )
-        .map(q => q.entityId)
-    );
-
-    const localStores = db.getStores();
-    const mergedStores = options?.reconcileDeleted
-      ? localStores.filter(s => pendingMutateStoreIds.has(s.id) && !pendingDeleteStoreIds.has(s.id))
-      : localStores.filter(s => !pendingDeleteStoreIds.has(s.id));
+    const mergedStores: any[] = options?.reconcileDeleted ? [] : [...db.getStores()];
 
     cloudStores.forEach((cloudStore: any) => {
-      if (!cloudStore?.id || pendingDeleteStoreIds.has(cloudStore.id)) return;
+      if (!cloudStore?.id) return;
       const index = mergedStores.findIndex(s => s.id === cloudStore.id);
-      if (index !== -1 && pendingMutateStoreIds.has(cloudStore.id)) {
-        return;
-      }
-
       const existingStore = index !== -1 ? mergedStores[index] : undefined;
       const rawStatus = String(
         cloudStore.status || existingStore?.status || 'ACTIVE'
@@ -544,25 +377,24 @@ export class SyncService {
   }
 
   // ==========================================
-  // APPLY CLOUD DATA TO LOCAL DATABASE
+  // APPLY CLOUD DATA TO IN-MEMORY DATABASE
   // ==========================================
-  public static applyCloudData(cloudData: any): void {
+  public static applyCloudData(cloudData: any, isFullPull: boolean = true): void {
     if (!cloudData) return;
 
     // Apply shops
-    if (Array.isArray(cloudData.shops) && cloudData.shops.length > 0) {
-      this.applyCloudShops(cloudData.shops);
+    if (Array.isArray(cloudData.shops)) {
+      this.applyCloudShops(cloudData.shops, { reconcileDeleted: isFullPull });
     }
 
     // Apply stores (warehouses)
-    if (Array.isArray(cloudData.stores) && cloudData.stores.length > 0) {
-      this.applyCloudStores(cloudData.stores);
+    if (Array.isArray(cloudData.stores)) {
+      this.applyCloudStores(cloudData.stores, { reconcileDeleted: isFullPull });
     }
 
     // Apply users
-    if (cloudData.users && cloudData.users.length > 0) {
-      const localUsers = db.getUsers();
-      const mergedUsers = [...localUsers];
+    if (Array.isArray(cloudData.users)) {
+      const mergedUsers = isFullPull ? [] : [...db.getUsers()];
 
       cloudData.users.forEach((cloudUser: any) => {
         const index = mergedUsers.findIndex(u => u.id === cloudUser.id);
@@ -589,11 +421,7 @@ export class SyncService {
                 : cloudUser.assigned_shop_ids;
           }
         } catch (e) {
-          console.warn(
-            'Failed to parse assigned_shop_ids for user:',
-            cloudUser.id,
-            e
-          );
+          console.warn('Failed to parse assigned_shop_ids for user:', cloudUser.id, e);
           parsedShopIds = [];
         }
 
@@ -623,9 +451,8 @@ export class SyncService {
     }
 
     // Apply categories
-    if (cloudData.categories && cloudData.categories.length > 0) {
-      const localCats = db.getCategories();
-      const mergedCats = [...localCats];
+    if (Array.isArray(cloudData.categories)) {
+      const mergedCats = isFullPull ? [] : [...db.getCategories()];
 
       cloudData.categories.forEach((cloudCat: any) => {
         const index = mergedCats.findIndex(c => c.id === cloudCat.id);
@@ -651,12 +478,14 @@ export class SyncService {
     }
 
     // Apply products
-    if (cloudData.products && cloudData.products.length > 0) {
-      const localProducts = db.getProducts();
-      const mergedProducts = [...localProducts];
+    if (Array.isArray(cloudData.products)) {
+      const prevProductsMap = new Map(db.getProducts().map(p => [p.id, p]));
+      const mergedProducts = isFullPull ? [] : [...db.getProducts()];
 
       cloudData.products.forEach((cloudProduct: any) => {
         const index = mergedProducts.findIndex(p => p.id === cloudProduct.id);
+        const existingProd =
+          index !== -1 ? mergedProducts[index] : prevProductsMap.get(cloudProduct.id);
 
         const productImages = (cloudData.productImages || [])
           .filter((img: any) => img.product_id === cloudProduct.id)
@@ -687,7 +516,6 @@ export class SyncService {
           return raw as T;
         };
 
-        const existingProd = index !== -1 ? mergedProducts[index] : undefined;
         const parsedStoreStocks = parseMaybeJson<Record<string, number>>(
           cloudProduct.store_stocks ?? cloudProduct.storeStocks,
           existingProd?.storeStocks
@@ -738,9 +566,8 @@ export class SyncService {
     }
 
     // Apply sales
-    if (cloudData.sales && cloudData.sales.length > 0) {
-      const localSales = db.getSales();
-      const mergedSales = [...localSales];
+    if (Array.isArray(cloudData.sales)) {
+      const mergedSales = isFullPull ? [] : [...db.getSales()];
 
       cloudData.sales.forEach((cloudSale: any) => {
         const index = mergedSales.findIndex(s => s.id === cloudSale.id);
@@ -797,21 +624,11 @@ export class SyncService {
     }
 
     // Apply purchases
-    if (cloudData.purchases && cloudData.purchases.length > 0) {
-      const queue = db.getSyncQueue();
-      const pendingDeletePurchaseIds = new Set(
-        queue
-          .filter(q => q.status === 'PENDING' && (q.operation || q.action) === 'DELETE_PURCHASE')
-          .map(q => q.entityId)
-      );
-
-      const localPurchases = db
-        .getPurchases()
-        .filter(p => !pendingDeletePurchaseIds.has(p.id));
-      const mergedPurchases = [...localPurchases];
+    if (Array.isArray(cloudData.purchases)) {
+      const mergedPurchases = isFullPull ? [] : [...db.getPurchases()];
 
       cloudData.purchases.forEach((cloudPurchase: any) => {
-        if (!cloudPurchase?.id || pendingDeletePurchaseIds.has(cloudPurchase.id)) return;
+        if (!cloudPurchase?.id) return;
         const index = mergedPurchases.findIndex(p => p.id === cloudPurchase.id);
 
         const purchaseItems = (cloudData.purchaseItems || [])
@@ -857,9 +674,8 @@ export class SyncService {
     }
 
     // Apply purchase returns
-    if (cloudData.purchaseReturns && cloudData.purchaseReturns.length > 0) {
-      const localReturns = db.getPurchaseReturns();
-      const mergedReturns = [...localReturns];
+    if (Array.isArray(cloudData.purchaseReturns)) {
+      const mergedReturns = isFullPull ? [] : [...db.getPurchaseReturns()];
 
       cloudData.purchaseReturns.forEach((cloudRet: any) => {
         if (!cloudRet?.id) return;
@@ -912,9 +728,8 @@ export class SyncService {
     }
 
     // Apply expenses
-    if (cloudData.expenses && cloudData.expenses.length > 0) {
-      const localExpenses = db.getExpenses();
-      const mergedExpenses = [...localExpenses];
+    if (Array.isArray(cloudData.expenses)) {
+      const mergedExpenses = isFullPull ? [] : [...db.getExpenses()];
 
       cloudData.expenses.forEach((cloudExpense: any) => {
         const index = mergedExpenses.findIndex(e => e.id === cloudExpense.id);
@@ -946,10 +761,26 @@ export class SyncService {
       db.saveExpenses(mergedExpenses);
     }
 
-    // Apply debts
-    if (cloudData.debts && cloudData.debts.length > 0) {
-      const localDebts = db.getDebts();
-      const mergedDebts = [...localDebts];
+    // Apply debts & debt payments
+    if (Array.isArray(cloudData.debts)) {
+      const paymentsByDebt = new Map<string, any[]>();
+      if (Array.isArray(cloudData.debtPayments)) {
+        cloudData.debtPayments.forEach((p: any) => {
+          const dId = p.debt_id || p.debtId;
+          if (!dId) return;
+          const list = paymentsByDebt.get(dId) || [];
+          list.push({
+            id: p.id,
+            amount: Number(p.amount) || 0,
+            date: p.payment_date || p.date || p.created_at,
+            recordedBy: p.recorded_by_name || p.recordedBy || 'Staff',
+            notes: p.notes || undefined,
+          });
+          paymentsByDebt.set(dId, list);
+        });
+      }
+
+      const mergedDebts = isFullPull ? [] : [...db.getDebts()];
 
       cloudData.debts.forEach((cloudDebt: any) => {
         const index = mergedDebts.findIndex(d => d.id === cloudDebt.id);
@@ -961,7 +792,7 @@ export class SyncService {
           amount: cloudDebt.amount,
           paidAmount: cloudDebt.paid_amount,
           remainingAmount: cloudDebt.remaining_amount,
-          payments: [],
+          payments: paymentsByDebt.get(cloudDebt.id) || [],
           dueDate: cloudDebt.due_date,
           contact: cloudDebt.contact,
           notes: cloudDebt.notes,
@@ -988,9 +819,8 @@ export class SyncService {
     }
 
     // Apply movements
-    if (cloudData.movements && cloudData.movements.length > 0) {
-      const localMovements = db.getMovements();
-      const mergedMovements = [...localMovements];
+    if (Array.isArray(cloudData.movements)) {
+      const mergedMovements = isFullPull ? [] : [...db.getMovements()];
 
       cloudData.movements.forEach((cloudMovement: any) => {
         const index = mergedMovements.findIndex(m => m.id === cloudMovement.id);
@@ -1024,9 +854,8 @@ export class SyncService {
     }
 
     // Apply sale edit requests
-    if (cloudData.saleEditRequests && cloudData.saleEditRequests.length > 0) {
-      const localRequests = db.getSaleEditRequests();
-      const mergedRequests = [...localRequests];
+    if (Array.isArray(cloudData.saleEditRequests)) {
+      const mergedRequests = isFullPull ? [] : [...db.getSaleEditRequests()];
 
       cloudData.saleEditRequests.forEach((cloudRequest: any) => {
         const index = mergedRequests.findIndex(r => r.id === cloudRequest.id);
@@ -1120,23 +949,22 @@ export class SyncService {
             mergedSettings.customerDetailsByShop = cleanMap;
           }
         } catch {
-          // keep local map if malformed
+          // keep map if malformed
         }
       }
       if (cloudData.settings.receipt_header_note)
-        mergedSettings.receiptHeaderNote =
-          cloudData.settings.receipt_header_note;
+        mergedSettings.receiptHeaderNote = cloudData.settings.receipt_header_note;
       if (cloudData.settings.receipt_footer_note)
-        mergedSettings.receiptFooterNote =
-          cloudData.settings.receipt_footer_note;
+        mergedSettings.receiptFooterNote = cloudData.settings.receipt_footer_note;
 
       db.saveSettings(mergedSettings);
     }
 
     // Apply customer records
-    if (Array.isArray(cloudData.customerRecords) && cloudData.customerRecords.length > 0) {
-      const localRecords = db.getCustomerRecords();
-      const mergedMap = new Map(localRecords.map(r => [r.id, r]));
+    if (Array.isArray(cloudData.customerRecords)) {
+      const mergedMap = isFullPull
+        ? new Map<string, any>()
+        : new Map(db.getCustomerRecords().map(r => [r.id, r]));
 
       cloudData.customerRecords.forEach((cr: any) => {
         if (!cr?.id) return;
@@ -1189,26 +1017,12 @@ export class SyncService {
     }
 
     // Apply stock transfers
-    if (Array.isArray(cloudData.stockTransfers) && cloudData.stockTransfers.length > 0) {
-      const queue = db.getSyncQueue();
-      const pendingDeleteIds = new Set(
-        queue
-          .filter(q => q.status === 'PENDING' && (q.operation || q.action) === 'DELETE_STOCK_TRANSFER')
-          .map(q => q.entityId)
-      );
-      const pendingUpsertIds = new Set(
-        queue
-          .filter(q => q.status === 'PENDING' && (q.operation || q.action) === 'UPSERT_STOCK_TRANSFER')
-          .map(q => q.entityId)
-      );
-
-      const localTransfers = db.getStockTransfers().filter(t => !pendingDeleteIds.has(t.id));
-      const mergedTransfers = [...localTransfers];
+    if (Array.isArray(cloudData.stockTransfers)) {
+      const mergedTransfers = isFullPull ? [] : [...db.getStockTransfers()];
 
       cloudData.stockTransfers.forEach((ct: any) => {
-        if (!ct?.id || pendingDeleteIds.has(ct.id)) return;
+        if (!ct?.id) return;
         const idx = mergedTransfers.findIndex(t => t.id === ct.id);
-        if (idx !== -1 && pendingUpsertIds.has(ct.id)) return;
 
         let parsedItems: any[] = [];
         try {
@@ -1224,8 +1038,14 @@ export class SyncService {
 
         const record = {
           id: ct.id,
-          transferNumber: ct.transfer_number || ct.transferNumber || `TRF-${String(ct.id).slice(0, 6).toUpperCase()}`,
-          transferDate: ct.transfer_date || ct.transferDate || (ct.created_at || ct.createdAt || new Date().toISOString()).slice(0, 10),
+          transferNumber:
+            ct.transfer_number ||
+            ct.transferNumber ||
+            `TRF-${String(ct.id).slice(0, 6).toUpperCase()}`,
+          transferDate:
+            ct.transfer_date ||
+            ct.transferDate ||
+            (ct.created_at || ct.createdAt || new Date().toISOString()).slice(0, 10),
           sourceType: (ct.source_type || ct.sourceType || 'STORE') as 'STORE' | 'SHOP',
           sourceId: ct.source_id || ct.sourceId || '',
           sourceName: ct.source_name || ct.sourceName || 'Source',
@@ -1238,7 +1058,9 @@ export class SyncService {
           destLocation: ct.dest_location || ct.destLocation || undefined,
           destShopId: ct.dest_shop_id || ct.destShopId || '',
           destShopName: ct.dest_shop_name || ct.destShopName || undefined,
-          status: (ct.status === 'NOT_COMPLETED' ? 'NOT_COMPLETED' : 'COMPLETED') as 'COMPLETED' | 'NOT_COMPLETED',
+          status: (ct.status === 'NOT_COMPLETED' ? 'NOT_COMPLETED' : 'COMPLETED') as
+            | 'COMPLETED'
+            | 'NOT_COMPLETED',
           shippingCharges: Number(ct.shipping_charges ?? ct.shippingCharges ?? 0),
           notice: ct.notice || undefined,
           items: parsedItems,
@@ -1264,6 +1086,7 @@ export class SyncService {
 
     // Reconstruct per-store stock breakdown from movements/purchases when missing after cloud pull
     this.reconcileStoreStocksFromMovements();
+    db.setCloudLoaded(true);
   }
 
   public static reconcileStoreStocksFromMovements(): void {
@@ -1341,8 +1164,7 @@ export class SyncService {
       const prodMv = mvByProduct.get(p.id);
       if (prodMv && prodMv.size > 0) {
         const positiveEntries = Array.from(prodMv.entries()).filter(
-          ([sid, qty]) =>
-            qty > 0 && fallbackWarehouses.some(w => w.id === sid)
+          ([sid, qty]) => qty > 0 && fallbackWarehouses.some(w => w.id === sid)
         );
         if (positiveEntries.length > 0) {
           const mvSum = positiveEntries.reduce((s, [, q]) => s + q, 0);

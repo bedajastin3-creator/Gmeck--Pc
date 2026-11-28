@@ -23,6 +23,7 @@ import { SellerService } from '../../services/sellerService';
 import { AuthService } from '../../services/authService';
 import { StorageService } from '../../db/storage';
 import { CloudflareApi } from '../../services/cloudflareApi';
+import { SyncService } from '../../services/syncService';
 import { User, SellerPermissions } from '../../types';
 import { SELLER_COLORS, getSellerColorById } from '../../utils/colors';
 import { formatCurrency, formatDateTime } from '../../utils/formatters';
@@ -132,22 +133,47 @@ export const AdminSellers: React.FC = () => {
         const users = StorageService.getUsers();
         const userIndex = users.findIndex(u => u.id === sellerId);
         if (userIndex !== -1) {
-          users[userIndex].avatarUrl = result.url;
+          const updatedUser = {
+            ...users[userIndex],
+            avatarUrl: result.url,
+            updatedAt: new Date().toISOString(),
+          };
+          const commitRes = await SyncService.commitOperation({
+            operation: 'UPDATE_SELLER',
+            entityType: 'USER',
+            entityId: updatedUser.id,
+            payload: updatedUser,
+          });
+          if (!commitRes.success) {
+            addToast({
+              type: 'error',
+              title: 'Upload Failed',
+              description: commitRes.error || CloudflareApi.OFFLINE_ERROR_MESSAGE,
+            });
+            return;
+          }
+          users[userIndex] = updatedUser;
           StorageService.saveUsers(users);
           if (refreshUser) refreshUser();
         }
-        
+
         addToast({
           type: 'success',
           title: 'Profile Picture Updated',
-          description: 'Seller profile picture has been updated successfully.',
+          description: 'Seller profile picture has been updated in the cloud.',
+        });
+      } else {
+        addToast({
+          type: 'error',
+          title: 'Upload Failed',
+          description: result.error || CloudflareApi.OFFLINE_ERROR_MESSAGE,
         });
       }
     } catch (error: any) {
       addToast({
         type: 'error',
         title: 'Upload Failed',
-        description: error.message || 'Could not upload profile picture.',
+        description: CloudflareApi.formatError(error, 'Could not upload profile picture.'),
       });
     } finally {
       setIsUploadingAvatar(false);
@@ -234,9 +260,9 @@ export const AdminSellers: React.FC = () => {
     }));
   };
 
-  const handleQuickToggleSellerExpenses = (seller: User) => {
+  const handleQuickToggleSellerExpenses = async (seller: User) => {
     const nextAllowed = !seller.permissions?.canRecordExpenses;
-    const res = SellerService.updateSeller(
+    const res = await SellerService.updateSeller(
       seller.id,
       {
         permissions: {
@@ -306,7 +332,7 @@ export const AdminSellers: React.FC = () => {
     }
   };
 
-  const handleUpdateSeller = (e: React.FormEvent) => {
+  const handleUpdateSeller = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!selectedSeller) return;
 
@@ -315,7 +341,7 @@ export const AdminSellers: React.FC = () => {
       return;
     }
 
-    const res = SellerService.updateSeller(
+    const res = await SellerService.updateSeller(
       selectedSeller.id,
       {
         name: name.trim(),
@@ -371,9 +397,9 @@ export const AdminSellers: React.FC = () => {
     }
   };
 
-  const handleToggleStatus = (s: User) => {
+  const handleToggleStatus = async (s: User) => {
     const newStatus = s.status === 'ACTIVE' ? 'INACTIVE' : 'ACTIVE';
-    const res = SellerService.toggleSellerStatus(s.id, newStatus, currentUser);
+    const res = await SellerService.toggleSellerStatus(s.id, newStatus, currentUser);
 
     if (res.success) {
       addToast({
@@ -390,10 +416,10 @@ export const AdminSellers: React.FC = () => {
     }
   };
 
-  const handleDeleteSeller = () => {
+  const handleDeleteSeller = async () => {
     if (!deletingSeller || !currentUser) return;
 
-    const res = SellerService.deleteSeller(deletingSeller.id, currentUser);
+    const res = await SellerService.deleteSeller(deletingSeller.id, currentUser);
 
     if (res.success) {
       addToast({

@@ -8,6 +8,8 @@ import {
   isPlatformAdmin,
   isShopAdmin,
 } from '../utils/permissions';
+import { CloudflareApi } from './cloudflareApi';
+import { SyncService } from './syncService';
 
 function getAllowedSellerShopIds(user: User): Set<string> | null {
   if (isPlatformAdmin(user)) return null;
@@ -119,30 +121,32 @@ export class SellerService {
       updatedAt: new Date().toISOString(),
     };
 
-    db.saveUsers([...users, newSeller]);
+    const sellerPayload = {
+      id: newSeller.id,
+      username: newSeller.username,
+      name: newSeller.name,
+      role: newSeller.role,
+      passwordHash: newSeller.passwordHash,
+      color: newSeller.color,
+      status: newSeller.status,
+      assignedShopIds: newSeller.assignedShopIds,
+      avatarUrl: newSeller.avatarUrl || null,
+      permissions: newSeller.permissions || {},
+      createdAt: newSeller.createdAt,
+      updatedAt: newSeller.updatedAt,
+    };
 
-    db.enqueueSync({
-      id: generateUUID(),
+    const commit = await SyncService.commitOperation({
       operation: 'CREATE_SELLER',
       entityType: 'SELLER',
       entityId: newSeller.id,
-      payload: {
-        id: newSeller.id,
-        username: newSeller.username,
-        name: newSeller.name,
-        role: newSeller.role,
-        passwordHash: newSeller.passwordHash,
-        color: newSeller.color,
-        status: newSeller.status,
-        assignedShopIds: newSeller.assignedShopIds,
-        avatarUrl: newSeller.avatarUrl || null,
-        permissions: newSeller.permissions || {},
-        createdAt: newSeller.createdAt,
-        updatedAt: newSeller.updatedAt,
-      },
-      status: 'PENDING',
-      createdAt: new Date().toISOString(),
+      payload: sellerPayload,
     });
+    if (!commit.success) {
+      return { success: false, error: commit.error || CloudflareApi.OFFLINE_ERROR_MESSAGE };
+    }
+
+    db.saveUsers([...users, newSeller]);
 
     db.addAuditLog({
       id: generateUUID(),
@@ -161,7 +165,7 @@ export class SellerService {
   /**
    * Admin or Seller with canManageSellers permission updates a seller.
    */
-  public static updateSeller(
+  public static async updateSeller(
     sellerId: string,
     params: {
       name?: string;
@@ -171,7 +175,7 @@ export class SellerService {
       permissions?: SellerPermissions;
     },
     currentUser: User
-  ): { success: boolean; seller?: User; error?: string } {
+  ): Promise<{ success: boolean; seller?: User; error?: string }> {
     const perms = getEffectiveSellerPermissions(currentUser);
     if (!hasAdminAccess(currentUser) && !perms.canManageSellers) {
       return { success: false, error: 'Permission Denied: Only Admin can manage seller profiles.' };
@@ -183,12 +187,12 @@ export class SellerService {
       return { success: false, error: 'Seller account not found.' };
     }
 
-    const seller = users[index];
+    const updatedSeller: User = { ...users[index] };
     const platformAdmin = isPlatformAdmin(currentUser);
     const allowedShopIds = getAllowedSellerShopIds(currentUser);
 
     if (!platformAdmin && allowedShopIds) {
-      const inManagedShop = (seller.assignedShopIds || []).some(id => allowedShopIds.has(id));
+      const inManagedShop = (updatedSeller.assignedShopIds || []).some(id => allowedShopIds.has(id));
       if (!inManagedShop) {
         return {
           success: false,
@@ -198,20 +202,20 @@ export class SellerService {
     }
 
     if (params.name?.trim()) {
-      seller.name = params.name.trim();
+      updatedSeller.name = params.name.trim();
     }
 
     if (params.color) {
-      seller.color = params.color;
+      updatedSeller.color = params.color;
     }
 
     if (params.status) {
-      seller.status = params.status;
+      updatedSeller.status = params.status;
     }
 
     if (params.assignedShopIds !== undefined) {
       if (!platformAdmin && allowedShopIds) {
-        const externalShopIds = (seller.assignedShopIds || []).filter(
+        const externalShopIds = (updatedSeller.assignedShopIds || []).filter(
           id => !allowedShopIds.has(id)
         );
         const scopedSelection = params.assignedShopIds.filter(id => allowedShopIds.has(id));
@@ -221,79 +225,81 @@ export class SellerService {
             error: 'Please select at least one shop within your management scope.',
           };
         }
-        seller.assignedShopIds = Array.from(new Set([...externalShopIds, ...scopedSelection]));
+        updatedSeller.assignedShopIds = Array.from(new Set([...externalShopIds, ...scopedSelection]));
       } else {
-        seller.assignedShopIds = params.assignedShopIds;
+        updatedSeller.assignedShopIds = params.assignedShopIds;
       }
     }
 
     if (params.permissions !== undefined) {
       if (platformAdmin) {
-        seller.permissions = params.permissions;
+        updatedSeller.permissions = params.permissions;
       } else if (isShopAdmin(currentUser)) {
-        seller.permissions = {
-          ...(seller.permissions || {}),
+        updatedSeller.permissions = {
+          ...(updatedSeller.permissions || {}),
           canRecordExpenses: Boolean(params.permissions.canRecordExpenses),
         };
       }
     }
 
-    seller.updatedAt = new Date().toISOString();
-    users[index] = seller;
-    db.saveUsers(users);
+    updatedSeller.updatedAt = new Date().toISOString();
 
-    db.enqueueSync({
-      id: generateUUID(),
+    const commit = await SyncService.commitOperation({
       operation: 'UPDATE_SELLER',
       entityType: 'SELLER',
-      entityId: seller.id,
+      entityId: updatedSeller.id,
       payload: {
-        id: seller.id,
-        username: seller.username,
-        name: seller.name,
-        role: seller.role,
-        passwordHash: seller.passwordHash,
-        color: seller.color,
-        status: seller.status,
-        assignedShopIds: seller.assignedShopIds,
-        avatarUrl: seller.avatarUrl || null,
-        permissions: seller.permissions || {},
-        createdAt: seller.createdAt,
-        updatedAt: seller.updatedAt,
+        id: updatedSeller.id,
+        username: updatedSeller.username,
+        name: updatedSeller.name,
+        role: updatedSeller.role,
+        passwordHash: updatedSeller.passwordHash,
+        color: updatedSeller.color,
+        status: updatedSeller.status,
+        assignedShopIds: updatedSeller.assignedShopIds,
+        avatarUrl: updatedSeller.avatarUrl || null,
+        permissions: updatedSeller.permissions || {},
+        createdAt: updatedSeller.createdAt,
+        updatedAt: updatedSeller.updatedAt,
       },
-      status: 'PENDING',
-      createdAt: new Date().toISOString(),
     });
+    if (!commit.success) {
+      return { success: false, error: commit.error || CloudflareApi.OFFLINE_ERROR_MESSAGE };
+    }
+
+    const nextUsers = [...users];
+    nextUsers[index] = updatedSeller;
+    db.saveUsers(nextUsers);
 
     db.addAuditLog({
       id: generateUUID(),
       userId: currentUser.id,
       userName: currentUser.name,
       action: 'UPDATE_SELLER',
-      details: `Updated seller ${seller.name} (Status: ${seller.status}, Color: ${seller.color}, Assigned Shops: ${seller.assignedShopIds?.length || 0})`,
+      details: `Updated seller ${updatedSeller.name} (Status: ${updatedSeller.status}, Color: ${updatedSeller.color}, Assigned Shops: ${updatedSeller.assignedShopIds?.length || 0})`,
       entityType: 'SELLER',
-      entityId: seller.id,
+      entityId: updatedSeller.id,
       timestamp: new Date().toISOString(),
     });
 
-    return { success: true, seller };
+    return { success: true, seller: updatedSeller };
   }
 
-  public static toggleSellerStatus(
+  public static async toggleSellerStatus(
     sellerId: string,
     status: UserStatus,
     currentUser: User
-  ): { success: boolean; error?: string } {
+  ): Promise<{ success: boolean; error?: string }> {
     return SellerService.updateSeller(sellerId, { status }, currentUser);
   }
 
   /**
    * Admin or Seller with canManageSellers permission deletes a seller.
    */
-  public static deleteSeller(
+  public static async deleteSeller(
     sellerId: string,
     currentUser: User
-  ): { success: boolean; error?: string } {
+  ): Promise<{ success: boolean; error?: string }> {
     const perms = getEffectiveSellerPermissions(currentUser);
     if (!hasAdminAccess(currentUser) && !perms.canManageSellers) {
       return { success: false, error: 'Permission Denied: Only Admin can delete sellers.' };
@@ -301,7 +307,7 @@ export class SellerService {
 
     const users = db.getUsers();
     const seller = users.find(u => u.id === sellerId && u.role === 'SELLER');
-    
+
     if (!seller) {
       return { success: false, error: 'Seller not found.' };
     }
@@ -326,22 +332,19 @@ export class SellerService {
       }
     }
 
-    // Remove seller from users
-    const updatedUsers = users.filter(u => u.id !== sellerId);
-    db.saveUsers(updatedUsers);
-
-    // Sync to cloud
-    db.enqueueSync({
-      id: generateUUID(),
+    const commit = await SyncService.commitOperation({
       operation: 'DELETE_SELLER',
       entityType: 'SELLER',
       entityId: sellerId,
       payload: { id: sellerId },
-      status: 'PENDING',
-      createdAt: new Date().toISOString(),
     });
+    if (!commit.success) {
+      return { success: false, error: commit.error || CloudflareApi.OFFLINE_ERROR_MESSAGE };
+    }
 
-    // Audit log
+    const updatedUsers = users.filter(u => u.id !== sellerId);
+    db.saveUsers(updatedUsers);
+
     db.addAuditLog({
       id: generateUUID(),
       userId: currentUser.id,
@@ -359,45 +362,51 @@ export class SellerService {
   /**
    * Seller or Admin updates the seller's account color.
    */
-  public static updateSellerColor(
+  public static async updateSellerColor(
     sellerId: string,
     color: string,
     currentUser: User
-  ): { success: boolean; error?: string } {
+  ): Promise<{ success: boolean; error?: string }> {
     if (currentUser.role !== 'ADMIN' && currentUser.id !== sellerId) {
       return { success: false, error: 'Permission Denied: You cannot modify another user color.' };
     }
 
     const users = db.getUsers();
-    const user = users.find(u => u.id === sellerId);
-    if (!user) return { success: false, error: 'User not found.' };
+    const index = users.findIndex(u => u.id === sellerId);
+    if (index === -1) return { success: false, error: 'User not found.' };
 
-    user.color = color;
-    user.updatedAt = new Date().toISOString();
-    db.saveUsers(users);
+    const updatedUser: User = {
+      ...users[index],
+      color,
+      updatedAt: new Date().toISOString(),
+    };
 
-    db.enqueueSync({
-      id: generateUUID(),
+    const commit = await SyncService.commitOperation({
       operation: 'UPDATE_SELLER',
       entityType: 'SELLER',
-      entityId: user.id,
+      entityId: updatedUser.id,
       payload: {
-        id: user.id,
-        username: user.username,
-        name: user.name,
-        role: user.role,
-        passwordHash: user.passwordHash,
-        color: user.color,
-        status: user.status,
-        assignedShopIds: user.assignedShopIds,
-        avatarUrl: user.avatarUrl || null,
-        permissions: user.permissions || {},
-        createdAt: user.createdAt,
-        updatedAt: user.updatedAt,
+        id: updatedUser.id,
+        username: updatedUser.username,
+        name: updatedUser.name,
+        role: updatedUser.role,
+        passwordHash: updatedUser.passwordHash,
+        color: updatedUser.color,
+        status: updatedUser.status,
+        assignedShopIds: updatedUser.assignedShopIds,
+        avatarUrl: updatedUser.avatarUrl || null,
+        permissions: updatedUser.permissions || {},
+        createdAt: updatedUser.createdAt,
+        updatedAt: updatedUser.updatedAt,
       },
-      status: 'PENDING',
-      createdAt: new Date().toISOString(),
     });
+    if (!commit.success) {
+      return { success: false, error: commit.error || CloudflareApi.OFFLINE_ERROR_MESSAGE };
+    }
+
+    const nextUsers = [...users];
+    nextUsers[index] = updatedUser;
+    db.saveUsers(nextUsers);
 
     return { success: true };
   }

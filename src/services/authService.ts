@@ -1,17 +1,15 @@
-// src/services/authService.ts (UPDATED WITH REMEMBER ME & PERMISSIONS)
+// src/services/authService.ts
 import { db } from '../db/storage';
 import { User, UserRole, SellerPermissions } from '../types';
 import { hashPassword, verifyPassword, generateUUID } from '../utils/crypto';
 import { CloudflareApi } from './cloudflareApi';
+import { SyncService } from './syncService';
 import { getShopAdminShopIds, hasAdminAccess, isPlatformAdmin, isShopAdmin } from '../utils/permissions';
 
 const AUTH_STORAGE_KEY = 'omnibiz_active_session_v1';
 const REMEMBER_KEY = 'omnibiz_remember_me';
 
 export class AuthService {
-  /**
-   * Helper to parse permissions from various sources (string or object)
-   */
   private static parsePermissions(permissions: any): SellerPermissions {
     if (!permissions) return {};
     try {
@@ -34,64 +32,66 @@ export class AuthService {
     plainPassword: string,
     expectedRole?: UserRole
   ): Promise<{ success: boolean; user?: User; error?: string }> {
+    if (!CloudflareApi.isOnline()) {
+      return { success: false, error: CloudflareApi.OFFLINE_ERROR_MESSAGE };
+    }
+
     const trimmedUsername = username.trim().toLowerCase();
+
+    try {
+      // Always pull fresh users and cloud state first so roles/permissions/passwords are authoritative
+      const pullResult = await CloudflareApi.pullSync();
+      if (!pullResult?.success || !pullResult?.data) {
+        return {
+          success: false,
+          error: pullResult?.error || 'Could not reach cloud database. Wait for internet connection.',
+        };
+      }
+      SyncService.applyCloudData(pullResult.data, true);
+    } catch (err: any) {
+      return {
+        success: false,
+        error: CloudflareApi.formatError(err, CloudflareApi.OFFLINE_ERROR_MESSAGE),
+      };
+    }
+
     const users = db.getUsers();
-    const user = users.find(u => u.username.toLowerCase() === trimmedUsername);
+    let user = users.find(u => u.username.toLowerCase() === trimmedUsername);
+
+    // Fallback to /auth/login endpoint if user wasn't matched or to obtain an API token
+    if (!user) {
+      try {
+        const cloudResult = await CloudflareApi.login(username, plainPassword);
+        if (cloudResult?.success && cloudResult.user) {
+          const parsedPermissions = AuthService.parsePermissions(cloudResult.user.permissions);
+          const cloudUser: User = {
+            id: cloudResult.user.id,
+            username: cloudResult.user.username,
+            name: cloudResult.user.name,
+            role: cloudResult.user.role,
+            passwordHash: await hashPassword(plainPassword),
+            color: cloudResult.user.color || 'blue',
+            status: cloudResult.user.status || 'ACTIVE',
+            assignedShopIds: cloudResult.user.assignedShopIds || [],
+            avatarUrl: cloudResult.user.avatarUrl || cloudResult.user.avatar_url || null,
+            permissions: parsedPermissions,
+            createdAt: cloudResult.user.created_at || new Date().toISOString(),
+            updatedAt: cloudResult.user.updated_at || new Date().toISOString(),
+          };
+          db.saveUsers([...db.getUsers().filter(u => u.id !== cloudUser.id), cloudUser]);
+          if (cloudResult.token) {
+            CloudflareApi.setToken(cloudResult.token);
+          }
+          user = cloudUser;
+        }
+      } catch (err: any) {
+        if (CloudflareApi.isNetworkError(err)) {
+          return { success: false, error: CloudflareApi.OFFLINE_ERROR_MESSAGE };
+        }
+      }
+    }
 
     if (!user) {
-      // Try cloud login if local user not found
-      try {
-        const online = await CloudflareApi.checkConnection();
-        if (online) {
-          const cloudResult = await CloudflareApi.login(username, plainPassword);
-          if (cloudResult.success && cloudResult.user) {
-            // Parse permissions from cloud response
-            const parsedPermissions = AuthService.parsePermissions(cloudResult.user.permissions);
-            
-            const cloudUser: User = {
-              id: cloudResult.user.id,
-              username: cloudResult.user.username,
-              name: cloudResult.user.name,
-              role: cloudResult.user.role,
-              passwordHash: await hashPassword(plainPassword),
-              color: cloudResult.user.color || 'blue',
-              status: cloudResult.user.status || 'ACTIVE',
-              assignedShopIds: cloudResult.user.assignedShopIds || [],
-              avatarUrl: cloudResult.user.avatarUrl || cloudResult.user.avatar_url || null,
-              permissions: parsedPermissions,
-              createdAt: cloudResult.user.created_at || new Date().toISOString(),
-              updatedAt: cloudResult.user.updated_at || new Date().toISOString(),
-            };
-            
-            const updatedUsers = [...db.getUsers().filter(u => u.id !== cloudUser.id), cloudUser];
-            db.saveUsers(updatedUsers);
-            
-            if (cloudResult.token) {
-              CloudflareApi.setToken(cloudResult.token);
-            }
-            
-            AuthService.setActiveUser(cloudUser);
-            
-            db.addAuditLog({
-              id: generateUUID(),
-              userId: cloudUser.id,
-              userName: cloudUser.name,
-              action: 'USER_LOGIN',
-              details: `${cloudUser.role} login successful via cloud (${cloudUser.username})`,
-              entityType: 'AUTH',
-              entityId: cloudUser.id,
-              timestamp: new Date().toISOString(),
-            });
-            
-            console.log('[Login] Cloud user:', { id: cloudUser.id, role: cloudUser.role, permissions: cloudUser.permissions });
-            
-            return { success: true, user: cloudUser };
-          }
-        }
-      } catch (error) {
-        console.log('Cloud login failed, continuing offline:', error);
-      }
-      
       return { success: false, error: 'Account not found. Please check your username.' };
     }
 
@@ -109,33 +109,28 @@ export class AuthService {
       };
     }
 
-    // Verify password hash
     const isValid = await verifyPassword(plainPassword, user.passwordHash);
     if (!isValid) {
-      // Fallback check for admin 52775277 or seller default passwords
-      if (plainPassword === '52775277' && user.role === 'ADMIN') {
-        const newHash = await hashPassword('52775277');
-        user.passwordHash = newHash;
-        db.saveUsers(users);
-      } else if (plainPassword === 'seller123' && user.role === 'SELLER') {
-        const newHash = await hashPassword('seller123');
-        user.passwordHash = newHash;
-        db.saveUsers(users);
-      } else {
-        return { success: false, error: 'Incorrect password. Please try again.' };
-      }
+      return { success: false, error: 'Incorrect password. Please try again.' };
     }
 
-    // Ensure permissions are parsed correctly from local user
     if (user.permissions && typeof user.permissions === 'string') {
       user.permissions = AuthService.parsePermissions(user.permissions);
-      db.saveUsers(users);
+      db.saveUsers(db.getUsers().map(u => (u.id === user!.id ? user! : u)));
     }
 
-    // Persist session locally
+    // Obtain/refresh API token online without blocking if /auth/login returns extra metadata
+    try {
+      const result = await CloudflareApi.login(username, plainPassword);
+      if (result?.success && result.token) {
+        CloudflareApi.setToken(result.token);
+      }
+    } catch {
+      // Token fetch optional if pullSync already authenticated
+    }
+
     AuthService.setActiveUser(user);
 
-    // Audit log
     db.addAuditLog({
       id: generateUUID(),
       userId: user.id,
@@ -147,39 +142,6 @@ export class AuthService {
       timestamp: new Date().toISOString(),
     });
 
-    console.log('[Login] Local user:', { id: user.id, name: user.name, role: user.role, permissions: user.permissions });
-
-    // Try cloud login in background (non-blocking)
-    CloudflareApi.login(username, plainPassword)
-      .then(result => {
-        if (result.success && result.token) {
-          CloudflareApi.setToken(result.token);
-          if (result.user) {
-            const latestUsers = db.getUsers();
-            const idx = latestUsers.findIndex(u => u.id === user.id);
-            if (idx !== -1) {
-              const cloudPerms = AuthService.parsePermissions(result.user.permissions);
-              const cloudShops = Array.isArray(result.user.assignedShopIds)
-                ? result.user.assignedShopIds
-                : latestUsers[idx].assignedShopIds;
-              latestUsers[idx] = {
-                ...latestUsers[idx],
-                permissions: result.user.permissions !== undefined ? cloudPerms : latestUsers[idx].permissions,
-                assignedShopIds: cloudShops,
-                avatarUrl: result.user.avatarUrl ?? latestUsers[idx].avatarUrl,
-                color: result.user.color ?? latestUsers[idx].color,
-                status: result.user.status ?? latestUsers[idx].status,
-              };
-              db.saveUsers(latestUsers);
-            }
-          }
-          console.log('Cloud token stored for future sync');
-        }
-      })
-      .catch(() => {
-        console.log('Cloud login deferred - will sync later');
-      });
-
     return { success: true, user };
   }
 
@@ -188,11 +150,16 @@ export class AuthService {
       const stored = localStorage.getItem(AUTH_STORAGE_KEY);
       if (!stored) return null;
       const parsed = JSON.parse(stored) as User;
-      // Refresh user from database to ensure up-to-date color/status/permissions
+
+      // Before cloud finishes loading at startup, return the saved session identity
+      // so AppContext knows whether a user was signed in; once cloud is loaded, validate against live cloud users.
+      if (!db.isCloudLoaded()) {
+        return parsed;
+      }
+
       const users = db.getUsers();
       const current = users.find(u => u.id === parsed.id);
       if (current && current.status === 'ACTIVE') {
-        // Ensure permissions are parsed
         if (current.permissions && typeof current.permissions === 'string') {
           current.permissions = AuthService.parsePermissions(current.permissions);
         }
@@ -212,10 +179,6 @@ export class AuthService {
     }
   }
 
-  // ==========================================
-  // REMEMBER ME FUNCTIONS
-  // ==========================================
-  
   public static setRememberMe(user: User): void {
     localStorage.setItem(REMEMBER_KEY, JSON.stringify({ userId: user.id }));
   }
@@ -226,13 +189,13 @@ export class AuthService {
 
   public static getRememberedUser(): User | null {
     try {
+      if (!db.isCloudLoaded()) return null;
       const remembered = localStorage.getItem(REMEMBER_KEY);
       if (!remembered) return null;
       const { userId } = JSON.parse(remembered);
       const users = db.getUsers();
       const user = users.find(u => u.id === userId);
       if (user && user.status === 'ACTIVE') {
-        // Ensure permissions are parsed
         if (user.permissions && typeof user.permissions === 'string') {
           user.permissions = AuthService.parsePermissions(user.permissions);
         }
@@ -258,15 +221,11 @@ export class AuthService {
         entityId: user.id,
         timestamp: new Date().toISOString(),
       });
-      
-      // Sync logout to cloud (non-blocking)
-      CloudflareApi.logout(user.id).catch(() => {
-        console.log('Cloud logout deferred');
-      });
+
+      CloudflareApi.logout(user.id).catch(() => {});
       CloudflareApi.clearToken();
     }
     AuthService.setActiveUser(null);
-    // Keep remember me for next auto-login
   }
 
   public static async adminResetPassword(
@@ -275,7 +234,10 @@ export class AuthService {
     currentUser: User
   ): Promise<{ success: boolean; error?: string }> {
     if (!hasAdminAccess(currentUser)) {
-      return { success: false, error: 'Permission denied: Only Admin or Shop Admin can reset seller passwords.' };
+      return {
+        success: false,
+        error: 'Permission denied: Only Admin or Shop Admin can reset seller passwords.',
+      };
     }
     return AuthService.changePassword(sellerId, '', newPass, currentUser);
   }
@@ -286,7 +248,6 @@ export class AuthService {
     newPassword: string,
     callerUser: User
   ): Promise<{ success: boolean; error?: string }> {
-    // Sellers can change only their own password. Platform Admin can change any password; Shop Admin can reset sellers in their managed shops.
     if (!hasAdminAccess(callerUser) && callerUser.id !== userId) {
       return { success: false, error: 'Permission denied: You cannot change another user password.' };
     }
@@ -314,7 +275,6 @@ export class AuthService {
       }
     }
 
-    // If seller is changing own password, verify old password first
     if (callerUser.id === userId && callerUser.role === 'SELLER') {
       const isValid = await verifyPassword(currentPassword, targetUser.passwordHash);
       if (!isValid) {
@@ -323,33 +283,60 @@ export class AuthService {
     }
 
     const newHash = await hashPassword(newPassword);
-    targetUser.passwordHash = newHash;
-    targetUser.updatedAt = new Date().toISOString();
+    const updatedUser: User = {
+      ...targetUser,
+      passwordHash: newHash,
+      updatedAt: new Date().toISOString(),
+    };
 
-    db.saveUsers(users);
+    const commit = await SyncService.commitOperation({
+      operation: 'UPDATE_SELLER',
+      entityType: 'SELLER',
+      entityId: updatedUser.id,
+      payload: {
+        id: updatedUser.id,
+        username: updatedUser.username,
+        name: updatedUser.name,
+        role: updatedUser.role,
+        passwordHash: updatedUser.passwordHash,
+        color: updatedUser.color,
+        status: updatedUser.status,
+        assignedShopIds: updatedUser.assignedShopIds,
+        avatarUrl: updatedUser.avatarUrl || null,
+        permissions: updatedUser.permissions || {},
+        createdAt: updatedUser.createdAt,
+        updatedAt: updatedUser.updatedAt,
+      },
+    });
+
+    if (!commit.success) {
+      return { success: false, error: commit.error || CloudflareApi.OFFLINE_ERROR_MESSAGE };
+    }
+
+    db.saveUsers(users.map(u => (u.id === updatedUser.id ? updatedUser : u)));
+    if (callerUser.id === updatedUser.id) {
+      AuthService.setActiveUser(updatedUser);
+    }
 
     db.addAuditLog({
       id: generateUUID(),
       userId: callerUser.id,
       userName: callerUser.name,
       action: 'PASSWORD_CHANGE',
-      details: `Password changed for user ${targetUser.username} by ${callerUser.name}`,
+      details: `Password changed for user ${updatedUser.username} by ${callerUser.name}`,
       entityType: 'SELLER',
-      entityId: targetUser.id,
+      entityId: updatedUser.id,
       timestamp: new Date().toISOString(),
     });
 
     return { success: true };
   }
 
-  // ==========================================
-  // CHANGE ADMIN USERNAME
-  // ==========================================
-  public static changeAdminUsername(
+  public static async changeAdminUsername(
     adminUserId: string,
     newUsername: string,
     currentUser: User
-  ): { success: boolean; error?: string } {
+  ): Promise<{ success: boolean; error?: string }> {
     if (currentUser.role !== 'ADMIN') {
       return { success: false, error: 'Permission denied: Only Admin can change username.' };
     }
@@ -360,8 +347,7 @@ export class AuthService {
 
     const cleanUsername = newUsername.trim().toLowerCase();
     const users = db.getUsers();
-    
-    // Check if username already taken
+
     if (users.some(u => u.username.toLowerCase() === cleanUsername && u.id !== adminUserId)) {
       return { success: false, error: `Username '${cleanUsername}' is already taken.` };
     }
@@ -371,36 +357,38 @@ export class AuthService {
       return { success: false, error: 'Admin user not found.' };
     }
 
-    targetUser.username = cleanUsername;
-    targetUser.updatedAt = new Date().toISOString();
-    db.saveUsers(users);
+    const updatedUser: User = {
+      ...targetUser,
+      username: cleanUsername,
+      updatedAt: new Date().toISOString(),
+    };
 
-    // Update active session
-    AuthService.setActiveUser(targetUser);
-
-    // Sync to cloud - INCLUDE PERMISSIONS
-    db.enqueueSync({
-      id: generateUUID(),
+    const commit = await SyncService.commitOperation({
       operation: 'UPDATE_SELLER',
       entityType: 'SELLER',
-      entityId: targetUser.id,
+      entityId: updatedUser.id,
       payload: {
-        id: targetUser.id,
-        username: targetUser.username,
-        name: targetUser.name,
-        role: targetUser.role,
-        passwordHash: targetUser.passwordHash,
-        color: targetUser.color,
-        status: targetUser.status,
-        assignedShopIds: targetUser.assignedShopIds,
-        avatarUrl: targetUser.avatarUrl || null,
-        permissions: targetUser.permissions || {},
-        createdAt: targetUser.createdAt,
-        updatedAt: targetUser.updatedAt,
+        id: updatedUser.id,
+        username: updatedUser.username,
+        name: updatedUser.name,
+        role: updatedUser.role,
+        passwordHash: updatedUser.passwordHash,
+        color: updatedUser.color,
+        status: updatedUser.status,
+        assignedShopIds: updatedUser.assignedShopIds,
+        avatarUrl: updatedUser.avatarUrl || null,
+        permissions: updatedUser.permissions || {},
+        createdAt: updatedUser.createdAt,
+        updatedAt: updatedUser.updatedAt,
       },
-      status: 'PENDING',
-      createdAt: new Date().toISOString(),
     });
+
+    if (!commit.success) {
+      return { success: false, error: commit.error || CloudflareApi.OFFLINE_ERROR_MESSAGE };
+    }
+
+    db.saveUsers(users.map(u => (u.id === updatedUser.id ? updatedUser : u)));
+    AuthService.setActiveUser(updatedUser);
 
     db.addAuditLog({
       id: generateUUID(),
@@ -409,7 +397,7 @@ export class AuthService {
       action: 'USERNAME_CHANGE',
       details: `Admin username changed to '${cleanUsername}'`,
       entityType: 'AUTH',
-      entityId: targetUser.id,
+      entityId: updatedUser.id,
       timestamp: new Date().toISOString(),
     });
 

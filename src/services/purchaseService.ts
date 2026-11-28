@@ -15,6 +15,8 @@ import { generateUUID } from '../utils/crypto';
 import { generatePurchaseNumber } from '../utils/formatters';
 import { getAdminManagedShops, hasAdminAccess, isPlatformAdmin } from '../utils/permissions';
 import { NotificationService } from './notificationService';
+import { CloudflareApi } from './cloudflareApi';
+import { SyncService } from './syncService';
 
 export interface PurchaseItemInput {
   productId: string;
@@ -186,7 +188,7 @@ export class PurchaseService {
    * Record a new purchase order / stock-in for a specific shop or store warehouse.
    * Uses LATEST PURCHASE PRICE for inventory valuation and optionally updates selling price.
    */
-  public static recordPurchase(
+  public static async recordPurchase(
     params: {
       shopId?: string;
       storeId?: string;
@@ -199,7 +201,7 @@ export class PurchaseService {
       invoiceNumber?: string;
     },
     currentUser: User
-  ): { success: boolean; purchase?: Purchase; error?: string } {
+  ): Promise<{ success: boolean; purchase?: Purchase; error?: string }> {
     const targetShopId = params.shopId || db.getShops()[0]?.id || 'shop-1';
 
     if (!isPlatformAdmin(currentUser)) {
@@ -342,15 +344,6 @@ export class PurchaseService {
       });
     }
 
-    db.saveProducts(products);
-    if (movementsToAdd.length > 0) {
-      db.saveMovements([...movementsToAdd, ...db.getMovements()]);
-    }
-
-    priceChanges.forEach(({ product, oldPrice, newPrice }) => {
-      NotificationService.broadcastPriceChange(product, oldPrice, newPrice);
-    });
-
     const newPurchase: Purchase = {
       id: purchaseId,
       shopId: targetShopId,
@@ -371,17 +364,26 @@ export class PurchaseService {
       createdAt: now,
     };
 
-    db.savePurchases([newPurchase, ...db.getPurchases()]);
-
-    db.enqueueSync({
-      id: generateUUID(),
+    const commit = await SyncService.commitOperation({
       operation: 'CREATE_PURCHASE',
       entityType: 'PURCHASE',
       entityId: purchaseId,
       payload: newPurchase,
-      status: 'PENDING',
-      createdAt: now,
     });
+    if (!commit.success) {
+      return { success: false, error: commit.error || CloudflareApi.OFFLINE_ERROR_MESSAGE };
+    }
+
+    db.saveProducts(products);
+    if (movementsToAdd.length > 0) {
+      db.saveMovements([...movementsToAdd, ...db.getMovements()]);
+    }
+
+    priceChanges.forEach(({ product, oldPrice, newPrice }) => {
+      NotificationService.broadcastPriceChange(product, oldPrice, newPrice);
+    });
+
+    db.savePurchases([newPurchase, ...db.getPurchases()]);
 
     db.addAuditLog({
       id: generateUUID(),
@@ -400,7 +402,7 @@ export class PurchaseService {
     return { success: true, purchase: newPurchase };
   }
 
-  public static createPurchase(
+  public static async createPurchase(
     params: {
       shopId?: string;
       storeId?: string;
@@ -421,7 +423,7 @@ export class PurchaseService {
    * Update an existing purchase.
    * Can update metadata only OR items (which triggers store/floor stock recalculation).
    */
-  public static updatePurchase(
+  public static async updatePurchase(
     purchaseId: string,
     updates: {
       supplierName?: string;
@@ -433,7 +435,7 @@ export class PurchaseService {
       items?: PurchaseItemInput[];
     },
     currentUser: User
-  ): { success: boolean; purchase?: Purchase; error?: string } {
+  ): Promise<{ success: boolean; purchase?: Purchase; error?: string }> {
     const purchases = db.getPurchases();
     const index = purchases.findIndex(p => p.id === purchaseId);
     if (index === -1) {
@@ -564,14 +566,6 @@ export class PurchaseService {
         });
       }
 
-      db.saveProducts(products);
-      if (movementsToAdd.length > 0) {
-        db.saveMovements([...movementsToAdd, ...db.getMovements()]);
-      }
-      priceChanges.forEach(({ product, oldPrice, newPrice }) => {
-        NotificationService.broadcastPriceChange(product, oldPrice, newPrice);
-      });
-
       const updatedPurchase: Purchase = {
         ...current,
         supplierName: updates.supplierName?.trim() || current.supplierName,
@@ -588,18 +582,27 @@ export class PurchaseService {
         updatedAt: now,
       };
 
-      purchases[index] = updatedPurchase;
-      db.savePurchases(purchases);
-
-      db.enqueueSync({
-        id: generateUUID(),
+      const commit = await SyncService.commitOperation({
         operation: 'UPDATE_PURCHASE',
         entityType: 'PURCHASE',
         entityId: purchaseId,
         payload: updatedPurchase,
-        status: 'PENDING',
-        createdAt: now,
       });
+      if (!commit.success) {
+        return { success: false, error: commit.error || CloudflareApi.OFFLINE_ERROR_MESSAGE };
+      }
+
+      db.saveProducts(products);
+      if (movementsToAdd.length > 0) {
+        db.saveMovements([...movementsToAdd, ...db.getMovements()]);
+      }
+      priceChanges.forEach(({ product, oldPrice, newPrice }) => {
+        NotificationService.broadcastPriceChange(product, oldPrice, newPrice);
+      });
+
+      const nextPurchases = [...purchases];
+      nextPurchases[index] = updatedPurchase;
+      db.savePurchases(nextPurchases);
 
       db.addAuditLog({
         id: generateUUID(),
@@ -630,18 +633,19 @@ export class PurchaseService {
       updatedAt: now,
     };
 
-    purchases[index] = updatedPurchase;
-    db.savePurchases(purchases);
-
-    db.enqueueSync({
-      id: generateUUID(),
+    const commit = await SyncService.commitOperation({
       operation: 'UPDATE_PURCHASE',
       entityType: 'PURCHASE',
       entityId: purchaseId,
       payload: updatedPurchase,
-      status: 'PENDING',
-      createdAt: now,
     });
+    if (!commit.success) {
+      return { success: false, error: commit.error || CloudflareApi.OFFLINE_ERROR_MESSAGE };
+    }
+
+    const nextPurchases = [...purchases];
+    nextPurchases[index] = updatedPurchase;
+    db.savePurchases(nextPurchases);
 
     db.addAuditLog({
       id: generateUUID(),
@@ -662,11 +666,11 @@ export class PurchaseService {
    * Permanently void & delete a purchase order and automatically revert added stock
    * from Shop Floor or Store warehouse.
    */
-  public static voidPurchase(
+  public static async voidPurchase(
     purchaseId: string,
     reason: string,
     currentUser: User
-  ): { success: boolean; revertedUnits?: number; error?: string } {
+  ): Promise<{ success: boolean; revertedUnits?: number; error?: string }> {
     const purchases = db.getPurchases();
     const current = purchases.find(p => p.id === purchaseId);
     if (!current) {
@@ -734,6 +738,16 @@ export class PurchaseService {
       }
     }
 
+    const commit = await SyncService.commitOperation({
+      operation: 'DELETE_PURCHASE',
+      entityType: 'PURCHASE',
+      entityId: purchaseId,
+      payload: { id: purchaseId, reason: cleanReason },
+    });
+    if (!commit.success) {
+      return { success: false, error: commit.error || CloudflareApi.OFFLINE_ERROR_MESSAGE };
+    }
+
     db.saveProducts(products);
     if (movementsToAdd.length > 0) {
       db.saveMovements([...movementsToAdd, ...db.getMovements()]);
@@ -741,16 +755,6 @@ export class PurchaseService {
 
     const remainingPurchases = purchases.filter(p => p.id !== purchaseId);
     db.savePurchases(remainingPurchases);
-
-    db.enqueueSync({
-      id: generateUUID(),
-      operation: 'DELETE_PURCHASE',
-      entityType: 'PURCHASE',
-      entityId: purchaseId,
-      payload: { id: purchaseId, reason: cleanReason },
-      status: 'PENDING',
-      createdAt: now,
-    });
 
     db.addAuditLog({
       id: generateUUID(),
@@ -772,12 +776,12 @@ export class PurchaseService {
    * Reduces Floor/Store stock, reduces purchase item quantities and totalAmount,
    * and logs a PurchaseReturn audit record.
    */
-  public static returnPurchaseItems(
+  public static async returnPurchaseItems(
     purchaseId: string,
     selections: Array<{ productId: string; itemId: string; returnQty: number }>,
     reason: string,
     currentUser: User
-  ): { success: boolean; purchaseReturn?: PurchaseReturn; error?: string } {
+  ): Promise<{ success: boolean; purchaseReturn?: PurchaseReturn; error?: string }> {
     const purchases = db.getPurchases();
     const index = purchases.findIndex(p => p.id === purchaseId);
     if (index === -1) {
@@ -911,13 +915,6 @@ export class PurchaseService {
       updatedAt: now,
     };
 
-    purchases[index] = updatedPurchase;
-    db.saveProducts(products);
-    if (movementsToAdd.length > 0) {
-      db.saveMovements([...movementsToAdd, ...db.getMovements()]);
-    }
-    db.savePurchases(purchases);
-
     const resolvedStoreName =
       current.storeName || (targetStore ? targetStore.name : undefined);
 
@@ -941,27 +938,32 @@ export class PurchaseService {
       createdAt: now,
     };
 
+    const commit = await SyncService.commitOperations([
+      {
+        operation: 'CREATE_PURCHASE_RETURN',
+        entityType: 'PURCHASE_RETURN',
+        entityId: purchaseReturn.id,
+        payload: purchaseReturn,
+      },
+      {
+        operation: 'UPDATE_PURCHASE',
+        entityType: 'PURCHASE',
+        entityId: purchaseId,
+        payload: updatedPurchase,
+      },
+    ]);
+    if (!commit.success) {
+      return { success: false, error: commit.error || CloudflareApi.OFFLINE_ERROR_MESSAGE };
+    }
+
+    const nextPurchases = [...purchases];
+    nextPurchases[index] = updatedPurchase;
+    db.saveProducts(products);
+    if (movementsToAdd.length > 0) {
+      db.saveMovements([...movementsToAdd, ...db.getMovements()]);
+    }
+    db.savePurchases(nextPurchases);
     db.savePurchaseReturns([purchaseReturn, ...db.getPurchaseReturns()]);
-
-    db.enqueueSync({
-      id: generateUUID(),
-      operation: 'CREATE_PURCHASE_RETURN',
-      entityType: 'PURCHASE_RETURN',
-      entityId: purchaseReturn.id,
-      payload: purchaseReturn,
-      status: 'PENDING',
-      createdAt: now,
-    });
-
-    db.enqueueSync({
-      id: generateUUID(),
-      operation: 'UPDATE_PURCHASE',
-      entityType: 'PURCHASE',
-      entityId: purchaseId,
-      payload: updatedPurchase,
-      status: 'PENDING',
-      createdAt: now,
-    });
 
     db.addAuditLog({
       id: generateUUID(),

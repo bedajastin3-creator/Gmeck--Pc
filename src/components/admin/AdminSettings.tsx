@@ -19,6 +19,7 @@ import { useApp } from '../../context/AppContext';
 import { AuthService } from '../../services/authService';
 import { StorageService } from '../../db/storage';
 import { CloudflareApi } from '../../services/cloudflareApi';
+import { SyncService } from '../../services/syncService';
 import { formatDateTime } from '../../utils/formatters';
 
 export const AdminSettings: React.FC = () => {
@@ -106,27 +107,51 @@ export const AdminSettings: React.FC = () => {
       const result = await CloudflareApi.uploadImage(compressed, 'seller', currentUser.id);
 
       if (result.success) {
-        setAvatarUrl(result.url);
-
         const users = StorageService.getUsers();
         const userIndex = users.findIndex(u => u.id === currentUser.id);
         if (userIndex !== -1) {
-          users[userIndex].avatarUrl = result.url;
+          const updatedUser = {
+            ...users[userIndex],
+            avatarUrl: result.url,
+            updatedAt: new Date().toISOString(),
+          };
+          const commitRes = await SyncService.commitOperation({
+            operation: 'UPDATE_SELLER',
+            entityType: 'USER',
+            entityId: updatedUser.id,
+            payload: updatedUser,
+          });
+          if (!commitRes.success) {
+            addToast({
+              type: 'error',
+              title: 'Upload Failed',
+              description: commitRes.error || CloudflareApi.OFFLINE_ERROR_MESSAGE,
+            });
+            return;
+          }
+          users[userIndex] = updatedUser;
           StorageService.saveUsers(users);
+          setAvatarUrl(result.url);
           if (refreshUser) refreshUser();
         }
 
         addToast({
           type: 'success',
           title: 'Profile Picture Updated',
-          description: 'Your admin profile picture has been updated successfully.',
+          description: 'Your admin profile picture has been updated in the cloud.',
+        });
+      } else {
+        addToast({
+          type: 'error',
+          title: 'Upload Failed',
+          description: result.error || CloudflareApi.OFFLINE_ERROR_MESSAGE,
         });
       }
     } catch (error: any) {
       addToast({
         type: 'error',
         title: 'Upload Failed',
-        description: error.message || 'Could not upload profile picture.',
+        description: CloudflareApi.formatError(error, 'Could not upload profile picture.'),
       });
     } finally {
       setIsUploading(false);
@@ -136,16 +161,34 @@ export const AdminSettings: React.FC = () => {
     }
   };
 
-  const handleRemoveAvatar = () => {
+  const handleRemoveAvatar = async () => {
     if (!currentUser) return;
-
-    setAvatarUrl(undefined);
 
     const users = StorageService.getUsers();
     const userIndex = users.findIndex(u => u.id === currentUser.id);
     if (userIndex !== -1) {
-      delete users[userIndex].avatarUrl;
+      const updatedUser = {
+        ...users[userIndex],
+        avatarUrl: undefined,
+        updatedAt: new Date().toISOString(),
+      };
+      const commitRes = await SyncService.commitOperation({
+        operation: 'UPDATE_SELLER',
+        entityType: 'USER',
+        entityId: updatedUser.id,
+        payload: updatedUser,
+      });
+      if (!commitRes.success) {
+        addToast({
+          type: 'error',
+          title: 'Remove Failed',
+          description: commitRes.error || CloudflareApi.OFFLINE_ERROR_MESSAGE,
+        });
+        return;
+      }
+      users[userIndex] = updatedUser;
       StorageService.saveUsers(users);
+      setAvatarUrl(undefined);
       if (refreshUser) refreshUser();
     }
 
@@ -156,9 +199,9 @@ export const AdminSettings: React.FC = () => {
     });
   };
 
-  const handleSaveSettings = (e: React.FormEvent) => {
+  const handleSaveSettings = async (e: React.FormEvent) => {
     e.preventDefault();
-    updateSettings({
+    const res = await updateSettings({
       businessName,
       tagline,
       address,
@@ -173,16 +216,32 @@ export const AdminSettings: React.FC = () => {
       enableSalesAssistant,
     });
 
-    addToast({
-      type: 'success',
-      title: 'Settings Saved',
-      description: 'Business configurations and receipt policies updated.',
-    });
+    if (res.success) {
+      addToast({
+        type: 'success',
+        title: 'Settings Saved',
+        description: 'Business configurations and receipt policies updated.',
+      });
+    } else {
+      addToast({
+        type: 'error',
+        title: 'Save Failed',
+        description: res.error || CloudflareApi.OFFLINE_ERROR_MESSAGE,
+      });
+    }
   };
 
-  const handleToggleSalesAssistant = () => {
+  const handleToggleSalesAssistant = async () => {
     const nextValue = !enableSalesAssistant;
-    updateSettings({ enableSalesAssistant: nextValue });
+    const res = await updateSettings({ enableSalesAssistant: nextValue });
+    if (!res.success) {
+      addToast({
+        type: 'error',
+        title: 'Update Failed',
+        description: res.error || CloudflareApi.OFFLINE_ERROR_MESSAGE,
+      });
+      return;
+    }
     addToast({
       type: nextValue ? 'success' : 'info',
       title: nextValue ? 'Sales Assistant Enabled' : 'Sales Assistant Disabled',
@@ -202,7 +261,7 @@ export const AdminSettings: React.FC = () => {
     }
 
     setIsChangingUsername(true);
-    const res = AuthService.changeAdminUsername(
+    const res = await AuthService.changeAdminUsername(
       currentUser.id,
       adminUsername.trim(),
       currentUser

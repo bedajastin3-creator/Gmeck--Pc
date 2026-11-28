@@ -17,6 +17,7 @@ import {
   DollarSign,
   FileText,
   ShoppingCart,
+  Lock,
 } from 'lucide-react';
 import { useApp } from '../../context/AppContext';
 import { formatDate, formatDateTime } from '../../utils/formatters';
@@ -27,6 +28,9 @@ export const Header: React.FC = () => {
   const {
     currentUser,
     logout,
+    isOnline,
+    isCloudLoaded,
+    cachedHome,
     syncStatus,
     triggerSync,
     sellerColor,
@@ -36,8 +40,10 @@ export const Header: React.FC = () => {
     availableShops,
     activeTab,
     setActiveTab,
+    addToast,
   } = useApp();
-  const settings = dbState.settings;
+  const offlineLocked = !isOnline || !isCloudLoaded;
+  const settings = !isCloudLoaded && cachedHome?.settings ? cachedHome.settings : dbState.settings;
 
   const [isNotifDropdownOpen, setIsNotifDropdownOpen] = useState(false);
   const notifDropdownRef = useRef<HTMLDivElement>(null);
@@ -85,7 +91,7 @@ export const Header: React.FC = () => {
           <span className="text-slate-600">|</span>
           <span className="text-slate-400">{settings.businessName}</span>
           <span className="text-slate-600">|</span>
-          <span className="text-slate-400">Windows Offline Engine v2.4</span>
+          <span className="text-slate-400">Online Cloud Engine v2.4</span>
         </div>
 
         <div className="flex items-center gap-4">
@@ -142,7 +148,7 @@ export const Header: React.FC = () => {
               </span>
             </div>
             <p className="text-xs text-slate-400">
-              @{currentUser?.username} • Local Offline Mode Active
+              @{currentUser?.username} • {isOnline ? 'Online Cloud Mode Active' : 'Offline — Wait for Internet'}
             </p>
           </div>
         </div>
@@ -206,14 +212,24 @@ export const Header: React.FC = () => {
             id="header-pos-shortcut-btn"
             type="button"
             onClick={() => setActiveTab('new_sale')}
-            title="Open Add Sale (POS)"
-            className={`flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg text-xs font-bold tracking-wide transition-all cursor-pointer border ${
-              activeTab === 'new_sale'
-                ? 'bg-blue-500 text-white border-blue-300 shadow-lg shadow-blue-600/35 ring-2 ring-blue-400/40'
-                : 'bg-gradient-to-r from-blue-600 to-blue-500 hover:from-blue-500 hover:to-blue-400 text-white border-blue-400/40 shadow-md shadow-blue-950/50 hover:shadow-blue-600/30 active:scale-[0.98]'
+            title={
+              offlineLocked
+                ? 'Internet connection required to open POS'
+                : 'Open Add Sale (POS)'
+            }
+            className={`flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg text-xs font-bold tracking-wide transition-all border ${
+              offlineLocked
+                ? 'bg-slate-800/70 text-slate-400 border-slate-700 opacity-65 cursor-not-allowed'
+                : activeTab === 'new_sale'
+                ? 'bg-blue-500 text-white border-blue-300 shadow-lg shadow-blue-600/35 ring-2 ring-blue-400/40 cursor-pointer'
+                : 'bg-gradient-to-r from-blue-600 to-blue-500 hover:from-blue-500 hover:to-blue-400 text-white border-blue-400/40 shadow-md shadow-blue-950/50 hover:shadow-blue-600/30 active:scale-[0.98] cursor-pointer'
             }`}
           >
-            <ShoppingCart className="w-3.5 h-3.5 shrink-0" />
+            {offlineLocked ? (
+              <Lock className="w-3.5 h-3.5 shrink-0 text-slate-400" />
+            ) : (
+              <ShoppingCart className="w-3.5 h-3.5 shrink-0" />
+            )}
             <span>POS</span>
           </button>
 
@@ -222,16 +238,32 @@ export const Header: React.FC = () => {
           <div className="relative" ref={notifDropdownRef}>
             <button
               id="header-notification-bell"
-              onClick={() => setIsNotifDropdownOpen(!isNotifDropdownOpen)}
-              title="Kituo cha Taarifa na Vikumbusho"
+              onClick={() => {
+                if (offlineLocked) {
+                  addToast({
+                    type: 'warning',
+                    title: 'Offline — Internet Required',
+                    description: 'You are offline. Connect to the internet to open notifications.',
+                  });
+                  return;
+                }
+                setIsNotifDropdownOpen(!isNotifDropdownOpen);
+              }}
+              title={
+                offlineLocked
+                  ? 'Internet connection required for notifications'
+                  : 'Kituo cha Taarifa na Vikumbusho'
+              }
               className={`p-2 rounded-md transition relative flex items-center justify-center border ${
-                unreadCount > 0
+                offlineLocked
+                  ? 'bg-slate-800/60 text-slate-500 border-slate-800 opacity-60 cursor-not-allowed'
+                  : unreadCount > 0
                   ? 'bg-slate-800 text-amber-400 border-amber-500/40 hover:bg-slate-750'
                   : 'bg-slate-800/90 text-slate-300 border-slate-700 hover:bg-slate-800'
               }`}
             >
               <Bell className="w-4 h-4" />
-              {unreadCount > 0 && (
+              {!offlineLocked && unreadCount > 0 && (
                 <span className="absolute -top-1 -right-1 min-w-[18px] h-[18px] px-1 rounded-full bg-rose-600 text-white font-mono text-[10px] font-bold flex items-center justify-center border-2 border-slate-900 animate-pulse">
                   {unreadCount > 9 ? '9+' : unreadCount}
                 </span>
@@ -239,7 +271,7 @@ export const Header: React.FC = () => {
             </button>
 
             {/* Notification Popover Dropdown */}
-            {isNotifDropdownOpen && (
+            {!offlineLocked && isNotifDropdownOpen && (
               <div className="absolute right-0 mt-2 w-80 sm:w-96 bg-slate-900 border border-slate-700 rounded-xl shadow-2xl z-50 overflow-hidden animate-in fade-in zoom-in-95 duration-100">
                 <div className="p-3 bg-slate-850 border-b border-slate-800 flex items-center justify-between">
                   <div className="flex items-center gap-2">
@@ -335,32 +367,27 @@ export const Header: React.FC = () => {
           </div>
           )}
 
-          {/* Sync & Offline Status Badge */}
+          {/* Online / Cloud Connection Status Badge */}
           <button
             id="sync-status-button"
             onClick={triggerSync}
-            title="Click to synchronize with server"
-            className="flex items-center gap-2 px-3 py-1.5 rounded-md bg-slate-800/90 hover:bg-slate-800 text-xs font-medium border border-slate-700 transition"
+            title="Click to refresh live cloud data"
+            className="flex items-center gap-2 px-3 py-1.5 rounded-md bg-slate-800/90 hover:bg-slate-800 text-xs font-medium border border-slate-700 transition cursor-pointer"
           >
             {syncStatus.state === 'SYNCING' ? (
               <>
                 <RefreshCw className="w-3.5 h-3.5 text-blue-400 animate-spin" />
-                <span className="text-blue-300">Syncing ({syncStatus.pendingCount})...</span>
+                <span className="text-blue-300">Refreshing...</span>
               </>
-            ) : syncStatus.state === 'PENDING_SYNC' ? (
-              <>
-                <AlertCircle className="w-3.5 h-3.5 text-amber-400" />
-                <span className="text-amber-300">Pending Sync ({syncStatus.pendingCount})</span>
-              </>
-            ) : syncStatus.state === 'SYNCED' ? (
+            ) : isOnline ? (
               <>
                 <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
-                <span className="text-emerald-300">Synced</span>
+                <span className="text-emerald-300">Online</span>
               </>
             ) : (
               <>
-                <WifiOff className="w-3.5 h-3.5 text-emerald-400" />
-                <span className="text-emerald-300">Offline / Local DB</span>
+                <WifiOff className="w-3.5 h-3.5 text-rose-400" />
+                <span className="text-rose-300">Offline</span>
               </>
             )}
           </button>

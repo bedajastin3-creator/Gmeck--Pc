@@ -3,6 +3,7 @@ import { Product, ProductImage, ProductStatus, User } from '../types';
 import { generateUUID } from '../utils/crypto';
 import { normalizeProductImages } from '../utils/imageUtils';
 import { CloudflareApi } from './cloudflareApi';
+import { CloudOperation, SyncService } from './syncService';
 import { getAdminManagedShops, hasAdminAccess, isPlatformAdmin } from '../utils/permissions';
 
 // Helper to convert base64 to Blob
@@ -179,6 +180,10 @@ export class ProductService {
       return { success: false, error: 'Selected shop does not exist.' };
     }
 
+    if (!CloudflareApi.isOnline()) {
+      return { success: false, error: CloudflareApi.OFFLINE_ERROR_MESSAGE };
+    }
+
     if (data.sellingPrice === undefined || data.sellingPrice < 0) {
       return { success: false, error: 'Valid selling price is required.' };
     }
@@ -291,47 +296,56 @@ export class ProductService {
       updatedAt: new Date().toISOString(),
     };
 
-    const updated = [newProduct, ...products];
-    db.saveProducts(updated);
+    const initialMovement =
+      initialQty > 0
+        ? {
+            id: generateUUID(),
+            shopId: newProduct.shopId,
+            shopName: shop.name,
+            storeId: isWarehouseCreate && targetStore ? targetStore.id : undefined,
+            productId: newProduct.id,
+            productName: newProduct.name,
+            previousQty: 0,
+            changeQty: initialQty,
+            newQty: initialQty,
+            type: (isWarehouseCreate ? 'INITIAL_STOCK' : 'ADJUSTMENT') as 'INITIAL_STOCK' | 'ADJUSTMENT',
+            reason:
+              isWarehouseCreate && targetStore
+                ? `Initial stock opening in store '${targetStore.name}' (${shop.name}) by ${currentUser.name}`
+                : `Initial stock opening in ${shop.name} by ${currentUser.name}`,
+            userId: currentUser.id,
+            userName: currentUser.name,
+            createdAt: new Date().toISOString(),
+          }
+        : null;
 
-    // If initial stock is greater than 0, record initial inventory movement with shopId (and storeId if warehouse)
-    if (initialQty > 0) {
-      db.saveMovements([
-        {
-          id: generateUUID(),
-          shopId: newProduct.shopId,
-          shopName: shop.name,
-          storeId: isWarehouseCreate && targetStore ? targetStore.id : undefined,
-          productId: newProduct.id,
-          productName: newProduct.name,
-          previousQty: 0,
-          changeQty: initialQty,
-          newQty: initialQty,
-          type: isWarehouseCreate ? 'INITIAL_STOCK' : 'ADJUSTMENT',
-          reason:
-            isWarehouseCreate && targetStore
-              ? `Initial stock opening in store '${targetStore.name}' (${shop.name}) by ${currentUser.name}`
-              : `Initial stock opening in ${shop.name} by ${currentUser.name}`,
-          userId: currentUser.id,
-          userName: currentUser.name,
-          createdAt: new Date().toISOString(),
-        },
-        ...db.getMovements(),
-      ]);
+    const ops: CloudOperation[] = [
+      {
+        operation: 'CREATE_PRODUCT',
+        entityType: 'PRODUCT',
+        entityId: newProduct.id,
+        payload: newProduct,
+      },
+    ];
+    if (initialMovement) {
+      ops.push({
+        operation: 'STOCK_ADJUSTMENT',
+        entityType: 'INVENTORY',
+        entityId: initialMovement.id,
+        payload: initialMovement,
+      });
     }
 
-    // Sync queue item
-    db.enqueueSync({
-      id: generateUUID(),
-      operation: 'CREATE_PRODUCT',
-      entityType: 'PRODUCT',
-      entityId: newProduct.id,
-      payload: newProduct,
-      status: 'PENDING',
-      createdAt: new Date().toISOString(),
-    });
+    const commit = await SyncService.commitOperations(ops);
+    if (!commit.success) {
+      return { success: false, error: commit.error || CloudflareApi.OFFLINE_ERROR_MESSAGE };
+    }
 
-    // Audit log
+    db.saveProducts([newProduct, ...products]);
+    if (initialMovement) {
+      db.saveMovements([initialMovement, ...db.getMovements()]);
+    }
+
     db.addAuditLog({
       id: generateUUID(),
       userId: currentUser.id,
@@ -406,21 +420,20 @@ export class ProductService {
       updatedAt: new Date().toISOString(),
     };
 
-    products[index] = updatedProduct;
-    db.saveProducts(products);
-
-    // Sync queue
-    db.enqueueSync({
-      id: generateUUID(),
+    const commit = await SyncService.commitOperation({
       operation: 'UPDATE_PRODUCT',
       entityType: 'PRODUCT',
       entityId: id,
       payload: updatedProduct,
-      status: 'PENDING',
-      createdAt: new Date().toISOString(),
     });
+    if (!commit.success) {
+      return { success: false, error: commit.error || CloudflareApi.OFFLINE_ERROR_MESSAGE };
+    }
 
-    // Audit log
+    const nextProducts = [...products];
+    nextProducts[index] = updatedProduct;
+    db.saveProducts(nextProducts);
+
     db.addAuditLog({
       id: generateUUID(),
       userId: currentUser.id,
@@ -456,38 +469,34 @@ export class ProductService {
    * Delete a product permanently.
    * Admin, Shop Admin, or Seller with canDeleteProducts permission.
    */
-  public static deleteProduct(
+  public static async deleteProduct(
     productId: string,
     currentUser: User
-  ): { success: boolean; error?: string } {
-    // Allow Platform Admin, Shop Admin, or Seller with canDeleteProducts permission
+  ): Promise<{ success: boolean; error?: string }> {
     if (!hasAdminAccess(currentUser) && !currentUser.permissions?.canDeleteProducts) {
       return { success: false, error: 'Permission Denied: You do not have permission to delete products.' };
     }
 
     const products = db.getProducts();
     const product = products.find(p => p.id === productId);
-    
+
     if (!product) {
       return { success: false, error: 'Product not found.' };
     }
 
-    // Remove product
-    const updatedProducts = products.filter(p => p.id !== productId);
-    db.saveProducts(updatedProducts);
-
-    // Sync to cloud
-    db.enqueueSync({
-      id: generateUUID(),
+    const commit = await SyncService.commitOperation({
       operation: 'DELETE_PRODUCT',
       entityType: 'PRODUCT',
       entityId: productId,
       payload: { id: productId },
-      status: 'PENDING',
-      createdAt: new Date().toISOString(),
     });
+    if (!commit.success) {
+      return { success: false, error: commit.error || CloudflareApi.OFFLINE_ERROR_MESSAGE };
+    }
 
-    // Audit log
+    const updatedProducts = products.filter(p => p.id !== productId);
+    db.saveProducts(updatedProducts);
+
     db.addAuditLog({
       id: generateUUID(),
       userId: currentUser.id,

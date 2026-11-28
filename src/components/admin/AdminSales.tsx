@@ -60,7 +60,6 @@ export const AdminSales: React.FC = () => {
   const [searchCurrentPeriodOnly, setSearchCurrentPeriodOnly] = useState(false);
   const [sellerFilter, setSellerFilter] = useState('ALL');
   const [paymentFilter, setPaymentFilter] = useState('ALL');
-  const [statusFilter, setStatusFilter] = useState('ALL');
   const [shopFilter, setShopFilter] = useState('ALL');
   const [datePreset, setDatePreset] = useState<DatePreset>('TODAY');
 
@@ -171,7 +170,7 @@ export const AdminSales: React.FC = () => {
   // Reset per-group pagination when filters change
   useEffect(() => {
     setGroupVisibleCounts({});
-  }, [searchQuery, searchCurrentPeriodOnly, sellerFilter, paymentFilter, statusFilter, shopFilter, datePreset, startDate, endDate]);
+  }, [searchQuery, searchCurrentPeriodOnly, sellerFilter, paymentFilter, shopFilter, datePreset, startDate, endDate]);
 
   // Reset Edit List pagination when its filters change
   useEffect(() => {
@@ -273,8 +272,11 @@ export const AdminSales: React.FC = () => {
         ))
   );
   const products = dbState.products || [];
+  const salesById = new Map<string, Sale>((dbState.sales || []).map(s => [s.id, s]));
   const editRequests = SalesService.getSaleEditRequests(currentUser);
-  const pendingRequests = editRequests.filter(r => r.status === 'PENDING');
+  const pendingRequests = editRequests.filter(
+    r => r.status === 'PENDING' && salesById.get(r.saleId)?.status !== 'VOIDED'
+  );
   const handledEditRequests = editRequests
     .filter(r => r.status === 'APPROVED' || r.status === 'REJECTED')
     .sort((a, b) => {
@@ -282,8 +284,6 @@ export const AdminSales: React.FC = () => {
       const tB = new Date(b.reviewedAt || b.createdAt).getTime();
       return tB - tA;
     });
-
-  const salesById = new Map<string, Sale>((dbState.sales || []).map(s => [s.id, s]));
 
   // Always derive the active date range deterministically from the selected preset
   const activePresetRange = datePreset === 'CUSTOM' ? null : computePresetRange(datePreset);
@@ -296,13 +296,13 @@ export const AdminSales: React.FC = () => {
       search: searchQuery,
       sellerId: sellerFilter === 'ALL' ? undefined : sellerFilter,
       paymentMethod: paymentFilter === 'ALL' ? undefined : (paymentFilter as any),
-      status: statusFilter === 'ALL' ? undefined : (statusFilter as any),
+      status: 'COMPLETED',
       shopId: shopFilter === 'ALL' ? undefined : shopFilter,
       startDate: isSearchingAllDates ? undefined : effectiveStartDate || undefined,
       endDate: isSearchingAllDates ? undefined : effectiveEndDate || undefined,
     },
     currentUser
-  );
+  ).filter(s => s.status !== 'VOIDED');
 
   const totalVolume = sales.reduce(
     (sum, s) => (s.status === 'COMPLETED' ? sum + s.total : sum),
@@ -453,7 +453,7 @@ export const AdminSales: React.FC = () => {
         : 'All Shops'
       : shops.find(s => s.id === shopFilter)?.name || 'Unknown Shop';
 
-  const handleExecuteVoid = () => {
+  const handleExecuteVoid = async () => {
     if (!voidingSale || !currentUser) return;
     if (!voidReason.trim()) {
       addToast({
@@ -465,7 +465,7 @@ export const AdminSales: React.FC = () => {
     }
 
     setIsVoiding(true);
-    const res = SalesService.voidSale(voidingSale.id, voidReason, currentUser);
+    const res = await SalesService.voidSale(voidingSale.id, voidReason, currentUser);
     setIsVoiding(false);
 
     if (res.success) {
@@ -498,11 +498,11 @@ export const AdminSales: React.FC = () => {
     setEditReason('');
   };
 
-  const handleSaveEdit = () => {
+  const handleSaveEdit = async () => {
     if (!editingSale || !currentUser) return;
 
     setIsEditing(true);
-    const result = SalesService.requestSaleEdit(
+    const result = await SalesService.requestSaleEdit(
       editingSale.id,
       editItems,
       editReason || 'Admin correction',
@@ -530,11 +530,11 @@ export const AdminSales: React.FC = () => {
     }
   };
 
-  const handleReviewRequest = (request: SaleEditRequest, action: 'APPROVE' | 'REJECT') => {
+  const handleReviewRequest = async (request: SaleEditRequest, action: 'APPROVE' | 'REJECT') => {
     if (!currentUser) return;
 
     const reviewNote = action === 'REJECT' ? 'Rejected by admin' : undefined;
-    const result = SalesService.reviewSaleEdit(request.id, action, currentUser, reviewNote);
+    const result = await SalesService.reviewSaleEdit(request.id, action, currentUser, reviewNote);
 
     if (result.success) {
       addToast({
@@ -629,11 +629,6 @@ export const AdminSales: React.FC = () => {
         ? 'Mobile Money'
         : paymentFilter.charAt(0) + paymentFilter.slice(1).toLowerCase();
 
-  const selectedStatusLabel =
-    statusFilter === 'ALL'
-      ? 'All Statuses'
-      : statusFilter.charAt(0) + statusFilter.slice(1).toLowerCase();
-
   const buildSalesPdfMeta = () => ({
     shopLabel: selectedShopName,
     startDate: isSearchingAllDates ? undefined : effectiveStartDate || undefined,
@@ -644,7 +639,7 @@ export const AdminSales: React.FC = () => {
     dateRangeText: isSearchingAllDates ? 'All Dates' : activePeriodMeta.dateRangeText,
     sellerLabel: selectedSellerLabel,
     paymentLabel: selectedPaymentLabel,
-    statusLabel: selectedStatusLabel,
+    statusLabel: 'Completed',
     searchQuery: searchQuery.trim() || undefined,
     totalRevenue: totalVolume,
     totalProfit,
@@ -855,7 +850,6 @@ export const AdminSales: React.FC = () => {
     searchQuery ||
     sellerFilter !== 'ALL' ||
     paymentFilter !== 'ALL' ||
-    statusFilter !== 'ALL' ||
     shopFilter !== 'ALL' ||
     datePreset !== 'TODAY' ||
     (datePreset === 'CUSTOM' && (startDate || endDate));
@@ -1778,7 +1772,7 @@ export const AdminSales: React.FC = () => {
           />
         )}
 
-        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
           <select
             value={shopFilter}
             onChange={e => setShopFilter(e.target.value)}
@@ -1820,16 +1814,6 @@ export const AdminSales: React.FC = () => {
             <option value="BANK">Bank</option>
             <option value="OTHER">Other</option>
           </select>
-
-          <select
-            value={statusFilter}
-            onChange={e => setStatusFilter(e.target.value)}
-            className="bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-2 text-xs text-white focus:outline-none focus:ring-1 focus:ring-blue-500"
-          >
-            <option value="ALL">All Statuses</option>
-            <option value="COMPLETED">Completed</option>
-            <option value="VOIDED">Voided</option>
-          </select>
         </div>
 
         {hasActiveFilters && (
@@ -1839,7 +1823,6 @@ export const AdminSales: React.FC = () => {
               setSearchCurrentPeriodOnly(false);
               setSellerFilter('ALL');
               setPaymentFilter('ALL');
-              setStatusFilter('ALL');
               setShopFilter('ALL');
               setDatePreset('TODAY');
             }}

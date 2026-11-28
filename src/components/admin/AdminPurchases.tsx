@@ -1653,7 +1653,7 @@ export const AdminPurchases: React.FC = () => {
     }
   };
 
-  const handleSavePurchase = (e: React.FormEvent) => {
+  const handleSavePurchase = async (e: React.FormEvent) => {
     e.preventDefault();
     setFormError('');
 
@@ -1743,7 +1743,7 @@ export const AdminPurchases: React.FC = () => {
     }
 
     if (editingPurchase) {
-      const res = PurchaseService.updatePurchase(
+      const res = await PurchaseService.updatePurchase(
         editingPurchase.id,
         {
           supplierName: finalSupplierName,
@@ -1781,7 +1781,7 @@ export const AdminPurchases: React.FC = () => {
         return;
       }
 
-      const res = PurchaseService.createPurchase(
+      const res = await PurchaseService.createPurchase(
         {
           shopId: purchaseShopId || availableShops[0]?.id || '',
           storeId: destinationType === 'STORE' ? purchaseStoreId : undefined,
@@ -1841,7 +1841,7 @@ export const AdminPurchases: React.FC = () => {
     setReturnError('');
   };
 
-  const handleExecuteReturn = (e: React.FormEvent) => {
+  const handleExecuteReturn = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!returningPurchase) return;
     setReturnError('');
@@ -1877,7 +1877,7 @@ export const AdminPurchases: React.FC = () => {
     }
 
     setIsReturning(true);
-    const res = PurchaseService.returnPurchaseItems(
+    const res = await PurchaseService.returnPurchaseItems(
       returningPurchase.id,
       selections,
       returnReason,
@@ -1905,7 +1905,7 @@ export const AdminPurchases: React.FC = () => {
     setVoidReason('');
   };
 
-  const handleExecuteVoid = () => {
+  const handleExecuteVoid = async () => {
     if (!voidingPurchase) return;
     if (!voidReason.trim()) {
       addToast({
@@ -1917,7 +1917,7 @@ export const AdminPurchases: React.FC = () => {
     }
 
     setIsVoiding(true);
-    const res = PurchaseService.voidPurchase(voidingPurchase.id, voidReason, currentUser);
+    const res = await PurchaseService.voidPurchase(voidingPurchase.id, voidReason, currentUser);
     setIsVoiding(false);
 
     if (res.success) {

@@ -2,6 +2,8 @@ import { db } from '../db/storage';
 import { Category, Shop, User } from '../types';
 import { generateUUID } from '../utils/crypto';
 import { hasAdminAccess } from '../utils/permissions';
+import { CloudflareApi } from './cloudflareApi';
+import { SyncService } from './syncService';
 
 export interface GetCategoriesOptions {
   shopId?: string;
@@ -53,10 +55,10 @@ export class CategoryService {
    * Create a new category assigned strictly to a specific shop
    * Admin OR Seller with canEditProducts permission
    */
-  public static createCategory(
+  public static async createCategory(
     data: { name: string; shopId: string; icon?: string; color?: string },
     currentUser: User
-  ): { success: boolean; category?: Category; error?: string } {
+  ): Promise<{ success: boolean; category?: Category; error?: string }> {
     // Allow Admin, Shop Admin, or Seller with canEditProducts permission
     if (!hasAdminAccess(currentUser) && !currentUser.permissions?.canEditProducts) {
       return { success: false, error: 'Permission Denied: You do not have permission to create categories.' };
@@ -99,18 +101,17 @@ export class CategoryService {
       updatedAt: new Date().toISOString(),
     };
 
-    db.saveCategories([...categories, newCategory]);
-
-    // Enqueue sync operation for category creation
-    db.enqueueSync({
-      id: generateUUID(),
+    const commit = await SyncService.commitOperation({
       operation: 'CREATE_CATEGORY',
       entityType: 'CATEGORY',
       entityId: newCategory.id,
       payload: newCategory,
-      status: 'PENDING',
-      createdAt: new Date().toISOString(),
     });
+    if (!commit.success) {
+      return { success: false, error: commit.error || CloudflareApi.OFFLINE_ERROR_MESSAGE };
+    }
+
+    db.saveCategories([...categories, newCategory]);
 
     db.addAuditLog({
       id: generateUUID(),
@@ -131,11 +132,11 @@ export class CategoryService {
    * Update an existing category
    * Admin OR Seller with canEditProducts permission
    */
-  public static updateCategory(
+  public static async updateCategory(
     id: string,
     data: { name?: string; shopId?: string; icon?: string; color?: string; status?: 'ACTIVE' | 'INACTIVE' },
     currentUser: User
-  ): { success: boolean; category?: Category; error?: string } {
+  ): Promise<{ success: boolean; category?: Category; error?: string }> {
     // Allow Admin, Shop Admin, or Seller with canEditProducts permission
     if (!hasAdminAccess(currentUser) && !currentUser.permissions?.canEditProducts) {
       return { success: false, error: 'Permission Denied: You do not have permission to edit categories.' };
@@ -176,19 +177,19 @@ export class CategoryService {
       updatedAt: new Date().toISOString(),
     };
 
-    categories[index] = updatedCategory;
-    db.saveCategories([...categories]);
-
-    // Enqueue sync operation for category update
-    db.enqueueSync({
-      id: generateUUID(),
+    const commit = await SyncService.commitOperation({
       operation: 'UPDATE_CATEGORY',
       entityType: 'CATEGORY',
       entityId: updatedCategory.id,
       payload: updatedCategory,
-      status: 'PENDING',
-      createdAt: new Date().toISOString(),
     });
+    if (!commit.success) {
+      return { success: false, error: commit.error || CloudflareApi.OFFLINE_ERROR_MESSAGE };
+    }
+
+    const nextCategories = [...categories];
+    nextCategories[index] = updatedCategory;
+    db.saveCategories(nextCategories);
 
     const shops = db.getShops();
     const shop = shops.find(s => s.id === updatedCategory.shopId);
@@ -208,10 +209,10 @@ export class CategoryService {
     return { success: true, category: updatedCategory };
   }
 
-  public static toggleCategoryStatus(
+  public static async toggleCategoryStatus(
     id: string,
     currentUser: User
-  ): { success: boolean; category?: Category; error?: string } {
+  ): Promise<{ success: boolean; category?: Category; error?: string }> {
     const category = db.getCategories().find(c => c.id === id);
     if (!category) {
       return { success: false, error: 'Category not found.' };

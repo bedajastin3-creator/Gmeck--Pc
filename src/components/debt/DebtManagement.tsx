@@ -218,7 +218,7 @@ export const DebtManagement: React.FC = () => {
   };
 
   // Handle Form Submit (Create / Edit)
-  const handleSaveDebt = (e: React.FormEvent) => {
+  const handleSaveDebt = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!currentUser) return;
 
@@ -237,7 +237,7 @@ export const DebtManagement: React.FC = () => {
       const currentPaid = editingDebt.paidAmount || 0;
       const newRemaining = Math.max(0, amt - currentPaid);
 
-      DebtService.updateDebt(
+      const res = await DebtService.updateDebt(
         editingDebt.id,
         {
           type: formType,
@@ -265,13 +265,22 @@ export const DebtManagement: React.FC = () => {
         currentUser
       );
 
+      if (!res.success) {
+        addToast({
+          type: 'error',
+          title: 'Imeshindikana Kusasisha',
+          description: res.error || 'Imeshindikana kuhifadhi mabadiliko mtandaoni.',
+        });
+        return;
+      }
+
       addToast({
         type: 'success',
         title: 'Deni Limesasishwa / Debt Updated',
         description: `Rekodi ya ${formName} imesasishwa kwa mafanikio.`,
       });
     } else {
-      DebtService.createDebt(
+      const res = await DebtService.createDebt(
         {
           type: formType,
           debtorName: formName.trim(),
@@ -283,6 +292,15 @@ export const DebtManagement: React.FC = () => {
         },
         currentUser
       );
+
+      if (!res.success) {
+        addToast({
+          type: 'error',
+          title: 'Imeshindikana Kuhifadhi',
+          description: res.error || 'Imeshindikana kuhifadhi deni mtandaoni.',
+        });
+        return;
+      }
 
       addToast({
         type: 'success',
@@ -299,7 +317,7 @@ export const DebtManagement: React.FC = () => {
   };
 
   // Handle Recording Payment
-  const handleConfirmPayment = (e: React.FormEvent) => {
+  const handleConfirmPayment = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!payingDebt || !currentUser) return;
 
@@ -333,7 +351,7 @@ export const DebtManagement: React.FC = () => {
       return;
     }
 
-    const res = DebtService.recordPayment(payingDebt.id, paymentAmt, currentUser, {
+    const res = await DebtService.recordPayment(payingDebt.id, paymentAmt, currentUser, {
       paymentDate,
       paymentMethod,
       notes: paymentNote,
@@ -370,7 +388,7 @@ export const DebtManagement: React.FC = () => {
   };
 
   // Handle Delete - Admin only
-  const handleConfirmDelete = () => {
+  const handleConfirmDelete = async () => {
     if (!deletingDebt || !currentUser) return;
 
     if (currentUser.role !== 'ADMIN') {
@@ -383,9 +401,9 @@ export const DebtManagement: React.FC = () => {
       return;
     }
 
-    const result = DebtService.deleteDebt(deletingDebt.id, currentUser);
+    const result = await DebtService.deleteDebt(deletingDebt.id, currentUser);
 
-    if (result) {
+    if (result.success) {
       addToast({
         type: 'success',
         title: 'Deni Limefutwa',
@@ -395,7 +413,7 @@ export const DebtManagement: React.FC = () => {
       addToast({
         type: 'error',
         title: 'Imeshindikana Kufuta',
-        description: 'Rekodi ya deni haikupatikana au imeshindikana kufutwa.',
+        description: result.error || 'Rekodi ya deni haikupatikana au imeshindikana kufutwa.',
       });
     }
 

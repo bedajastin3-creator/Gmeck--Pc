@@ -54,6 +54,50 @@ export class CloudflareApi {
     return this.config.deviceId;
   }
 
+  public static readonly OFFLINE_ERROR_MESSAGE =
+    'You are offline. Wait for internet connection.';
+
+  private static connectionListeners = new Set<(online: boolean) => void>();
+
+  public static onConnectionChange(listener: (online: boolean) => void): () => void {
+    this.connectionListeners.add(listener);
+    return () => {
+      this.connectionListeners.delete(listener);
+    };
+  }
+
+  private static notifyConnection(online: boolean): void {
+    this.connectionListeners.forEach(fn => {
+      try {
+        fn(online);
+      } catch {
+        // ignore listener error
+      }
+    });
+  }
+
+  public static isNetworkError(err: any): boolean {
+    if (!this.isOnline()) return true;
+    const msg = String(err?.message || err || '').toLowerCase();
+    return (
+      err?.name === 'TypeError' ||
+      msg.includes('offline') ||
+      msg.includes('failed to fetch') ||
+      msg.includes('networkerror') ||
+      msg.includes('network error') ||
+      msg.includes('load failed') ||
+      msg.includes('err_internet_disconnected') ||
+      msg.includes('cannot reach cloud')
+    );
+  }
+
+  public static formatError(err: any, fallback: string = 'Request failed'): string {
+    if (this.isNetworkError(err)) {
+      return this.OFFLINE_ERROR_MESSAGE;
+    }
+    return err?.message || fallback;
+  }
+
   public static isOnline(): boolean {
     return typeof navigator !== 'undefined' && navigator.onLine;
   }
@@ -66,7 +110,8 @@ export class CloudflareApi {
     options: RequestInit = {}
   ): Promise<T> {
     if (!this.isOnline()) {
-      throw new Error('OFFLINE: Cannot reach cloud endpoint');
+      this.notifyConnection(false);
+      throw new Error(this.OFFLINE_ERROR_MESSAGE);
     }
 
     const headers: Record<string, string> = {
@@ -76,10 +121,19 @@ export class CloudflareApi {
       ...(options.headers as Record<string, string> | undefined),
     };
 
-    const response = await fetch(`${this.config.baseUrl}/api${endpoint}`, {
-      ...options,
-      headers,
-    });
+    let response: Response;
+    try {
+      response = await fetch(`${this.config.baseUrl}/api${endpoint}`, {
+        cache: 'no-store',
+        ...options,
+        headers,
+      });
+    } catch (err: any) {
+      this.notifyConnection(false);
+      throw new Error(this.OFFLINE_ERROR_MESSAGE);
+    }
+
+    this.notifyConnection(true);
 
     if (!response.ok) {
       const error = await response.json().catch(() => ({ error: 'Unknown error' }));
@@ -93,7 +147,10 @@ export class CloudflareApi {
   // HEALTH CHECK
   // ==========================================
   public static async checkConnection(): Promise<boolean> {
-    if (!this.isOnline()) return false;
+    if (!this.isOnline()) {
+      this.notifyConnection(false);
+      return false;
+    }
     try {
       await this.request('/health');
       return true;
@@ -131,7 +188,8 @@ export class CloudflareApi {
     error?: string;
   }> {
     if (!this.isOnline()) {
-      throw new Error('OFFLINE: Cannot reach cloud endpoint');
+      this.notifyConnection(false);
+      throw new Error(this.OFFLINE_ERROR_MESSAGE);
     }
 
     const headers: Record<string, string> = {
@@ -140,19 +198,28 @@ export class CloudflareApi {
       ...(this.token ? { Authorization: `Bearer ${this.token}` } : {}),
     };
 
-    const response = await fetch(`${this.config.baseUrl}/api/sync/push`, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({
-        deviceId: this.getDeviceId(),
-        operations,
-      }),
-    });
+    let response: Response;
+    try {
+      response = await fetch(`${this.config.baseUrl}/api/sync/push`, {
+        method: 'POST',
+        cache: 'no-store',
+        headers,
+        body: JSON.stringify({
+          deviceId: this.getDeviceId(),
+          operations,
+        }),
+      });
+    } catch (err: any) {
+      this.notifyConnection(false);
+      throw new Error(this.OFFLINE_ERROR_MESSAGE);
+    }
+
+    this.notifyConnection(true);
 
     const data = await response.json().catch(() => null);
 
     // /api/sync/push returns 200 (all ok), 207 (partial), or 400 (all failed with per-item errors[]).
-    // Preserve structured results/errors so SyncService can reconcile each queue item accurately.
+    // Preserve structured results/errors so SyncService can reconcile each operation accurately.
     if (data && (Array.isArray(data.results) || Array.isArray(data.errors))) {
       return data;
     }
@@ -168,7 +235,8 @@ export class CloudflareApi {
     const params = new URLSearchParams();
     if (since) params.append('since', since);
     if (shopId && shopId !== 'ALL') params.append('shopId', shopId);
-    return this.request(`/sync/pull?${params.toString()}`);
+    const qs = params.toString();
+    return this.request(qs ? `/sync/pull?${qs}` : '/sync/pull');
   }
 
   // ==========================================
@@ -464,7 +532,8 @@ export class CloudflareApi {
     imageOrder: number = 0
   ): Promise<any> {
     if (!this.isOnline()) {
-      throw new Error('OFFLINE: Cannot upload file');
+      this.notifyConnection(false);
+      throw new Error(this.OFFLINE_ERROR_MESSAGE);
     }
 
     const formData = new FormData();
@@ -473,14 +542,22 @@ export class CloudflareApi {
     formData.append('entityId', entityId);
     formData.append('imageOrder', imageOrder.toString());
 
-    const response = await fetch(`${this.config.baseUrl}/api/r2/upload`, {
-      method: 'POST',
-      headers: {
-        'X-Device-ID': this.getDeviceId(),
-        ...(this.token ? { Authorization: `Bearer ${this.token}` } : {}),
-      },
-      body: formData,
-    });
+    let response: Response;
+    try {
+      response = await fetch(`${this.config.baseUrl}/api/r2/upload`, {
+        method: 'POST',
+        headers: {
+          'X-Device-ID': this.getDeviceId(),
+          ...(this.token ? { Authorization: `Bearer ${this.token}` } : {}),
+        },
+        body: formData,
+      });
+    } catch {
+      this.notifyConnection(false);
+      throw new Error(this.OFFLINE_ERROR_MESSAGE);
+    }
+
+    this.notifyConnection(true);
 
     if (!response.ok) {
       throw new Error(`Upload failed: ${response.status}`);
@@ -545,20 +622,29 @@ export class CloudflareApi {
 
   public static async uploadBackup(backupFile: Blob | File): Promise<any> {
     if (!this.isOnline()) {
-      throw new Error('OFFLINE: Cannot upload backup');
+      this.notifyConnection(false);
+      throw new Error(this.OFFLINE_ERROR_MESSAGE);
     }
 
     const formData = new FormData();
     formData.append('backup', backupFile);
 
-    const response = await fetch(`${this.config.baseUrl}/api/r2/backup`, {
-      method: 'POST',
-      headers: {
-        'X-Device-ID': this.getDeviceId(),
-        ...(this.token ? { Authorization: `Bearer ${this.token}` } : {}),
-      },
-      body: formData,
-    });
+    let response: Response;
+    try {
+      response = await fetch(`${this.config.baseUrl}/api/r2/backup`, {
+        method: 'POST',
+        headers: {
+          'X-Device-ID': this.getDeviceId(),
+          ...(this.token ? { Authorization: `Bearer ${this.token}` } : {}),
+        },
+        body: formData,
+      });
+    } catch {
+      this.notifyConnection(false);
+      throw new Error(this.OFFLINE_ERROR_MESSAGE);
+    }
+
+    this.notifyConnection(true);
 
     if (!response.ok) {
       throw new Error(`Backup upload failed: ${response.status}`);

@@ -144,6 +144,12 @@ async function processOperation(db: any, op: any) {
     case 'CREATE_EXPENSE':
       await createExpense(db, payload);
       break;
+    case 'UPDATE_EXPENSE':
+      await updateExpense(db, payload);
+      break;
+    case 'DELETE_EXPENSE':
+      await deleteExpense(db, payload);
+      break;
 
     case 'CREATE_SELLER':
     case 'UPDATE_SELLER':
@@ -1917,6 +1923,41 @@ async function createExpense(db: any, expense: any) {
       expense.createdByName,
       expense.createdAt || new Date().toISOString()
     )
+    .run();
+}
+
+async function updateExpense(db: any, expense: any) {
+  await db
+    .prepare(
+      `
+    UPDATE expenses
+    SET shop_id = ?, shop_name = ?, is_company_expense = ?, category = ?,
+        description = ?, title = ?, amount = ?, payment_method = ?,
+        date = ?, reference = ?, notes = ?
+    WHERE id = ?
+  `
+    )
+    .bind(
+      expense.shopId || null,
+      expense.shopName || null,
+      expense.isCompanyExpense ? 1 : 0,
+      expense.category,
+      expense.description || '',
+      expense.title || null,
+      expense.amount || 0,
+      expense.paymentMethod || 'CASH',
+      expense.date || new Date().toISOString().slice(0, 10),
+      expense.reference || null,
+      expense.notes || null,
+      expense.id
+    )
+    .run();
+}
+
+async function deleteExpense(db: any, payload: any) {
+  await db
+    .prepare('DELETE FROM expenses WHERE id = ?')
+    .bind(payload.id)
     .run();
 }
 

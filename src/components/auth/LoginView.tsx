@@ -8,15 +8,15 @@ import {
   RefreshCw,
   Eye,
   EyeOff,
+  WifiOff,
 } from 'lucide-react';
 import { useApp } from '../../context/AppContext';
 import { AuthService } from '../../services/authService';
 import { CloudflareApi } from '../../services/cloudflareApi';
-import { SyncService } from '../../services/syncService';
 import { UserRole } from '../../types';
 
 export const LoginView: React.FC = () => {
-  const { login, dbState } = useApp();
+  const { login, dbState, isOnline, retryConnection } = useApp();
   const [activePortal, setActivePortal] = useState<UserRole>('SELLER');
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
@@ -28,37 +28,6 @@ export const LoginView: React.FC = () => {
   const [showPassword, setShowPassword] = useState(false);
 
   const settings = dbState.settings;
-
-  /**
-   * Pull fresh users + shops from cloud.
-   * Only used when local lookup fails (new user from another device).
-   */
-  const pullFreshAccountsFromCloud = async (): Promise<boolean> => {
-    try {
-      const online = await CloudflareApi.checkConnection();
-      if (!online) {
-        console.log('[LoginView] Offline — skipping cloud account refresh');
-        return false;
-      }
-
-      setStatusMsg('Checking for latest accounts...');
-      const pullResult = await CloudflareApi.pullSync();
-
-      if (pullResult.success && pullResult.data) {
-        SyncService.applyCloudData(pullResult.data);
-        console.log('[LoginView] Cloud accounts pulled successfully');
-        setStatusMsg('');
-        return true;
-      }
-
-      setStatusMsg('');
-      return false;
-    } catch (err) {
-      console.log('[LoginView] Cloud account refresh failed:', err);
-      setStatusMsg('');
-      return false;
-    }
-  };
 
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -75,11 +44,14 @@ export const LoginView: React.FC = () => {
       return;
     }
 
+    if (!isOnline || !CloudflareApi.isOnline()) {
+      setErrorMsg(CloudflareApi.OFFLINE_ERROR_MESSAGE);
+      return;
+    }
+
     setIsLoading(true);
+    setStatusMsg('Verifying account with cloud database...');
     try {
-      // ==========================================
-      // STEP 1: Try local login (fast, offline-capable)
-      // ==========================================
       const result = await AuthService.login(username, password, activePortal);
 
       if (result.success && result.user) {
@@ -89,46 +61,9 @@ export const LoginView: React.FC = () => {
         return;
       }
 
-      // ==========================================
-      // STEP 2: If user not found locally, refresh from cloud
-      // ==========================================
-      const isUserNotFoundError =
-        result.error?.toLowerCase().includes('account not found') ||
-        result.error?.toLowerCase().includes('not found');
-
-      if (isUserNotFoundError) {
-        console.log('[LoginView] User not found locally — pulling from cloud...');
-        const refreshed = await pullFreshAccountsFromCloud();
-
-        if (refreshed) {
-          // Retry login with fresh local data
-          const retryResult = await AuthService.login(username, password, activePortal);
-
-          if (retryResult.success && retryResult.user) {
-            if (rememberMe) AuthService.setRememberMe(retryResult.user);
-            else AuthService.clearRememberMe();
-            login(retryResult.user);
-            return;
-          }
-
-          // Still failing after refresh
-          setErrorMsg(
-            retryResult.error || 'Authentication failed. Please verify credentials.'
-          );
-        } else {
-          // Couldn't refresh (offline or error)
-          setErrorMsg(
-            result.error ||
-              'Account not found locally. Connect to internet to check for new accounts.'
-          );
-        }
-        return;
-      }
-
-      // Any other error (wrong password, inactive, etc.)
       setErrorMsg(result.error || 'Authentication failed. Please verify credentials.');
     } catch (err: any) {
-      setErrorMsg(err.message || 'An unexpected error occurred.');
+      setErrorMsg(CloudflareApi.formatError(err, 'An unexpected error occurred.'));
     } finally {
       setIsLoading(false);
       setStatusMsg('');
@@ -158,12 +93,20 @@ export const LoginView: React.FC = () => {
           />
           <span className="font-semibold text-slate-200">{settings.businessName}</span>
           <span className="text-slate-600">•</span>
-          <span className="text-slate-400">Windows Desktop Business Engine</span>
+          <span className="text-slate-400">Online Cloud Business Engine</span>
         </div>
         <div className="flex items-center gap-1.5">
-          <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 inline-block"></span>
-          <span className="text-[11px] text-emerald-400 font-medium">
-            Local Database Ready
+          <span
+            className={`w-2.5 h-2.5 rounded-full inline-block ${
+              isOnline ? 'bg-emerald-500' : 'bg-rose-500'
+            }`}
+          ></span>
+          <span
+            className={`text-[11px] font-medium ${
+              isOnline ? 'text-emerald-400' : 'text-rose-400'
+            }`}
+          >
+            {isOnline ? 'Cloud Database Connected' : 'Offline — Wait for Internet'}
           </span>
         </div>
       </div>
@@ -218,6 +161,23 @@ export const LoginView: React.FC = () => {
                 <span>Admin Login</span>
               </button>
             </div>
+
+            {/* Offline warning banner */}
+            {!isOnline && (
+              <div className="mb-4 p-3 rounded-lg bg-rose-500/15 border border-rose-500/30 text-rose-300 text-xs flex items-center justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  <WifiOff className="w-4 h-4 shrink-0 text-rose-400" />
+                  <span>You are offline. Wait for internet connection to sign in.</span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => retryConnection()}
+                  className="px-2 py-1 rounded bg-rose-500/20 hover:bg-rose-500/30 text-rose-100 font-semibold shrink-0 cursor-pointer"
+                >
+                  Retry
+                </button>
+              </div>
+            )}
 
             {/* Status message (checking cloud) */}
             {statusMsg && (
@@ -335,7 +295,7 @@ export const LoginView: React.FC = () => {
               <button
                 type="submit"
                 id="login-submit-btn"
-                disabled={isLoading}
+                disabled={isLoading || !isOnline}
                 className={`w-full flex items-center justify-center gap-2 py-2.5 rounded-lg text-sm font-semibold text-white shadow-lg transition-all ${
                   activePortal === 'ADMIN'
                     ? 'bg-amber-600 hover:bg-amber-500 focus:ring-amber-500'
@@ -363,7 +323,7 @@ export const LoginView: React.FC = () => {
 
       {/* Footer Info */}
       <footer className="px-6 py-3 border-t border-slate-900 text-center text-xs text-slate-400">
-        Local SQLite-compatible Storage • Zero Internet Requirement • Multi-Shop Ready
+        Online-Only Cloud Database • Immediate Sync • Multi-Shop Ready
       </footer>
     </div>
   );
